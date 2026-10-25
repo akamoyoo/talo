@@ -62,6 +62,10 @@ def private_dirty(pid: int | None) -> int | None:
 MEMORY_FIELDS = {"Rss:": "rss", "Pss:": "pss", "Private_Clean:": "private_clean", "Private_Dirty:": "private_dirty"}
 MEMORY_LIMIT_INTERVAL = 0.5  # seconds between samples of a session with --memory-limit
 AUTOSAVE_CHECK = float(os.environ.get("TALO_AUTOSAVE_CHECK", "15"))  # seconds between autosave checks
+POLICY_INTERVAL = float(os.environ.get("TALO_POLICY_INTERVAL", 30))  # --snapshot-policy demote: seconds between checks
+POLICY_IDLE_S = float(os.environ.get("TALO_POLICY_IDLE", 600))  # snapshots used more recently are not demoted
+POLICY_HIGH, POLICY_LOW = 0.9, 0.8           # demote above 90% of the budget, until below 80%
+POLICY_BACKOFF_S = (300, 900, 3600)          # retries after transient demotion failures
 RETAINED_ERRORS = 5          # error-JOB snapshots kept by --retain-error (older unpinned ones are dropped)
 GUARD_GRACE = 5.0           # seconds a job past its deadline or output limit gets to stop after the interrupt
 MEMORY_LIMIT_GRACE = 3.0     # seconds an interrupted job gets to stop before its worker is killed
@@ -155,7 +159,8 @@ def scope_command(limits: dict, unit: str) -> list[str]:
     if shutil.which("systemd-run") is None:
         raise RuntimeError("--limit needs systemd-run (a systemd user instance); use --memory-limit for a soft limit")
     available = delegated_controllers()
-    cmd = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}", "--collect"]
+    # Delegate=yes lets the user manager attach a process started later (a worker restored from disk, M10)
+    cmd = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}", "--collect", "-p", "Delegate=yes"]
     for key, value in limits.items():
         if key not in LIMIT_PROPERTIES:
             raise ValueError(f"unknown limit {key!r}: use memory, pids or cpu")
@@ -169,6 +174,18 @@ def scope_command(limits: dict, unit: str) -> list[str]:
         if key == "memory":  # without this the kernel swaps the excess out instead of enforcing the limit
             cmd += ["-p", "MemorySwapMax=0"]
     return cmd + ["--"]
+
+
+async def attach_to_scope(scope: str, pid: int) -> None:
+    """Move ``pid`` into the session's systemd scope (its limits then apply to it), through the user manager."""
+    proc = await asyncio.create_subprocess_exec(
+        "busctl", "--user", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager", "AttachProcessesToUnit", "ssau", scope, "", "1", str(pid),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"cannot place the restored worker in the session's scope {scope}: "
+                           f"{err.decode(errors='replace').strip()}")
 
 
 def memory_events_path(pid: int) -> Path | None:
@@ -307,6 +324,15 @@ class Snapshot:
     pins: set = field(default_factory=set)  # holders that need this snapshot alive (maps, service versions, handoffs)
     auto: bool = False                      # taken by talo autosnap (dropped when older than the last N)
     hold: socket.socket | None = field(default=None, repr=False)
+    cold: dict | None = None    # on disk (M10): {"manifest": path, "bytes", "stored", "variables", "fingerprints"}
+    demoting: str | None = None  # the demotion job holding this snapshot's transition, if any
+    blocked: str | None = None   # why it cannot be demoted (a variable that cannot be saved): a snapshot never changes
+    last_used: float = field(default_factory=time.time)  # checked out, branched from, diffed
+    retry_at: float = 0.0                       # the policy retries a transient failure after this
+    failures: int = 0
+
+    def manifest(self) -> dict:
+        return json.loads(Path(self.cold["manifest"]).read_text())
 
     @property
     def ref(self) -> str:
@@ -317,7 +343,12 @@ class Snapshot:
                 "pid": self.pid, "created": self.created, "message": self.message, "owner": self.owner,
                 "pins": sorted(self.pins), "auto": self.auto,
                 "execution_count": self.execution_count, "jobs": self.jobs, "threads": self.threads,
-                "private_bytes": private_dirty(self.pid), "alive": private_dirty(self.pid) is not None}
+                "storage": "disk" if self.cold else "memory",
+                "private_bytes": None if self.cold else private_dirty(self.pid),
+                "alive": bool(self.cold) or private_dirty(self.pid) is not None,
+                **({"disk": {k: self.cold[k] for k in ("bytes", "stored", "variables")}} if self.cold else {}),
+                **({"demote_blocked": self.blocked} if self.blocked else {}),
+                **({"demoting": self.demoting} if self.demoting else {})}
 
 
 @dataclass
@@ -468,6 +499,13 @@ class Session:
         self.lease: dict | None = None     # talo lease: {"id", "owner", "until", "reason"}
         self.counts: list = []             # execution counts of finished executions, latest last
         self.resolve = None                # set by the supervisor: "session:id" -> Snapshot (any session)
+        self.store_ops = lambda delta: None  # set by the supervisor: count store users (gc waits for them)
+        self.snapshot_policy = "retain"      # M10: "demote" moves snapshots to disk to stay under memory_budget
+        self.reclaim = None                  # set by the supervisor: async, demote snapshots until under the budget
+        self.reclaim_lock = asyncio.Lock()
+        self.demote_lock = asyncio.Lock()    # one demotion at a time per session, manual or automatic
+        self.closing = False                 # set first thing by stop(): late starts give up
+        self.policy_stuck = False            # only protected or blocked snapshots are left (reported once)
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
         self.tasks: list[asyncio.Task] = []
@@ -495,9 +533,80 @@ class Session:
         self._start_tasks()
 
     async def start_from(self, snap: Snapshot) -> None:
-        """Start this session with a worker forked from a snapshot (possibly another session's)."""
-        await self._spawn_from(snap)
+        """Start this session with a worker forked from a snapshot (possibly another session's), or restored from it
+        when it is on disk."""
+        pin = f"branch {self.name}"
+        snap.pins.add(pin)
+        try:
+            await (self._restore_cold(snap) if snap.cold else self._spawn_from(snap))
+        finally:
+            snap.pins.discard(pin)
         self._start_tasks()
+
+    async def _restore_cold(self, snap: Snapshot) -> None:
+        """Checkout of a snapshot on disk (M10): a new worker (the snapshot's interpreter and directory) in the
+        session's scope, the snapshot's checkpoint restored into it with its execution count and ``In``. It replaces
+        the current worker only once it answered as the session's worker; until then any failure or cancellation
+        kills it and leaves the current worker as it was. The caller holds a pin on the snapshot."""
+        manifest = snap.manifest()
+        if self.memory_budget:  # an estimate: the restored values need about their size, next to the old worker
+            used, unknown = self.memory_usage()
+            if not unknown and used + manifest["bytes"] > self.memory_budget:
+                raise MemoryError(f"restoring {snap.name} needs about {manifest['bytes'] >> 20} MB next to the "
+                                  f"{used >> 20} MB the session uses, over its budget of {self.memory_budget >> 20} MB")
+        self.store_ops(+1)  # before the first await: gc keeps the units while we read them
+        key, proc, channel, committed, parent = f"restore {snap.id}", None, None, False, None
+        try:
+            parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            env = {"MPLBACKEND": "Agg", **os.environ, **self.env, "PYTHONUNBUFFERED": "1",
+                   "TALO_SOCKET": str(socket_path()), "TALO_DATASETS": str(datasets_root())}
+            try:
+                with open(self.dir / "worker.log", "ab") as errlog:
+                    proc = await asyncio.create_subprocess_exec(
+                        manifest.get("python") or self.python, str(WORKER), "--fd", str(child.fileno()),
+                        "--session", self.name, cwd=manifest.get("worker_cwd") or manifest["cwd"], env=env,
+                        pass_fds=(child.fileno(),), stdin=asyncio.subprocess.DEVNULL, stdout=errlog, stderr=errlog,
+                        start_new_session=True)
+            finally:
+                child.close()
+            self.ephemeral[key] = proc.pid  # counted, and killed with the session, until it is the worker
+            if self.closing:
+                raise RuntimeError(f"session {self.name} is closing")
+            if self.scope:  # the limits of the session apply to it, as to forks
+                await attach_to_scope(self.scope, proc.pid)
+            reader, writer = await asyncio.open_unix_connection(sock=parent, limit=wire.MAX_LINE)
+            parent = None  # owned by the transport now
+            channel = ephemeral.Channel(reader, writer, proc.pid, proc)
+            await channel.request("kernel_info_request", {}, timeout=60)
+            code = (f"talo._load({str(home() / 'store')!r}, {manifest['units']!r}, None, {manifest['modules']!r}, "
+                    f"{manifest['versions']!r}, {manifest.get('imports') or {}!r})\n"
+                    f"talo._restore_meta({manifest.get('inputs') or ['']!r}, {manifest.get('execution_count') or 0!r})")
+            out = self.dir / "jobs" / f"restore-{snap.id}-{wire.new_id()[:6]}.out"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            got = await channel.execute(code, str(out), silent=True)
+            if got["status"] != "ok":
+                e = got.get("error") or {}
+                raise RuntimeError(f"restoring {snap.name} from disk failed: {e.get('ename')}: {e.get('evalue')}")
+            if self.closing:
+                raise RuntimeError(f"session {self.name} is closing")
+            old = (self.writer, self.proc, self.worker_pid)
+            await self._attach(reader, writer, proc=proc)  # the session switches only after this handshake
+            committed = True
+            self.ephemeral.pop(key, None)
+            self.base, self.jobs_since_base = snap.ref, []
+            self.python = manifest.get("python") or self.python  # the interpreter this worker runs in
+            await asyncio.shield(self._stop_worker(*old))
+        finally:
+            try:
+                self.ephemeral.pop(key, None)
+                if parent is not None:
+                    parent.close()
+                if not committed and proc is not None and proc.returncode is None:
+                    proc.kill()  # synchronously: nothing of it outlives a failed or cancelled restore
+                if not committed and channel is not None:
+                    await asyncio.shield(channel.close())
+            finally:
+                self.store_ops(-1)
 
     def _start_tasks(self) -> None:
         self.tasks.append(asyncio.create_task(self._execute_loop()))
@@ -505,6 +614,13 @@ class Session:
             self.tasks.append(asyncio.create_task(self._watch_memory()))
 
     async def _spawn_from(self, snap: Snapshot) -> None:
+        snap.pins.add(f"spawn {self.name}")  # a demotion finishing meanwhile gives up instead of ending it
+        try:
+            await self._spawn_worker_from(snap)
+        finally:
+            snap.pins.discard(f"spawn {self.name}")
+
+    async def _spawn_worker_from(self, snap: Snapshot) -> None:
         reader, writer = await asyncio.open_unix_connection(snap.socket, limit=wire.MAX_LINE)
         writer.write(b'{"op": "spawn"}\n')
         await writer.drain()
@@ -552,8 +668,12 @@ class Session:
 
     async def _retire(self) -> None:
         """Ask the current worker to exit (used when a checkout replaces it); its death is not reported."""
-        old_writer, old_proc, pid = self.writer, self.proc, self.worker_pid
+        old = (self.writer, self.proc, self.worker_pid)
         self.generation += 1  # the old worker's reader now belongs to a past generation
+        await self._stop_worker(*old)
+
+    async def _stop_worker(self, old_writer, old_proc, pid) -> None:
+        """Ask a worker that no longer belongs to the current generation to exit."""
         if old_writer is not None:
             try:
                 old_writer.write(wire.encode(wire.message("shutdown_request", {"restart": False}, session=self.name)))
@@ -995,7 +1115,8 @@ class Session:
         if not target:
             raise RuntimeError("nothing to undo: no snapshot before the last execution (`talo autosnap on` takes one "
                                "after every execution)")
-        return await self._checkout(self.resolve(target), discard=True, owner=job.owner)
+        return await self._checkout(self.resolve(target), discard=True, owner=job.owner,
+                                    shared=bool(job.params.get("shared")))
 
     async def _publish(self, job: Job) -> None:
         """Publish the services a successful job staged, as new versions on one snapshot of the state it left."""
@@ -1084,6 +1205,9 @@ class Session:
     async def _fork(self, sid: str, strict: bool, *, name: str | None = None, message: str = "",
                     owner: str = "user") -> Snapshot:
         """Fork the worker into a held snapshot process (named snapshots and internal checkpoints alike)."""
+        if self.memory_budget and self.memory_in_use() > self.memory_budget and self.reclaim is not None \
+                and self.snapshot_policy == "demote":
+            await self.reclaim(target=self.memory_budget)  # move snapshots to disk first, then judge
         if self.memory_budget and self.memory_in_use() > self.memory_budget:
             biggest = sorted(self.snapshots.values(), key=lambda s: -(private_dirty(s.pid) or 0))[:3]
             hint = ", ".join(f"{s.name} ({(private_dirty(s.pid) or 0) >> 20} MB)" for s in biggest) or "none"
@@ -1120,7 +1244,18 @@ class Session:
         raise KeyError(f"session {self.name} has no snapshot {name!r} (`talo snaps -s {self.name}` lists them)")
 
     async def _checkout(self, snap: Snapshot, discard: bool = False, save_as: str | None = None,
-                        owner: str = "user") -> dict:
+                        owner: str = "user", shared: bool = False) -> dict:
+        pin = f"checkout {self.name} {wire.new_id()[:6]}"
+        snap.pins.add(pin)  # before any await: neither a demotion nor a drop changes the target under us
+        try:
+            return await self._checkout_pinned(snap, discard, save_as, owner, shared)
+        finally:
+            snap.pins.discard(pin)
+
+    async def _checkout_pinned(self, snap: Snapshot, discard: bool, save_as: str | None, owner: str,
+                               shared: bool) -> dict:
+        if snap.cold and shared:  # restoring runs pickles: not on the shared socket, as `restore`
+            raise Forbidden(f"{snap.name} is on disk; checking it out restores a checkpoint, which share clients cannot")
         if self.jobs_since_base and self.state != "dead" and not discard and not save_as:
             by = sorted({self.owners.get(j, "user") for j in self.jobs_since_base})
             raise RuntimeError(f"jobs {', '.join(self.jobs_since_base)} (by {', '.join(by)}) ran since this worker's base "
@@ -1128,6 +1263,10 @@ class Session:
                                f"--snap NAME to save it first")
         if save_as and self.state != "dead":
             await self._snap(save_as, message=f"saved before checking out {snap.name}", owner=owner)
+        snap.last_used = time.time()
+        if snap.cold:
+            await self._restore_cold(snap)
+            return {**self.to_dict(), "restore": "values"}
         if private_dirty(snap.pid) is None:
             raise RuntimeError(f"snapshot {snap.name} (pid {snap.pid}) is gone")
         await self._retire()
@@ -1136,6 +1275,8 @@ class Session:
 
     def drop(self, snap: Snapshot) -> None:
         self._release(snap)
+        if snap.cold:  # its checkpoint goes with it
+            Path(snap.cold["manifest"]).unlink(missing_ok=True)
         self.snapshots.pop(snap.id, None)
         self.emit("snapshot.dropped", session=self.name, snapshot=snap.ref, name=snap.name)
 
@@ -1146,7 +1287,7 @@ class Session:
             job.status, job.finished = "cancelled", time.time()
             job.done.set()
             return "cancelled"
-        if job.status == "running" and job.kind in ("execute", "trial", "save", "publish"):
+        if job.status == "running" and job.kind in ("execute", "trial", "save", "publish", "demote"):
             job.interrupt_requested = True
             if job.phase != "executing" or not job.exec_pid:  # a checkpoint or restore is in progress
                 return "interrupt deferred" if job.phase == "preparing" else "finishing"
@@ -1164,6 +1305,13 @@ class Session:
                 job.error = {"ename": "SessionKilled", "evalue": f"session {self.name} was closed", "traceback": []}
                 job.done.set()
         self.pending = []
+        self.closing = True
+        for key, pid in list(self.ephemeral.items()):
+            if key.startswith("restore "):  # a worker being restored from disk dies with the session
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         for snap in [*self.snapshots.values(), *self.internal_snaps]:
             self._release(snap)
         self.snapshots.clear()
@@ -1198,7 +1346,7 @@ class Session:
                 "memory_budget": self.memory_budget, "memory_limit": self.memory_limit, "over_limit": self.over_limit,
                 "limits": self.limits, "effective_limits": self.effective_limits, "scope": self.scope,
                 "limits_inherited_from": self.limits_inherited_from, "last_checkpoint": self.last_checkpoint,
-                "autosave": self.autosave_config,
+                "autosave": self.autosave_config, "snapshot_policy": self.snapshot_policy,
                 "max_output": self.max_output}
 
 
@@ -1283,6 +1431,16 @@ class Supervisor:
             raise KeyError(f"no job {job_id!r} (`talo jobs` lists jobs)")
         return self.jobs[str(job_id)]
 
+    def _store_op(self, delta: int) -> None:
+        self.store_ops += delta  # garbage collection waits while this is positive
+
+    def _hot(self, snap: Snapshot, what: str) -> Snapshot:
+        """Operations that fork a snapshot need it in memory (M10)."""
+        if snap.cold:
+            raise ValueError(f"snapshot {snap.ref} ({snap.name}) is on disk; {what} needs it in memory: "
+                             f"`talo checkout {snap.name}` (or `talo new NAME --from {snap.ref}`), then `talo snap`")
+        return snap
+
     def _snapshot(self, ref: str, default_session: str | None) -> Snapshot:
         """``[session:]name`` -> the snapshot. Without a session, look in ``default_session`` first, then in every
         session, requiring the name to be unique (so a branch can name the snapshot it came from)."""
@@ -1355,6 +1513,10 @@ class Supervisor:
         session.on_handoff = lambda job: self._do_handoff(session, job)
         session.on_adopt = lambda job: self._do_adopt(session, job)
         session.resolve = lambda ref: self._snapshot(ref, session.name)
+        session.store_ops = self._store_op
+        session.reclaim = lambda target=None: self._reclaim(session, target)
+        if req.get("snapshot_policy"):
+            self._set_policy(session, req["snapshot_policy"])
         session.on_publish = lambda job, snap: self._register_versions(session, job, snap)
         self.sessions[name] = session
         try:
@@ -1376,6 +1538,7 @@ class Supervisor:
 
     async def op_kill(self, req):
         session = self._session(req["name"])
+        session.closing = True  # a restore or branch start in progress gives up instead of attaching
         self._kill_maps(session.name)
         calls = [c for c in self.calls.values() if c["session"] == session.name and not c["done"].is_set()]
         for c in calls:
@@ -1395,8 +1558,11 @@ class Supervisor:
         for task in list(session.store_tasks):  # saves and publications of this session end with it
             task.cancel()
         for job in self.jobs.values():
-            if job.session_id == session.id and job.kind in ("save", "publish") and job.exec_pid:
+            if job.session_id == session.id and job.kind in ("save", "publish", "demote") and job.exec_pid:
                 kill_tree(job.exec_pid)
+        for snap in session.snapshots.values():  # snapshots on disk go with the session (they are archives only
+            if snap.cold:                         # after a restart, when nobody killed it)
+                Path(snap.cold["manifest"]).unlink(missing_ok=True)
         for tr in [x for x in self.trials.values() if x["session_id"] == session.id]:
             if tr["status"] in ("preparing", "running"):
                 tr["task"].cancel()
@@ -1653,7 +1819,8 @@ class Supervisor:
             return self._control_reply({**await self._wait(job, req.get("timeout", 300)), "deduplicated": True})
         snap = self._snapshot(req["name"], session.name)
         return await self._control(session, "checkout", req.get("timeout", 300), req, fingerprint=fingerprint,
-                                   snap=snap, discard=bool(req.get("discard")), save_as=req.get("snap"))
+                                   snap=snap, discard=bool(req.get("discard")), save_as=req.get("snap"),
+                                   shared=bool(req.get("_shared")))
 
     async def op_reload(self, req):
         session = self._session(req["session"])
@@ -1673,7 +1840,7 @@ class Supervisor:
 
     async def op_undo(self, req):
         session = self._session(req["session"])
-        return await self._control(session, "undo", req.get("timeout", 300), req)
+        return await self._control(session, "undo", req.get("timeout", 300), req, shared=bool(req.get("_shared")))
 
     async def op_queue(self, req):
         """Pause or resume starting jobs (never queued itself)."""
@@ -1740,7 +1907,7 @@ class Supervisor:
             return None if m is None else m.get("private_dirty", 0) + m.get("private_clean", 0)
         candidates = []
         for s in list(session.snapshots.values()):
-            if s.pins or s.ref == session.base:
+            if s.pins or s.ref == session.base or s.cold:  # a snapshot on disk holds no memory
                 continue
             if s.auto or s.name.startswith("error-"):
                 candidates.append({"action": "drop", "snapshot": s.ref, "name": s.name, "private_bytes": private(s),
@@ -1795,7 +1962,7 @@ class Supervisor:
                 raise ValueError(f"key {key!r} was used for map {map_id} with a different request; use a new key")
             out = await self._wait_map(self.maps[map_id], req.get("timeout", 30))
             return {**out, "map": {**out["map"], "deduplicated": True}}
-        snap = self._snapshot(req["from"], session.name) if req.get("from") else None  # resolved once, now
+        snap = self._hot(self._snapshot(req["from"], session.name), "map --from") if req.get("from") else None  # resolved once, now
         map_id = f"m{self.next_map}"
         self.next_map += 1
         m = MapRun(map_id, session.name, req["code"], cases, snap, snap is None, parallel,
@@ -2261,7 +2428,7 @@ class Supervisor:
         params = job.params
         hid = params["hid"]
         if params.get("snap"):
-            snap = self._snapshot(params["snap"], session.name)
+            snap = self._hot(self._snapshot(params["snap"], session.name), "a handoff")
         else:
             snap = await session._snap(f"handoff-{hid}", message=f"handoff {hid}: {params['message']}"[:200],
                                        owner=job.owner)
@@ -2499,7 +2666,9 @@ class Supervisor:
                 "notes": {"last": [cut(n) for n in notes[-n_notes:]] if n_notes else [], "total": len(notes),
                           "more": "talo notes"},
                 "snapshots": {"last": [{"name": s.name, "ref": s.ref, "parent": s.parent, "message": s.message[:120],
-                                        "owner": s.owner, "private_bytes": private_dirty(s.pid)}
+                                        "owner": s.owner, "storage": "disk" if s.cold else "memory",
+                                        "private_bytes": None if s.cold else private_dirty(s.pid),
+                                        **({"demote_blocked": s.blocked} if s.blocked else {})}
                                        for s in (snaps[-n_snaps:] if n_snaps else [])],
                               "total": len(snaps), "more": "talo snaps"},
                 "variables": {**variables, "largest": variables["largest"][:n_vars]} if "largest" in variables else variables,
@@ -2519,7 +2688,9 @@ class Supervisor:
                 continue
             procs = [{"kind": "worker", "pid": s.worker_pid, "memory": memory(s.worker_pid) if s.state != "dead" else None}]
             procs += [{"kind": "snapshot", "name": x.name, "ref": x.ref, "pid": x.pid, "memory": memory(x.pid)}
-                      for x in s.snapshots.values()]
+                      for x in s.snapshots.values() if not x.cold]
+            disk = [{"name": x.name, "ref": x.ref, **{k: x.cold[k] for k in ("bytes", "stored", "variables")}}
+                    for x in s.snapshots.values() if x.cold]
             if s.checkpoint:
                 procs.append({"kind": "checkpoint", "pid": s.checkpoint.pid, "memory": memory(s.checkpoint.pid)})
             procs += [{"kind": "internal", "name": x.name, "ref": x.ref, "pid": x.pid, "pins": sorted(x.pins),
@@ -2530,7 +2701,7 @@ class Supervisor:
             sessions.append({"name": s.name, "state": s.state, "processes": procs,
                              "pss_total": sum(known), "pss_unknown": len(known) < len(procs),
                              "memory_limit": s.memory_limit, "memory_budget": s.memory_budget,
-                             "over_limit": s.over_limit})
+                             "over_limit": s.over_limit, "on_disk": disk, "snapshot_policy": s.snapshot_policy})
         return {"sampled_at": time.time(), "machine": machine_memory(), "sessions": sessions,
                 "pss_total": sum(x["pss_total"] for x in sessions)}
 
@@ -2556,15 +2727,27 @@ class Supervisor:
         """Ask a live worker (kernel message) or a snapshot (its socket) for ``vars`` or ``fingerprint``."""
         if isinstance(state, Session):
             return await self._ask_idle(state, f"talo_{op}_request", params, timeout=None)
+        if state.cold:  # on disk: what was recorded when it was demoted
+            state.last_used = time.time()
+            if op == "vars":
+                return {"variables": state.cold["summaries"]}
+            names = params.get("names") or []
+            return {"fingerprints": {n: state.cold["fingerprints"].get(n, {"error": "not recorded"}) for n in names}}
         if private_dirty(state.pid) is None:
             raise RuntimeError(f"snapshot {state.ref} (pid {state.pid}) is gone")
-        reader, writer = await asyncio.open_unix_connection(state.socket, limit=wire.MAX_LINE)
+        state.last_used = time.time()
+        pin = f"inspect {wire.new_id()[:6]}"
+        state.pins.add(pin)  # a demotion finishing meanwhile gives up
         try:
-            writer.write(json.dumps({"op": op, **params}).encode() + b"\n")
-            await writer.drain()
-            reply = json.loads(await reader.readline())
+            reader, writer = await asyncio.open_unix_connection(state.socket, limit=wire.MAX_LINE)
+            try:
+                writer.write(json.dumps({"op": op, **params}).encode() + b"\n")
+                await writer.drain()
+                reply = json.loads(await reader.readline())
+            finally:
+                writer.close()
         finally:
-            writer.close()
+            state.pins.discard(pin)
         if not reply.get("ok"):
             raise RuntimeError(f"snapshot {state.ref}: {reply.get('error')}")
         return reply
@@ -2787,14 +2970,22 @@ class Supervisor:
     def _checkpoint_dir(self, session: str) -> Path:
         return home() / "checkpoints" / session
 
-    def _manifest(self, ref: str, default_session: str | None) -> tuple[str, dict]:
-        """``SESSION/NAME`` (or ``NAME`` of the default session) -> (ref, manifest)."""
+    def _manifest_path(self, ref: str, default_session: str | None) -> tuple[str, Path]:
+        """``SESSION/NAME`` (or ``NAME`` of the default session) -> (ref, path); ``snapshot:NAME@ID`` names the
+        archive of a snapshot that was on disk (M10)."""
         session, _, name = ref.rpartition("/")
         session = session or default_session
         path = self._checkpoint_dir(session) / f"{name}.json"
+        if name.startswith("snapshot:"):
+            path = next((p for p in (self._checkpoint_dir(session) / ".snapshots").glob("*.json")
+                         if json.loads(p.read_text()).get("name") == name), path)
         if not path.exists():
-            raise KeyError(f"no checkpoint {session}/{name} (`talo checkpoints` lists them)")
-        return f"{session}/{name}", json.loads(path.read_text())
+            raise KeyError(f"no checkpoint {session}/{name} (`talo checkpoints --all` lists them)")
+        return f"{session}/{name}", path
+
+    def _manifest(self, ref: str, default_session: str | None) -> tuple[str, dict]:
+        ref, path = self._manifest_path(ref, default_session)
+        return ref, json.loads(path.read_text())
 
     async def op_save(self, req):
         session = self._session(req["session"])
@@ -2908,6 +3099,282 @@ class Supervisor:
             if source in session.internal_snaps:
                 session.internal_snaps.remove(source)
             session._release(source)
+
+    # ---------------------------------------------------------------- bounded snapshots (M10)
+
+    def _demote_blocker(self, session: Session, snap: Snapshot, job: Job | None = None) -> str | None:
+        """Why this snapshot cannot move to disk now, or None (``job``: the demotion asking, whose pin is its own)."""
+        if self.sessions.get(session.name) is not session or session.snapshots.get(snap.id) is not snap:
+            return "it was dropped"
+        if snap.cold:
+            return "it is already on disk"
+        if snap.demoting and (job is None or snap.demoting != job.id):
+            return f"job {snap.demoting} is moving it to disk"
+        pins = snap.pins - ({f"demote {job.id}"} if job else set())
+        if pins:
+            return f"pinned by {', '.join(sorted(pins))}"
+        bases = [s.name for s in self.sessions.values() if s.base == snap.ref and s.state != "dead"]
+        if bases:
+            return f"it is the base of the live worker of session {', '.join(bases)}"
+        if session.checkpoint is snap or snap.name.startswith("error-"):
+            return "it holds an atomic run's checkpoint or a retained error"
+        if private_dirty(snap.pid) is None:
+            return "its process is gone"
+        return None
+
+    def _snapshot_manifest_path(self, session: Session, snap: Snapshot) -> Path:
+        return self._checkpoint_dir(session.name) / ".snapshots" / f"{session.id}-{snap.id}.json"
+
+    async def op_snapshot_demote(self, req):
+        """``talo snapshot demote NAME`` (M10)."""
+        session = self._session(req["session"])
+        snap = self._snapshot(req["name"], session.name)
+        if snap.session != session.name:
+            raise ValueError(f"{snap.ref} belongs to session {snap.session}; demote it there")
+        blocker = self._demote_blocker(session, snap)
+        if req.get("dry_run"):
+            return {"snapshot": snap.ref, "name": snap.name, "eligible": blocker is None, "reason": blocker,
+                    "private_bytes": None if snap.cold else private_dirty(snap.pid), "blocked": snap.blocked}
+        key = req.get("key")
+        if key is not None and ("demote", session.id, key) in self.keys:
+            job_id, known = self.keys[("demote", session.id, key)]
+            if known != snap.ref:
+                raise ValueError(f"key {key!r} was used for another demotion; use a new key")
+            return {**await self._wait(self.jobs[job_id], req.get("timeout", 30)), "deduplicated": True}
+        if blocker:
+            raise ValueError(f"snapshot {snap.ref} ({snap.name}) cannot move to disk: {blocker}")
+        job = Job(self._new_job_id(), session.name, f"# snapshot demote {snap.name}", "", kind="demote",
+                  params={"snapshot": snap.ref}, owner=req.get("owner") or "user", session_id=session.id)
+        job.output = str(session.dir / "jobs" / f"{job.id}.out")
+        Path(job.output).touch()
+        self.jobs[job.id] = job
+        if key is not None:
+            self.keys[("demote", session.id, key)] = (job.id, snap.ref)
+        job.handle = asyncio.create_task(self._run_demote(session, snap, job))
+        session.store_tasks.add(job.handle)
+        job.handle.add_done_callback(session.store_tasks.discard)
+        return await self._wait(job, req.get("timeout", 30))
+
+    async def _run_demote(self, session: Session, snap: Snapshot, job: Job) -> bool:
+        """Write the snapshot's variables from a fork of it; publish the manifest durably; then, if nothing pinned,
+        dropped or based itself on the snapshot meanwhile, end its process (the commit). Before the commit every
+        failure, interrupt or cancellation leaves the snapshot in memory; one demotion runs at a time per session."""
+        snap.demoting = job.id
+        snap.pins.add(f"demote {job.id}")  # drop, autosnap expiry and `memory --apply` leave it alone meanwhile
+        self.store_ops += 1
+        channel, path, committed = None, self._snapshot_manifest_path(session, snap), False
+        job.status = "queued"  # until it holds the session's demotion lock: `interrupt` cancels it
+        try:
+            async with session.demote_lock:
+                if job.done.is_set():  # cancelled while waiting
+                    raise RuntimeError("cancelled")
+                if job.params.get("policy") and not self._policy_needs(session):
+                    job.result = {"snapshot": snap.ref, "skipped": "no longer needed"}
+                    return None
+                job.started = time.time()
+                job.status, job.phase = "running", "executing"
+                if (blocker := self._demote_blocker(session, snap, job)) is not None:
+                    raise RuntimeError(blocker)
+                before = self._session_pss(session)
+
+                def check_interrupt() -> None:
+                    if job.interrupt_requested:
+                        raise RuntimeError("interrupted")
+                channel = await ephemeral.Channel.from_snapshot(snap.socket)
+                job.exec_pid = channel.pid
+                session.ephemeral[f"demote {job.id}"] = channel.pid
+                check_interrupt()
+                store = home() / "store"
+
+                async def value(code: str):
+                    got = await channel.execute(code, job.output, silent=True, json_limit=64 << 20, job=job.id)
+                    if got["status"] != "ok":
+                        e = got.get("error") or {}
+                        raise RuntimeError(f"{e.get('ename')}: {e.get('evalue')}")
+                    meta = (got.get("result") or {}).get("metadata", {}).get("talo_json") or {}
+                    if "value" not in meta:
+                        raise RuntimeError(f"no result: {meta.get('error')}")
+                    return meta["value"]
+                saved = await value(f"talo._save(None, {str(store)!r}, strict=True)")
+                if saved["skipped"]:
+                    snap.blocked = "; ".join(f"{x['name']}: {x['reason']}" for x in saved["skipped"])[:500]
+                    raise RuntimeError(f"not every variable can be saved ({snap.blocked})")
+                check_interrupt()
+                inputs = await value("list(In)")
+                summaries = (await channel.request("talo_vars_request", {"pattern": None},
+                                                   timeout=600))[0]["content"]["variables"]
+                small = [v["name"] for v in summaries if (v.get("nbytes") or 0) <= DIFF_MAX_BYTES]
+                prints = (await channel.request("talo_fingerprint_request", {"names": small},
+                                                timeout=600))[0]["content"]["fingerprints"]
+                check_interrupt()
+                manifest = {"format": 2, "kind": "snapshot", "id": wire.new_id(), "session": session.name,
+                            "session_id": session.id, "name": f"snapshot:{snap.name}@{session.id[:8]}",
+                            "snapshot": {"id": snap.id, "name": snap.name, "ref": snap.ref, "parent": snap.parent},
+                            "created": time.time(), "selection": None, "complete": True, "auto": False,
+                            "owner": job.owner, "rev": None, "python": saved.get("executable") or session.python,
+                            "python_version": saved["python"], "cwd": session.cwd, "worker_cwd": saved.get("cwd"),
+                            "limits": session.limits, "units": saved["units"], "skipped": [],
+                            "modules": saved["modules"], "imports": saved["imports"], "versions": saved["versions"],
+                            "inputs": inputs, "execution_count": snap.execution_count,
+                            "bytes": sum(u["bytes"] for u in saved["units"]),
+                            "new_bytes": sum(u["new_bytes"] for u in saved["units"])}
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    f.write(json.dumps(manifest, indent=1))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+                for d in (path.parent, path.parent.parent):
+                    fd = os.open(d, os.O_RDONLY)
+                    os.fsync(fd)
+                    os.close(fd)
+                # the commit: from the check to the end of the process nothing awaits, so a pin, a drop or a branch
+                # that came first makes us give up, and anything after it finds the snapshot on disk
+                check_interrupt()
+                if (blocker := self._demote_blocker(session, snap, job)) is not None:
+                    raise RuntimeError(f"gave up: {blocker}")
+                freed = private_dirty(snap.pid)
+                snap.cold = {"manifest": str(path), "bytes": manifest["bytes"], "stored": manifest["new_bytes"],
+                             "variables": sum(len(u["names"]) for u in saved["units"]), "summaries": summaries,
+                             "fingerprints": prints}
+                committed = True
+                snap.pid, snap.blocked = 0, None
+                try:
+                    session._release(snap)
+                except OSError:
+                    pass  # leftover socket files; the process exits when its hold closes
+                job.result = {"snapshot": snap.ref, "name": snap.name, "storage": "disk", "bytes": manifest["bytes"],
+                              "new_bytes": manifest["new_bytes"], "variables": snap.cold["variables"],
+                              "released_private_estimate": freed, "pss_before": before}
+            self.emit("snapshot.demoted", session=session.name, snapshot=snap.ref, name=snap.name)
+            return True
+        except BaseException as error:  # noqa: BLE001 - reported below; cancellation is re-raised
+            if not committed:
+                path.with_suffix(".tmp").unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
+                job.error = {"ename": "DemoteFailed", "evalue": str(error)[:2000] or type(error).__name__,
+                             "traceback": []}
+                self.emit("snapshot.demote_failed", session=session.name, snapshot=snap.ref, name=snap.name,
+                          reason=job.error["evalue"][:500])
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            return committed
+        finally:
+            try:
+                snap.demoting = None
+                snap.pins.discard(f"demote {job.id}")
+                session.ephemeral.pop(f"demote {job.id}", None)
+                if channel is not None:
+                    try:
+                        os.kill(channel.pid, signal.SIGKILL)  # the serializer is done: never let it outlive us
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.shield(channel.close())
+                    except Exception:  # noqa: BLE001
+                        pass
+            finally:
+                self.store_ops -= 1
+                job.exec_pid, job.phase = None, None
+                if committed and job.result is not None:
+                    job.result["pss_after"] = self._session_pss(session)
+                self._end_job(session, job, "ok" if committed or (job.result or {}).get("skipped") else "error")
+
+    def _end_job(self, session: Session, job: Job, status: str) -> None:
+        """Finish a control job even when its history cannot be written (the outcome is what matters)."""
+        if job.done.is_set():
+            return
+        try:
+            session._finish(job, status, **({"error": job.error} if status == "error" and job.error else {}))
+        except Exception:  # noqa: BLE001 - e.g. a full disk: the job still ends, with what we know
+            log.exception("job %s: could not record its end", job.id)
+            job.status, job.finished = status, time.time()
+            job.done.set()
+
+    def _set_policy(self, session: Session, policy: str) -> None:
+        if policy not in ("retain", "demote"):
+            raise ValueError(f"snapshot policy {policy!r}: retain or demote")
+        session.snapshot_policy = policy
+        if policy == "demote" and not any(t.get_name() == "snapshot-policy" for t in session.tasks if not t.done()):
+            task = asyncio.create_task(self._policy_loop(session), name="snapshot-policy")
+            session.tasks.append(task)
+
+    async def op_snapshot_policy(self, req):
+        session = self._session(req["session"])
+        if req.get("memory_budget") is not None:
+            session.memory_budget = int(req["memory_budget"])
+        if req.get("policy"):
+            self._set_policy(session, req["policy"])
+        return {"session": session.name, "policy": session.snapshot_policy, "memory_budget": session.memory_budget}
+
+    async def _policy_loop(self, session: Session) -> None:
+        while session.snapshot_policy == "demote":
+            if session.memory_budget and session.state != "dead":
+                try:
+                    await self._reclaim(session)
+                except Exception:  # noqa: BLE001 - the controller keeps running; failures are events
+                    log.exception("session %s: snapshot policy", session.name)
+            await asyncio.sleep(POLICY_INTERVAL)
+
+    async def _reclaim(self, session: Session, target: int | None = None) -> list:
+        """Demote snapshots, largest private memory first, while the session is above 90% of its budget (or above
+        ``target``), until it is below 80%; one at a time, measuring again after each, and checking again before each
+        that the session still exists, still consents and still has that budget. Returns what was demoted."""
+        def consenting() -> bool:
+            return self._policy_consents(session)
+        if not consenting():
+            return []
+        async with session.reclaim_lock:
+            done = []
+            used = self._session_pss(session)
+            if not consenting() or used is None or \
+                    used <= (target if target is not None else POLICY_HIGH * session.memory_budget):
+                return done
+            while consenting() and used is not None and used > POLICY_LOW * session.memory_budget:
+                now = time.time()
+                candidates = [s for s in session.snapshots.values()
+                              if not s.blocked and now >= s.retry_at and now - s.last_used >= POLICY_IDLE_S
+                              and self._demote_blocker(session, s) is None]
+                if not candidates:
+                    if not session.policy_stuck:
+                        session.policy_stuck = True
+                        self.emit("snapshot.policy_stuck", session=session.name, used=used,
+                                  budget=session.memory_budget)
+                    break
+                session.policy_stuck = False
+                snap = max(candidates, key=lambda s: private_dirty(s.pid) or 0)
+                job = Job(self._new_job_id(), session.name, f"# snapshot demote {snap.name} (policy)", "",
+                          kind="demote", params={"snapshot": snap.ref, "policy": True}, owner="talo",
+                          session_id=session.id)
+                job.output = str(session.dir / "jobs" / f"{job.id}.out")
+                Path(job.output).touch()
+                self.jobs[job.id] = job
+                outcome = await self._run_demote(session, snap, job)
+                if outcome is None:  # skipped: consent or budget changed while it waited
+                    break
+                if outcome:
+                    done.append(snap.ref)
+                    snap.failures = 0
+                elif not snap.blocked:  # transient: retry later
+                    snap.failures += 1
+                    snap.retry_at = time.time() + POLICY_BACKOFF_S[min(snap.failures, len(POLICY_BACKOFF_S)) - 1]
+                used = self._session_pss(session)
+            return done
+
+    def _policy_consents(self, session: Session) -> bool:
+        return (self.sessions.get(session.name) is session and session.state != "dead" and not session.closing
+                and session.snapshot_policy == "demote" and bool(session.memory_budget))
+
+    def _policy_needs(self, session: Session) -> bool:
+        """Still consenting, and still above the low watermark of the current budget."""
+        used = self._session_pss(session) if self._policy_consents(session) else None
+        return used is not None and used > POLICY_LOW * session.memory_budget
+
+    def _session_pss(self, session: Session) -> int | None:
+        """The session's memory as `talo memory` and budgets measure it; None when a process cannot be read."""
+        known, unknown = session.memory_usage()
+        return None if unknown else known
 
     async def op_restore(self, req):
         """Load a checkpoint into a new session (--as) or an existing idle one, as a recorded, queued execution."""
@@ -3065,19 +3532,29 @@ class Supervisor:
     async def op_checkpoints(self, req):
         root = home() / "checkpoints"
         out = []
-        for path in sorted(root.glob("*/*.json")) if root.exists() else []:
-            if req.get("session") and path.parent.name != req["session"]:
+        live = self._live_snapshot_manifests()
+        paths = sorted(root.glob("*/*.json")) if root.exists() else []
+        if req.get("all"):
+            paths += sorted(root.glob("*/.snapshots/*.json")) if root.exists() else []
+        for path in paths:
+            session = path.parent.parent.name if path.parent.name == ".snapshots" else path.parent.name
+            if req.get("session") and session != req["session"]:
                 continue
             m = json.loads(path.read_text())
+            kind = ("snapshot" if str(path) in live else "archive") if m.get("kind") == "snapshot" else "checkpoint"
             out.append({k: m.get(k) for k in ("session", "name", "created", "auto", "rev", "bytes", "new_bytes",
                                                  "owner")} | {"variables": sum(len(u["names"]) for u in m["units"]),
-                                                              "skipped": len(m["skipped"])})
+                                                              "skipped": len(m["skipped"]), "kind": kind})
         return {"checkpoints": out}
 
+    def _live_snapshot_manifests(self) -> set:
+        return {s.cold["manifest"] for x in self.sessions.values() for s in x.snapshots.values() if s.cold}
+
     async def op_checkpoint_drop(self, req):
-        ref, _ = self._manifest(req["checkpoint"], req.get("session"))
-        session, _, name = ref.partition("/")
-        (self._checkpoint_dir(session) / f"{name}.json").unlink()
+        ref, path = self._manifest_path(req["checkpoint"], req.get("session"))
+        if str(path) in self._live_snapshot_manifests():
+            raise ValueError(f"{ref} holds a snapshot that is on disk; `talo drop` the snapshot instead")
+        path.unlink()
         return {"dropped": ref}
 
     async def op_store_gc(self, req):
@@ -3087,7 +3564,8 @@ class Supervisor:
             raise RuntimeError(f"{self.store_ops} saves or restores are in progress; run gc when they are done")
         store = home() / "store"
         used_units, used_buffers = set(), set()
-        for path in (home() / "checkpoints").glob("*/*.json"):
+        root = home() / "checkpoints"
+        for path in [*root.glob("*/*.json"), *root.glob("*/.snapshots/*.json")]:  # archives of snapshots too
             used_units |= {u["hash"] for u in json.loads(path.read_text())["units"]}
         for h in used_units:
             index = store / "units" / h / "index.json"
@@ -3293,12 +3771,12 @@ class Supervisor:
             except KeyError as error:
                 report.update(status="inconclusive", inconclusive=[f"incomplete lineage: {error.args[0]}"])
                 return report
-            alive = {s.ref: s for x in self.sessions.values() for s in x.snapshots.values()}
+            alive = {s.ref: s for x in self.sessions.values() for s in x.snapshots.values() if not s.cold}
             start = 0
             if not cold:
                 marks = [i for i, r in enumerate(lineage) if r["kind"] == "snap" and r["result"]["ref"] in alive]
                 if req.get("from"):
-                    ref = self._snapshot(req["from"], session.name).ref
+                    ref = self._hot(self._snapshot(req["from"], session.name), "verify --from").ref
                     marks = [i for i in marks if lineage[i]["result"]["ref"] == ref]
                     if not marks:
                         raise RuntimeError(f"{req['from']} is not on the lineage of the current state")
@@ -3424,6 +3902,7 @@ class Supervisor:
                   if name in self.sessions and self.sessions[name].id == g["id"]}
         req["_visible"] = sorted(levels)
         req["_cached"] = True
+        req["_shared"] = True  # stays on the request (unlike _visible): restoring checkpoints is refused to it
 
         def deny(why: str, session=None):
             self.emit("share.denied", user=user, op=op, session=session)

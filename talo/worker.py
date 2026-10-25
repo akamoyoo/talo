@@ -561,6 +561,20 @@ def _rebuild_function(name: str, source: str, defaults=None, kwdefaults=None, at
 
 
 
+def _rebuild_function_code(name: str, qualname: str, code: bytes, python: str, defaults=None, kwdefaults=None,
+                           attrs=None):
+    """Unpickling a function saved by its bytecode (no source: defined through exec, a lambda, decorated or nested
+    without closure variables): only in the Python version that saved it."""
+    import marshal
+    import types
+    if python != sys.version.split()[0]:
+        raise ValueError(f"{qualname} was saved as Python {python} bytecode; this is Python {sys.version.split()[0]}")
+    fn = types.FunctionType(marshal.loads(code), _RESTORE["ns"], name, defaults)
+    fn.__qualname__, fn.__kwdefaults__ = qualname, kwdefaults
+    fn.__dict__.update(attrs or {})
+    return fn
+
+
 def _rebuild_view(root, offset: int, shape: tuple, strides: tuple, dtype):
     """Unpickling a NumPy view saved with its base: a view of the restored base, so they share memory again."""
     import numpy as np
@@ -590,18 +604,25 @@ class _SavePickler(pickle.Pickler):
                 offset = obj.__array_interface__["data"][0] - root.__array_interface__["data"][0]
                 return _rebuild_view, (root, offset, obj.shape, obj.strides, obj.dtype)
         if isinstance(obj, types.FunctionType) and obj.__module__ == "__main__" \
-                and obj.__code__.co_filename.startswith(("<talo-", "<talo-restored-")):  # cells, not Talo's own
-            if obj.__name__ == "<lambda>" or obj.__code__.co_freevars:
-                raise pickle.PicklingError(f"{obj.__qualname__}: lambdas and closures cannot be saved by source")
-            try:
-                source = inspect.getsource(obj)
-            except (OSError, TypeError) as error:
-                raise pickle.PicklingError(f"{obj.__qualname__}: source not available") from error
-            import textwrap
-            source = textwrap.dedent(source)
-            if source.lstrip().startswith("@") or obj.__qualname__ != obj.__name__:
-                raise pickle.PicklingError(f"{obj.__qualname__}: decorated or nested functions cannot be saved by source")
-            return _rebuild_function, (obj.__name__, source, obj.__defaults__, obj.__kwdefaults__, dict(obj.__dict__))
+                and obj.__globals__ is not globals():  # defined in the session (this file also runs as __main__)
+            if obj.__code__.co_freevars:
+                raise pickle.PicklingError(f"{obj.__qualname__}: closures cannot be saved")
+            source = None
+            if obj.__code__.co_filename.startswith(("<talo-", "<talo-restored-")) and obj.__name__ != "<lambda>" \
+                    and obj.__qualname__ == obj.__name__:  # a function of a cell: by its source, readable
+                import textwrap
+                try:
+                    source = textwrap.dedent(inspect.getsource(obj))
+                except (OSError, TypeError):
+                    source = None
+                if source is not None and source.lstrip().startswith("@"):
+                    source = None
+            if source is not None:
+                return _rebuild_function, (obj.__name__, source, obj.__defaults__, obj.__kwdefaults__, dict(obj.__dict__))
+            import marshal  # no usable source (exec, a lambda, decorated or nested): by bytecode, same Python only
+            return _rebuild_function_code, (obj.__name__, obj.__qualname__, marshal.dumps(obj.__code__),
+                                            sys.version.split()[0], obj.__defaults__, obj.__kwdefaults__,
+                                            dict(obj.__dict__))
         return NotImplemented
 
 
@@ -671,7 +692,17 @@ def _put_buffer(raw: memoryview, buffers: str) -> tuple[str, int, bool]:
     return digest, raw.nbytes, _install(tmp, final, buffers)
 
 
-def save_units(namespace: dict, names: list, store: str) -> dict:
+def _approx_bytes(value) -> int:
+    try:
+        if hasattr(value, "memory_usage") and callable(value.memory_usage):  # pandas
+            usage = value.memory_usage(deep=False)
+            return int(getattr(usage, "sum", lambda: usage)())
+        return int(getattr(value, "nbytes", 0) or sys.getsizeof(value))
+    except Exception:  # noqa: BLE001 - only an ordering hint
+        return 0
+
+
+def save_units(namespace: dict, names: list, store: str, strict: bool = False) -> dict:
     """Write the variables ``names`` into the content-addressed ``store``; returns the units and what was skipped.
     Every out-of-band buffer (NumPy arrays, the data of pandas objects) is stored by its own content in
     ``store/buffers/HASH``, so a variable whose arrays did not change writes nothing new; a unit
@@ -684,7 +715,10 @@ def save_units(namespace: dict, names: list, store: str) -> dict:
     units_dir, buffers_dir = os.path.join(store, "units"), os.path.join(store, "buffers")
     _makedirs_durable(units_dir)
     _makedirs_durable(buffers_dir)
-    for members in groups.values():
+    order = list(groups.values())
+    if strict:  # small values first: what cannot be saved is usually small (a function, a handle), found before GBs
+        order.sort(key=lambda members: sum(_approx_bytes(namespace[n]) for n in members))
+    for members in order:
         tmp = os.path.join(units_dir, f".tmp-{os.getpid()}-{wire.new_id()[:8]}")
         os.makedirs(tmp)
         hs = hashlib.blake2b(digest_size=20)
@@ -725,6 +759,8 @@ def save_units(namespace: dict, names: list, store: str) -> dict:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
             skipped += [{"name": n, "reason": f"{type(error).__name__}: {error}"[:200]} for n in members]
+            if strict:  # all or nothing (moving a snapshot to disk): stop writing at the first value that cannot go
+                break
     return {"units": units, "skipped": skipped}
 
 
@@ -1038,13 +1074,13 @@ class Helper:
             raise ValueError(f"artifact name {name!r} leads outside the job's directory (through a link)")
         return str(path)
 
-    def _save(self, names: list | None, store: str) -> dict:
+    def _save(self, names: list | None, store: str, strict: bool = False) -> dict:
         """talo save, in a fork of the session: write variables to the store (see "Checkpoints" in design.md)."""
         ns = self._worker.namespace
         selection = names  # None: everything, including what imports bound
         names = names or [k for k, v in list(ns.items()) if is_user_variable(k, v) and k != "talo"]
         missing = [n for n in names if n not in ns]
-        out = save_units(ns, [n for n in names if n in ns], store)
+        out = save_units(ns, [n for n in names if n in ns], store, strict=strict)
         out["skipped"] += [{"name": n, "reason": "no such variable"} for n in missing]
         cwd = os.path.realpath(os.getcwd())
         out["imports"] = {}
@@ -1061,7 +1097,14 @@ class Helper:
         out["versions"] = {m: getattr(sys.modules[m], "__version__", None) for m in ("numpy", "pandas", "pyarrow")
                            if m in sys.modules}
         out["python"] = sys.version.split()[0]
+        out["cwd"] = os.getcwd()
+        out["executable"] = sys.executable
         return out
+
+    def _restore_meta(self, inputs: list, execution_count: int) -> None:
+        """Checkout of a snapshot on disk: its input history and execution count (``Out`` and ``_`` start empty)."""
+        self._worker.namespace["In"][:] = list(inputs)
+        self._worker.execution_count = int(execution_count)
 
     def _load(self, store: str, units: list, only: list | None = None, modules: list | None = None,
               versions: dict | None = None, imports: dict | None = None) -> dict:

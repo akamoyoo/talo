@@ -85,7 +85,8 @@ and it only consumes extra memory for the pages that change afterwards
 - shared datasets: immutable versions in memory, mapped by every session without copying;
 - Jupyter front ends (a kernel bridge, notebook magics, autosnap and undo) and an MCP server;
 - trust and safety: `verify`, trial / review / adopt, hard limits, deadlines, `diagnose`, `--retain-error`, leases;
-- durability: content-addressed checkpoints, `recover` after a restart, `autosave`.
+- durability: content-addressed checkpoints, `recover` after a restart, `autosave`;
+- bounded snapshots: snapshots move to disk under a memory budget and come back on checkout.
 
 ## Install
 
@@ -160,6 +161,7 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo snap [NAME]` / `checkout NAME` / `undo` | snapshot; roll back; go back one execution (`autosnap on`) |
 | `talo new NAME --from SNAPSHOT` | branch: a new session forked from a snapshot |
 | `talo snaps` / `tree` / `diff A [B]` / `drop NAME` | snapshots and their memory, the tree of all states, what changed |
+| `talo snapshot demote NAME` / `new --snapshot-policy demote` | move snapshots to disk to bound memory; checkout restores their values |
 | `talo run --trial NAME` / `review` / `adopt` | run in a fork, review it, switch the session to it |
 | `talo verify [--cold]` | replay the code behind the current state and check it gives the same variables |
 | `talo export [-o FILE]` / `notebook` | that code as `.py` / `.ipynb`; a notebook attached to the session |

@@ -711,8 +711,9 @@ restored 14 variables into research2 (2.4 GB, 2.0s); content verified
   (offset, shape and strides), so they share memory again. Aliasing hidden deeper (a list held by two
   dictionaries) is kept within one unit only; identical but independent values stay independent. Functions defined in a session's cells are saved by
   their source (with their current defaults and attributes) and rebuilt with the restored session's namespace as
-  their globals; lambdas, closures, decorated and nested functions and classes defined in the session are reported
-  as not saved. A buffer already in the store is reused only after its content is checked against its hash; a
+  their globals; functions whose source is not available (defined through `exec`, lambdas, decorated or nested
+  ones) are saved by their bytecode and can only be restored by the same Python version; closures and classes
+  defined in the session are reported as not saved. A buffer already in the store is reused only after its content is checked against its hash; a
   storage error (disk full, I/O) fails the save instead of being reported as a skipped variable.
 - What cannot be saved is reported with the reason (generators, open files and sockets, locks, objects whose pickling
   fails): `saved: 12, skipped: 2 (gen: cannot pickle generator; conn: socket)`. Modules are not saved: names bound by imports
@@ -783,14 +784,16 @@ snapshot loaded (research:s1): on disk, 14 variables, 2.4 GB (312 MB new)
 
 - Demotion is a control job of the session (an id, `wait`, `interrupt`, `--key`), one at a time per session; it does
   not change the session's revision and does not wait for running executions.
-- **Eligibility** is decided under a transition lease on the snapshot that lasts until the end: not eligible while
-  anything pins it (the generic pins: a submitted map, a service version, a handoff, a `verify` run, a trial's
-  source or result), while it is the base of a live worker (the session's, a branch's), or when it is an atomic
-  run's checkpoint or a retained error. An operation that wants a hot snapshot while its lease is held waits for the
-  demotion to finish and then resolves the snapshot again (and finds it cold).
+- **Eligibility**: not while anything pins it (the generic pins: a submitted map, a service version, a handoff, a
+  `verify` run, a trial's source or result, a worker being forked from it), while it is the base of a live worker
+  (the session's, a branch's), or when it is an atomic run's checkpoint or a retained error. It is checked when the
+  demotion starts and again at its very end, together with ending the process and without yielding in between: an
+  operation that pinned the snapshot or based a worker on it meanwhile makes the demotion give up (the snapshot
+  stays hot and the job reports why). Operations that resolve the snapshot afterwards find it cold.
 - The variables, execution count and `In` are written from a fork of **the snapshot**, not the live worker, into the M9
   store, as a manifest owned by the snapshot (`checkpoints/SESSION/.snapshots/INCARNATION-ID.json`). The demotion
-  is registered like a save, so `store gc` does not run during it. It **fails closed**: if any variable would be
+  is registered like a save, so `store gc` does not run during it; small values are written first, and the first
+  value that cannot be saved stops it, before gigabytes are written. It **fails closed**: if any variable would be
   skipped (a generator, a socket, a lambda defined in a cell), or on a storage error, a timeout, the death of the
   serializer or an interrupt, the snapshot stays hot and usable, and the reply lists what blocked it; units already
   written and not referenced by a manifest are left for `store gc`. The snapshot process is ended only after the
@@ -817,9 +820,10 @@ snapshot loaded (research:s1): on disk, 14 variables, 2.4 GB (312 MB new)
 
 `talo checkout NAME` on a cold snapshot is one checkout operation, with checkout's rules: the dirty-state check
 (`--discard`, `--snap NAME`), `--expect-rev` and `--key`, one revision, and the lineage of the snapshot (the old
-worker's lineage is not extended; the reply and the lineage say `restored from disk: values`). It starts a new worker
-with the snapshot's interpreter and working directory, in the session's resource scope (the cgroup limits of the
-session apply, as for hot checkouts and branches), restores the manifest into it, installs the execution count and
+worker's lineage is not extended; the reply says `restore: values`). It starts a new worker with the snapshot's
+interpreter and working directory, in the session's resource scope (the cgroup limits of the session apply, as for
+hot checkouts and branches: scopes are created with `Delegate=yes`, and the user manager attaches the new process
+with `AttachProcessesToUnit`; a session whose scope cannot take it refuses the checkout), restores the manifest into it, installs the execution count and
 `In`, and switches the session only once all of that succeeded; on any failure Talo does not retire the current
 worker (a kernel OOM kill under a hard limit can still end either process). The snapshot stays cold; `snap` takes a
 new hot one. `new S --from NAME` does the same for a new session.
@@ -883,7 +887,10 @@ $ talo snapshot policy demote -s research [--memory-budget 32G]      # on an exi
 
 A cold snapshot ends with the supervisor like a hot one (its manifest becomes an archive). Demotion writes at disk
 speed and serializing walks every object of the snapshot's fork, which dirties pages of that fork too; under acute
-memory pressure it may come too late, so leave headroom in the budget.
+memory pressure it may come too late, so leave headroom in the budget. The base of the live worker stays hot, so
+a budget close to the working set refuses new snapshots once the older ones are on disk (measured: a 3.5 GB
+research session under a 4 GB budget kept three of twelve snapshots on disk and refused the rest; 1.5 to 2 times
+the working set leaves room).
 
 ## Shared datasets (M6)
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- M10, bounded snapshots: `talo snapshot demote NAME` moves a snapshot's variables to the checkpoint store and ends
+  its process (fail closed: a value that cannot be saved keeps it in memory); checking out a cold snapshot restores
+  its values, `In` and execution count into a new worker in the session's scope; `--snapshot-policy demote` with
+  `--memory-budget` does it automatically, largest private memory first; `checkpoints --all` lists snapshots on disk
+  and, after a restart, their archives. Scopes are created with `Delegate=yes`.
+- Checkpoints save functions without available source (defined through `exec`, lambdas, decorated or nested ones
+  without closure variables) by their bytecode, restorable by the same Python version.
 - `reload --in-place` updates the old functions and classes in place, so instances and references made before the
   reload (also inside containers) run the new code.
 - `import talo` inside a session (in a cell or in a module it imports) gives the session's `talo` helper, also in

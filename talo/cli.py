@@ -194,6 +194,7 @@ def cmd_new(args):
                                        "directory; --python / --cwd cannot change them")
     s = call("new", name=args.name, python=args.python or (None if args.from_ else sys.executable),
              cwd=os.path.abspath(args.cwd or os.getcwd()), memory_budget=parse_size(args.memory_budget),
+             snapshot_policy=args.snapshot_policy,
              memory_limit=parse_size(args.memory_limit), limits=parse_limits(args.limit),
              max_output=parse_size(args.max_output),
              **({"from": args.from_} if args.from_ else {}))
@@ -596,8 +597,12 @@ def cmd_snaps(args):
             here = "  <- base of the current worker" if s["ref"] == d["base"] else ""
             alive = "" if s["alive"] else "  (gone)"
             msg = f"  {s['message']}" if s["message"] else ""
-            print(f"{s['name']:16s} {s['ref']:20s} parent {s['parent'] or '-':20s} private {human_bytes(s['private_bytes'])}"
-                  f"  jobs {','.join(s['jobs']) or '-'}{msg}{alive}{here}")
+            where = (f"on disk {human_bytes(s['disk']['bytes'])}" if s.get("storage") == "disk"
+                     else f"private {human_bytes(s['private_bytes'])}")
+            extra = "  (moving to disk)" if s.get("demoting") else ""
+            extra += f"  (cannot move to disk: {s['demote_blocked']})" if s.get("demote_blocked") else ""
+            print(f"{s['name']:16s} {s['ref']:20s} parent {s['parent'] or '-':20s} {where}"
+                  f"  jobs {','.join(s['jobs']) or '-'}{msg}{alive}{here}{extra}")
         if d["jobs_since_base"]:
             print(f"(jobs since the base: {', '.join(d['jobs_since_base'])})")
     emit(args, call("snaps", session=session_name(args)), human)
@@ -608,7 +613,10 @@ def cmd_checkout(args):
              timeout=args.timeout, expect_rev=args.expect_rev, key=args.key)
     if (code := pending(args, d)) is not None:
         return code
-    emit(args, d, lambda x: print(f"session {x['name']} now runs a fork of {x['base']} (pid {x['pid']})"))
+    emit(args, d, lambda x: print(f"session {x['name']} now runs a fork of {x['base']} (pid {x['pid']})"
+                                  if x.get("restore") != "values" else
+                                  f"session {x['name']} now runs {x['base']} restored from disk: values, `In` and the "
+                                  f"execution count (pid {x['pid']})"))
 
 
 def cmd_autosnap(args):
@@ -1012,6 +1020,8 @@ def cmd_memory(args):
             label = p["kind"] if p["kind"] in ("worker", "checkpoint") else f"{p['kind']} {p.get('name', '')}"
             print(f"  {label:28s} pss {human_bytes(mem.get('pss')):>9}  private "
                   f"{human_bytes((mem.get('private_dirty') or 0) + (mem.get('private_clean') or 0)):>9}")
+        for c in pr.get("on_disk") or []:
+            print(f"  {'snapshot ' + c['name']:28s} on disk {human_bytes(c['bytes'])} ({human_bytes(c['stored'])} stored)")
         if x["objects"]:
             print("largest objects (estimated; not additive):")
             for v in x["objects"]["largest"]:
@@ -1065,9 +1075,42 @@ def cmd_checkpoints(args):
             print("(no checkpoints; `talo save` writes one)")
         for c in d["checkpoints"]:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["created"]))
+            kind = {"snapshot": "  (a snapshot on disk)", "archive": "  (archive of a snapshot)"}.get(c.get("kind"), "")
             print(f"{c['session'] + '/' + c['name']:36s} {when}  {c['variables']:>4} vars  {human_bytes(c['bytes']):>9} "
-                  f"({human_bytes(c['new_bytes'])} new)  rev {c['rev']}" + ("  auto" if c["auto"] else ""))
-    emit(args, call("checkpoints", session=args.session), human)
+                  f"({human_bytes(c['new_bytes'])} new)  rev {c['rev']}" + ("  auto" if c["auto"] else "") + kind)
+    emit(args, call("checkpoints", session=args.session, all=args.all), human)
+
+
+def cmd_snapshot(args):
+    if args.action == "demote":
+        if not args.name:
+            raise TaloError("BadArgument", "snapshot demote needs the snapshot's NAME")
+        d = call("snapshot_demote", session=session_name(args), name=args.name, dry_run=args.dry_run,
+                 timeout=args.timeout, key=args.key)
+        if args.dry_run:
+            emit(args, d, lambda x: print(f"{x['name']} ({x['snapshot']}): " + (
+                f"can move to disk; would release about {human_bytes(x['private_bytes'])} private"
+                if x["eligible"] else f"cannot move to disk: {x['reason']}")))
+            return
+        job = d
+        if args.json:
+            print(json.dumps({"job": d}, ensure_ascii=False, default=str))
+            return exit_code(job)
+        r = job.get("result") or {}
+        if job["status"] == "ok":
+            print(f"snapshot {r['name']} ({r['snapshot']}): on disk, {r['variables']} variables, "
+                  f"{human_bytes(r['bytes'])} ({human_bytes(r['new_bytes'])} new)")
+            print(f"  session memory {human_bytes(r.get('pss_before'))} -> {human_bytes(r.get('pss_after'))} pss "
+                  f"(measured before and after)")
+        elif job["status"] in ("running", "queued"):
+            print(status_line(job), file=sys.stderr)
+        else:
+            print(f"{(job.get('error') or {}).get('evalue')}; the snapshot stays in memory")
+        return exit_code(job)
+    d = call("snapshot_policy", session=session_name(args), policy=args.name,
+             memory_budget=parse_size(args.memory_budget))
+    emit(args, d, lambda x: print(f"session {x['session']}: snapshot policy {x['policy']}, memory budget "
+                                  f"{human_bytes(x['memory_budget']) if x['memory_budget'] else 'none'}"))
 
 
 def cmd_checkpoint(args):
@@ -1175,7 +1218,9 @@ def cmd_tree(args):
                 return f"* {n['session']:24s} {n['state']}, {k} job{'s' if k != 1 else ''} since"
             alive = "" if n["alive"] else "  (gone)"
             msg = f"  {n['message']}" if n["message"] else ""
-            return (f"{n['name']:12s} {n['ref']:14s} {human_bytes(n['private_bytes'])} private"
+            where = (f"on disk {human_bytes(n['disk']['bytes'])}" if n.get("storage") == "disk"
+                     else f"{human_bytes(n['private_bytes'])} private")
+            return (f"{n['name']:12s} {n['ref']:14s} {where}"
                     f"   jobs {','.join(n['jobs']) or '-'}{msg}{alive}")
 
         def walk(key, prefix):
@@ -1295,6 +1340,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "interrupted, then its worker killed (e.g. 100G)")
     p.add_argument("--memory-budget", metavar="SIZE",
                    help="refuse new snapshots when the worker plus its snapshots use more than this (e.g. 200G)")
+    p.add_argument("--snapshot-policy", choices=("retain", "demote"),
+                   help="demote: move snapshots to disk to stay under --memory-budget (values restored on checkout)")
     add("ls", cmd_ls, "list sessions", session=False)
     p = add("kill", cmd_kill, "close a session (its variables are freed)", session=False)
     p.add_argument("name")
@@ -1370,6 +1417,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key", help="idempotency key")
     p = add("drop", cmd_drop, "free a snapshot")
     p.add_argument("name")
+    p = add("snapshot", cmd_snapshot, "move a snapshot to disk (demote), or set the session's snapshot policy")
+    p.add_argument("action", choices=("demote", "policy"))
+    p.add_argument("name", nargs="?", help="demote: the snapshot; policy: retain or demote (none: show)")
+    p.add_argument("--dry-run", action="store_true", help="demote: only say whether it can move and what it frees")
+    p.add_argument("--memory-budget", metavar="SIZE", help="policy: the session's memory budget (e.g. 32G)")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
+    p.add_argument("--key", help="idempotency key")
     add("attach", cmd_attach, "an interactive prompt on the session (Ctrl-D detaches; the session keeps running)")
     p = add("export", cmd_export, "write the code that produced the current state as a .py script or .ipynb notebook")
     p.add_argument("-o", "--output", help="file to write (default: standard output)")
@@ -1504,6 +1558,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-t", "--timeout", type=float, default=300)
     p = add("checkpoints", cmd_checkpoints, "durable checkpoints", session=False)
     p.add_argument("-s", "--session")
+    p.add_argument("--all", action="store_true", help="also the checkpoints of snapshots on disk and their archives")
     p = add("checkpoint", cmd_checkpoint, "manage a checkpoint")
     p.add_argument("action", choices=("drop",))
     p.add_argument("name", help="SESSION/NAME or NAME")

@@ -176,3 +176,16 @@ def test_recover_prefers_complete_checkpoints(talo, talo_home):
     time.sleep(0.5)
     rc, d = run_json(talo, "ls")
     assert d["lost"][0]["last_checkpoint"] == "default/complete"
+
+
+def test_functions_without_source_are_saved_by_bytecode(talo):
+    code = ("exec('def load(n, k=2):\\n    return n * k')\nsq = lambda x: x * x\n"
+            "def outer():\n    def inner(y):\n        return y + 1\n    return inner\nnested = outer()\n"
+            "def make(c):\n    return lambda x: x + c\nclosure = make(3)")
+    talo("run", code)
+    rc, out = run_json(talo, "save", "--name", "fx")
+    assert [s["name"] for s in out["job"]["result"]["skipped"]] == ["closure"]
+    rc, out = run_json(talo, "restore", "default/fx", "--as", "fx2")
+    assert rc == 0, out
+    rc, r = run_json(talo, "run", "-s", "fx2", "load(3), sq(4), nested(1), load.__defaults__")
+    assert r["job"]["result"]["data"]["text/plain"] == "(6, 16, 2, (2,))"
