@@ -12,7 +12,7 @@ accounting.
 1. **Resident.** When the CLI exits or the agent disconnects, the session's variables and running computations stay.
 2. **Hot rollback** (M2). While the machine is up, the session can switch back to any snapshot of its in-memory
    state, or branch from it.
-3. **Durable restore** (M5). After a process or machine restart, selected variables can be restored from disk.
+3. **Durable restore** (M7). After a process or machine restart, selected variables can be restored from disk.
 
 Rollback is not a sandbox: files already written, network requests already sent and changes to external databases
 are not undone.
@@ -20,7 +20,7 @@ are not undone.
 ## Architecture
 
 ```
-talo CLI (humans, agents)       JupyterLab / VS Code (M4)     MCP (M4)
+talo CLI (humans, agents)       JupyterLab / VS Code (M6)     MCP (M6)
         │ JSON over a Unix socket       │ ZMQ bridge
         └───────────────┬───────────────┘
                  supervisor (one resident process per machine)
@@ -62,7 +62,7 @@ $ talo drop loaded                 # free it
 - Each session records its **base** (the snapshot its worker descends from, or none) and the jobs run since; snapshots
   record their parent snapshot, so the tree and "what happened since" are always known.
 - Snapshots survive the death of the worker: after an out-of-memory kill, `checkout` brings back the last snapshot.
-  They do not survive the supervisor (they exit when it goes away) or a reboot (that is M5).
+  They do not survive the supervisor (they exit when it goes away) or a reboot (that is M7).
 
 **Mechanics.** On `talo_snapshot_request` the worker, at an idle point, forks. The child is the snapshot: it closes the
 worker's connection, listens on its own Unix socket (`sessions/NAME/snapshots/ID.sock`) and serves a few requests:
@@ -136,7 +136,7 @@ by a rollback.
 All messages — CLI to supervisor and supervisor to worker — use the structure of the Jupyter messaging protocol
 (5.3): `header` (`msg_id`, `msg_type`, `session`, `date`, `version`), `parent_header`, `metadata`, `content`.
 Execution-related message types and fields follow the specification; Talo's own features are extension messages
-prefixed `talo_`. The transport is newline-delimited JSON over Unix sockets; M4 adds a ZMQ bridge and a standard
+prefixed `talo_`. The transport is newline-delimited JSON over Unix sockets; M6 adds a ZMQ bridge and a standard
 kernel connection file so that Jupyter front ends can attach. See [protocol.md](protocol.md).
 
 ## A command line designed for agents
@@ -226,4 +226,4 @@ $ talo export --all                          # every job, in order, including ro
 - Linux only (relies on `fork`, `/proc`, Unix sockets).
 - Snapshots inherit the limits of `fork()` described above.
 - A worker that runs out of memory is killed by the kernel; the supervisor reports it, and its variables are lost
-  unless a snapshot or (M5) a durable checkpoint exists.
+  unless a snapshot or (M7) a durable checkpoint exists.

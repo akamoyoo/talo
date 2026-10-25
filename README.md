@@ -56,7 +56,7 @@ driven from the shell, plus what Jupyter does not have:
 |---|---|---|
 | Variables stay in memory between executions | ✓ | ✓ |
 | Rich outputs (HTML, images), `.ipynb` | ✓ | ✓ (M3) |
-| Connect from JupyterLab / VS Code | ✓ | ✓ (M4, Jupyter messaging protocol) |
+| Connect from JupyterLab / VS Code | ✓ | ✓ (M6, Jupyter messaging protocol) |
 | Driven from the terminal by agents, non-blocking commands, background jobs | – | ✓ |
 | Structured, truncated output with `--json` | – | ✓ |
 | **Snapshots, rollback and branches of the in-memory state** | – | ✓ |
@@ -69,7 +69,7 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
 
 ## Status
 
-**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches / `tree` / `diff` (M2) and the interactive prompt, images as files and export (M3) work; Jupyter front ends and MCP (M4) are next. Interfaces will change.
+**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches / `tree` / `diff` (M2) and the interactive prompt, images as files and export (M3) work; tools for agents at scale (M4) are next, then shared datasets (M5) and Jupyter front ends (M6). Interfaces will change.
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
@@ -154,7 +154,7 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 ## How it works
 
 ```
-talo CLI (humans, agents)        JupyterLab / VS Code (M4)
+talo CLI (humans, agents)        JupyterLab / VS Code (M6)
         │  JSON over a Unix socket       │  ZMQ bridge
         └───────────────┬────────────────┘
                  supervisor  (one per machine; holds no user data)
