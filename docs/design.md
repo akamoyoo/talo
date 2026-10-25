@@ -690,9 +690,10 @@ restored 14 variables into research2 (2.4 GB, 2.0s); content verified
   `--expect-rev`, and records the revision, lineage, interpreter, working directory and the versions of NumPy,
   pandas and pyarrow when they are loaded.
 - Format: each saved unit is a pickle (protocol 5) whose large buffers (NumPy arrays, and the data of pandas
-  objects) are written next to it as raw bytes, not copied into the pickle stream. Units are stored by content
-  (`$TALO_HOME/store/HASH`), so a checkpoint only writes what changed since earlier ones, and checkpoints share
-  storage. A checkpoint is a manifest (`checkpoints/SESSION/NAME.json`) listing its units, their variables,
+  objects) are not copied into the pickle stream: every buffer is stored by its own content
+  (`$TALO_HOME/store/buffers/HASH`), and a unit (`store/units/HASH`) holds the stream and the list of its buffers. A
+  checkpoint therefore writes only the arrays that changed since earlier ones (changing one factor of a table
+  rewrites that factor, not the table), and checkpoints share storage. A checkpoint is a manifest (`checkpoints/SESSION/NAME.json`) listing its units, their variables,
   sizes and hashes; it is written last, so a checkpoint either exists completely or not at all: unit files, unit directories, the
   manifest and the directory holding it are each flushed to disk (fsync) before the next step, and an existing
   manifest is never replaced. The manifest has a format version, an id, the session's incarnation, the revision it
@@ -705,8 +706,9 @@ restored 14 variables into research2 (2.4 GB, 2.0s); content verified
   their source and rebuilt in the restored session's namespace; lambdas, closures and classes defined in the session
   are reported as not saved.
 - What cannot be saved is reported with the reason (generators, open files and sockets, locks, objects whose pickling
-  fails): `saved: 12, skipped: 2 (gen: cannot pickle generator; conn: socket)`. Modules are not saved; the manifest
-  lists the modules the session had imported from its working directory, and `restore` imports them first.
+  fails): `saved: 12, skipped: 2 (gen: cannot pickle generator; conn: socket)`. Modules are not saved: names bound by imports
+  (`import numpy as np`, `from pathlib import Path`) are recorded as imports and imported again on restore, and the
+  modules the session had imported from its working directory are imported first.
 - `restore CHECKPOINT [VARS...] [--as SESSION | -s SESSION]` loads into a new session (created with the checkpoint's
   interpreter and directory, or `--python`) or into an existing idle one, as a queued, atomic job that counts as a revision
   and appears in the lineage (`# --- restored from research/panels`): if any unit fails to load, the session is

@@ -540,8 +540,7 @@ def _rebuild_function(name: str, source: str):
     return ns[name]
 
 
-def _unit_digest(stream_hash, buffer_hash) -> str:
-    return hashlib.blake2b(stream_hash.digest() + buffer_hash.digest(), digest_size=20).hexdigest()
+
 
 
 def _rebuild_view(root, offset: int, shape: tuple, strides: tuple, dtype: str):
@@ -601,58 +600,79 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
+CHECKPOINT_FORMAT = 2
+
+
+def _install(tmp: str, final: str, parent: str) -> bool:
+    """Move a completely written file or directory into place; False if the same content is there already."""
+    if os.path.exists(final):
+        import shutil
+        shutil.rmtree(tmp) if os.path.isdir(tmp) else os.unlink(tmp)
+        return False
+    os.rename(tmp, final)
+    _fsync_dir(parent)  # the rename itself survives a crash
+    return True
+
+
+def _put_buffer(raw: memoryview, buffers: str) -> tuple[str, int, bool]:
+    """Store one buffer by its content: (hash, size, newly written)."""
+    digest = hashlib.blake2b(raw, digest_size=20).hexdigest()
+    final = os.path.join(buffers, digest)
+    if os.path.exists(final):
+        return digest, raw.nbytes, False
+    tmp = os.path.join(buffers, f".tmp-{os.getpid()}-{wire.new_id()[:8]}")
+    with open(tmp, "wb") as f:
+        f.write(raw)
+        f.flush()
+        os.fsync(f.fileno())
+    return digest, raw.nbytes, _install(tmp, final, buffers)
+
+
 def save_units(namespace: dict, names: list, store: str) -> dict:
     """Write the variables ``names`` into the content-addressed ``store``; returns the units and what was skipped.
-    Each unit is a directory ``store/HASH`` with ``stream`` (the pickle), ``buffers`` (raw out-of-band buffers)
-    and ``index.json``; it is written under a temporary name and renamed when complete."""
+    Every out-of-band buffer (NumPy arrays, the data of pandas objects) is stored by its own content in
+    ``store/buffers/HASH``, so a variable whose arrays did not change writes nothing new; a unit
+    (``store/units/HASH``) holds the pickle stream and the list of its buffers."""
     import json as _json
     groups: dict = {}
     for name in names:
         groups.setdefault(_alias_root(namespace[name]), []).append(name)
     units, skipped = [], []
-    os.makedirs(store, exist_ok=True)
+    units_dir, buffers_dir = os.path.join(store, "units"), os.path.join(store, "buffers")
+    os.makedirs(units_dir, exist_ok=True)
+    os.makedirs(buffers_dir, exist_ok=True)
     for members in groups.values():
-        tmp = os.path.join(store, f".tmp-{os.getpid()}-{wire.new_id()[:8]}")
+        tmp = os.path.join(units_dir, f".tmp-{os.getpid()}-{wire.new_id()[:8]}")
         os.makedirs(tmp)
-        hs, hb = hashlib.blake2b(digest_size=20), hashlib.blake2b(digest_size=20)  # stream and buffers
-        sizes = []
+        hs = hashlib.blake2b(digest_size=20)
+        buffers, new_bytes = [], 0
         try:
-            with open(os.path.join(tmp, "buffers"), "wb") as fb:
-                def buffer(b: pickle.PickleBuffer) -> bool:
-                    raw = b.raw()
-                    sizes.append(raw.nbytes)
-                    hb.update(raw.nbytes.to_bytes(8, "little"))
-                    hb.update(raw)
-                    fb.write(raw)
-                    return False
-                with open(os.path.join(tmp, "stream"), "wb") as fs:
-                    class Tee:
-                        def write(self, data):
-                            hs.update(data)
-                            return fs.write(data)
-                    roots = {id(_root(namespace[n])) for n in members if type(namespace[n]).__name__ == "ndarray"}
-                    _SavePickler(Tee(), protocol=5, buffer_callback=buffer, roots=roots).dump(
-                        {n: namespace[n] for n in sorted(members, key=lambda n: getattr(namespace[n], "base", None) is not None)})
-                    fs.flush()
-                    os.fsync(fs.fileno())
-                fb.flush()
-                os.fsync(fb.fileno())
-            digest = _unit_digest(hs, hb)
+            def buffer(b: pickle.PickleBuffer) -> bool:
+                nonlocal new_bytes
+                digest, size, new = _put_buffer(b.raw(), buffers_dir)
+                buffers.append([digest, size])
+                new_bytes += size if new else 0
+                return False
+            with open(os.path.join(tmp, "stream"), "wb") as fs:
+                class Tee:
+                    def write(self, data):
+                        hs.update(data)
+                        return fs.write(data)
+                roots = {id(_root(namespace[n])) for n in members if type(namespace[n]).__name__ == "ndarray"}
+                _SavePickler(Tee(), protocol=5, buffer_callback=buffer, roots=roots).dump(
+                    {n: namespace[n] for n in sorted(members, key=lambda n: getattr(namespace[n], "base", None) is not None)})
+                fs.flush()
+                os.fsync(fs.fileno())
+            digest = _unit_digest(hs, buffers)
             with open(os.path.join(tmp, "index.json"), "w") as f:
-                _json.dump({"format": 1, "buffers": sizes, "names": members}, f)
+                _json.dump({"format": CHECKPOINT_FORMAT, "buffers": buffers, "names": members}, f)
                 f.flush()
                 os.fsync(f.fileno())
             _fsync_dir(tmp)
-            final = os.path.join(store, digest)
-            size = os.path.getsize(os.path.join(tmp, "stream")) + sum(sizes)
-            if os.path.exists(final):  # the same content is stored already
-                import shutil
-                shutil.rmtree(tmp)
-                units.append({"hash": digest, "names": members, "bytes": size, "new": False})
-            else:
-                os.rename(tmp, final)
-                _fsync_dir(store)  # the rename itself survives a crash
-                units.append({"hash": digest, "names": members, "bytes": size, "new": True})
+            stream_bytes = os.path.getsize(os.path.join(tmp, "stream"))
+            new = _install(tmp, os.path.join(units_dir, digest), units_dir)
+            units.append({"hash": digest, "names": members, "bytes": stream_bytes + sum(s for _, s in buffers),
+                          "new_bytes": new_bytes + (stream_bytes if new else 0)})
         except Exception as error:  # noqa: BLE001 - this unit is skipped, the others are saved
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -660,41 +680,54 @@ def save_units(namespace: dict, names: list, store: str) -> dict:
     return {"units": units, "skipped": skipped}
 
 
+def _unit_digest(stream_hash, buffers: list) -> str:
+    """A unit's identity: its stream and the identities of its buffers, in order."""
+    h = hashlib.blake2b(stream_hash.digest(), digest_size=20)
+    for digest, size in buffers:
+        h.update(bytes.fromhex(digest) + size.to_bytes(8, "little"))
+    return h.hexdigest()
+
+
 def load_units(namespace: dict, store: str, units: list, only: list | None = None) -> dict:
-    """Read units back into ``namespace``, checking each one's hash; buffers become ordinary writable memory."""
+    """Read units back into ``namespace``, checking every buffer's and stream's hash; buffers become ordinary
+    writable memory, a separate allocation for each restored buffer."""
     import json as _json
-    _RESTORE["ns"] = namespace
-    loaded, total = [], 0
+    hex40 = re.compile(r"[0-9a-f]{40}")
     for unit in units:  # checked before anything is unpickled: names, hashes, no link in the way
-        if not re.fullmatch(r"[0-9a-f]{40}", str(unit.get("hash"))) or not all(
+        if not hex40.fullmatch(str(unit.get("hash"))) or not all(
                 isinstance(n, str) and n.isidentifier() for n in unit.get("names", [])):
             raise ValueError(f"malformed checkpoint unit {str(unit)[:200]}")
-        if os.path.islink(os.path.join(store, unit["hash"])) or os.path.islink(store):
-            raise ValueError(f"unit {unit['hash']} is a symbolic link; refusing to load it")
+    if any(os.path.islink(p) for p in (store, os.path.join(store, "units"), os.path.join(store, "buffers"))):
+        raise ValueError("the checkpoint store goes through a symbolic link; refusing to load from it")
+    _RESTORE["ns"] = namespace
+    loaded, total = [], 0
     for unit in units:
         if only and not set(unit["names"]) & set(only):
             continue
-        d = os.path.join(store, unit["hash"])
+        d = os.path.join(store, "units", unit["hash"])
+        if os.path.islink(d):
+            raise ValueError(f"unit {unit['hash']} is a symbolic link; refusing to load it")
         index = _json.loads(open(os.path.join(d, "index.json")).read())
-        if index.get("format") not in (None, 1) or not all(isinstance(n, int) and n >= 0 for n in index["buffers"]):
-            raise ValueError(f"unit {unit['hash']} has an unknown format or malformed buffer sizes")
-        if os.path.getsize(os.path.join(d, "buffers")) != sum(index["buffers"]):
-            raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: its buffers are truncated")
+        if index.get("format") != CHECKPOINT_FORMAT or not all(
+                hex40.fullmatch(str(h)) and isinstance(s, int) and s >= 0 for h, s in index["buffers"]):
+            raise ValueError(f"unit {unit['hash']} has an unknown format or malformed buffers")
         with open(os.path.join(d, "stream"), "rb") as f:
             stream = f.read()
-        data = bytearray(sum(index["buffers"]))
-        with open(os.path.join(d, "buffers"), "rb") as f:
-            f.readinto(data)
-        hs, hb = hashlib.blake2b(stream, digest_size=20), hashlib.blake2b(digest_size=20)
-        views, at = [], 0
-        mv = memoryview(data)
-        for n in index["buffers"]:
-            hb.update(n.to_bytes(8, "little"))
-            hb.update(mv[at:at + n])
-            views.append(mv[at:at + n])
-            at += n
-        if _unit_digest(hs, hb) != unit["hash"]:
-            raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: its content does not "
+        views = []
+        for digest, size in index["buffers"]:
+            path = os.path.join(store, "buffers", digest)
+            if os.path.islink(path) or os.path.getsize(path) != size:
+                raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: buffer {digest} "
+                                 "is missing, truncated or a link")
+            data = bytearray(size)
+            with open(path, "rb") as f:
+                f.readinto(data)
+            if hashlib.blake2b(data, digest_size=20).hexdigest() != digest:
+                raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: buffer {digest} "
+                                 "does not match its hash")
+            views.append(memoryview(data))
+        if _unit_digest(hashlib.blake2b(stream, digest_size=20), index["buffers"]) != unit["hash"]:
+            raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: its stream does not "
                              "match its hash")
         values = pickle.loads(stream, buffers=views)
         for name, value in values.items():
@@ -901,11 +934,20 @@ class Helper:
     def _save(self, names: list | None, store: str) -> dict:
         """talo save, in a fork of the session: write variables to the store (see "Checkpoints" in design.md)."""
         ns = self._worker.namespace
+        selection = names  # None: everything, including what imports bound
         names = names or [k for k, v in list(ns.items()) if is_user_variable(k, v) and k != "talo"]
         missing = [n for n in names if n not in ns]
         out = save_units(ns, [n for n in names if n in ns], store)
         out["skipped"] += [{"name": n, "reason": "no such variable"} for n in missing]
         cwd = os.path.realpath(os.getcwd())
+        out["imports"] = {}
+        for k, v in list(ns.items()):  # names bound by import statements: brought back by importing again
+            if k.startswith("_") or k in ("In", "Out", "talo", "display") or (selection and k not in selection):
+                continue
+            if isinstance(v, type(sys)):
+                out["imports"][k] = {"module": v.__name__}
+            elif not is_user_variable(k, v) and getattr(v, "__module__", None) not in (None, "__main__"):
+                out["imports"][k] = {"module": v.__module__, "attr": getattr(v, "__qualname__", k)}
         out["modules"] = sorted(name for name, m in list(sys.modules.items())
                                 if (f := getattr(m, "__file__", None)) and not _excluded(f)
                                 and os.path.realpath(f).startswith(cwd + os.sep))
@@ -915,10 +957,20 @@ class Helper:
         return out
 
     def _load(self, store: str, units: list, only: list | None = None, modules: list | None = None,
-              versions: dict | None = None) -> dict:
-        """talo restore: import the session's modules, then read the units back."""
+              versions: dict | None = None, imports: dict | None = None) -> dict:
+        """talo restore: import the session's modules and names bound by imports, then read the units back."""
         import importlib
         failed = []
+        for name, spec in (imports or {}).items():
+            if only and name not in only:
+                continue
+            try:
+                value = importlib.import_module(spec["module"])
+                for part in spec.get("attr", "").split(".") if spec.get("attr") else []:
+                    value = getattr(value, part)
+                self._worker.namespace[name] = value
+            except Exception as error:  # noqa: BLE001
+                failed.append(f"{name} ({spec['module']}): {type(error).__name__}: {error}"[:200])
         for m in modules or []:
             try:
                 importlib.import_module(m)

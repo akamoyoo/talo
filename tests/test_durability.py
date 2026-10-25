@@ -43,10 +43,10 @@ def test_save_and_restore_keep_values_aliasing_and_functions(talo):
 def test_a_corrupt_unit_is_refused(talo, talo_home):
     talo("run", "import numpy as np\nx = np.ones(100)")
     talo("save", "--name", "c")
-    unit = next((talo_home / "store").iterdir())
-    data = bytearray((unit / "buffers").read_bytes())
+    buf = next((talo_home / "store" / "buffers").iterdir())
+    data = bytearray(buf.read_bytes())
     data[0] ^= 0xFF
-    (unit / "buffers").write_bytes(bytes(data))
+    buf.write_bytes(bytes(data))
     rc, out = run_json(talo, "restore", "default/c", "--as", "bad")
     assert rc == 1 and "corrupt" in out["error"]["evalue"]
 
@@ -94,11 +94,12 @@ def test_restore_is_atomic_and_recover_uses_complete_checkpoints(talo, talo_home
     flags = {x["name"]: x for x in c["checkpoints"]}
     assert set(flags) == {"full", "only_a"}
     manifest = json.loads((talo_home / "checkpoints" / "default" / "full.json").read_text())
-    assert manifest["complete"] and manifest["format"] == 1 and manifest["selection"] is None
+    assert manifest["complete"] and manifest["format"] == 2 and manifest["selection"] is None
     # corrupt the unit of b: restoring into a session that has a and b leaves it unchanged
     talo("run", "a = 'kept'\nb = 'kept'")
     unit_b = [u for u in manifest["units"] if "b" in u["names"]][0]["hash"]
-    (talo_home / "store" / unit_b / "buffers").write_bytes(b"\0" * 79 + b"\1")
+    index = json.loads((talo_home / "store" / "units" / unit_b / "index.json").read_text())
+    (talo_home / "store" / "buffers" / index["buffers"][0][0]).write_bytes(b"\0" * 79 + b"\1")
     rc, out = run_json(talo, "restore", "default/full", "-s", "default")
     assert rc == 1 and out["atomic"]["outcome"] == "restored"
     assert show(talo, "a") == "'kept'" and show(talo, "b") == "'kept'"
@@ -114,3 +115,18 @@ def test_a_malformed_manifest_is_refused(talo, talo_home):
     path.write_text(json.dumps(m))
     rc, out = run_json(talo, "restore", "default/m", "--as", "z")
     assert rc == 2 and "malformed" in out["error"]["message"]
+
+
+def test_only_changed_buffers_are_written_and_imports_come_back(talo):
+    talo("run", "import numpy as np\nfrom collections import OrderedDict\nfrom types import SimpleNamespace\n"
+                "box = SimpleNamespace(a=np.ones(1_000_000), b=np.zeros(1_000_000))\n"
+                "def total():\n    return float(np.sum(box.a)) + len(OrderedDict(x=1))")
+    rc, first = run_json(talo, "save", "--name", "one")
+    assert first["job"]["result"]["new_bytes"] > 15_000_000
+    talo("run", "box.b[0] = 5")                                   # one of the two arrays changes
+    rc, second = run_json(talo, "save", "--name", "two")
+    assert 7_000_000 < second["job"]["result"]["new_bytes"] < 9_000_000   # only b is written again
+    rc, out = run_json(talo, "restore", "default/two", "--as", "r")
+    assert rc == 0
+    rc, out = run_json(talo, "run", "-s", "r", "total(), float(box.b[0]), np.__name__, OrderedDict.__name__")
+    assert out["job"]["result"]["data"]["text/plain"] == "(1000001.0, 5.0, 'numpy', 'OrderedDict')"

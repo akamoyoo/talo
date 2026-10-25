@@ -2835,16 +2835,16 @@ class Supervisor:
             if "value" not in meta:
                 raise RuntimeError(f"the save did not report its units: {meta.get('error')}")
             saved = meta["value"]
-            manifest = {"format": 1, "id": wire.new_id(), "session": session.name, "session_id": session.id,
+            manifest = {"format": 2, "id": wire.new_id(), "session": session.name, "session_id": session.id,
                         "name": job.params["name"], "created": time.time(), "selection": job.params["names"],
                         "complete": not saved["skipped"] and not job.params["names"],
                         "auto": job.params["auto"], "owner": job.owner, "rev": fork.result["rev"],
                         "base": fork.result["base"], "jobs_since_base": fork.result["jobs"],
                         "python": session.python, "python_version": saved["python"], "cwd": session.cwd,
                         "limits": session.limits, "units": saved["units"], "skipped": saved["skipped"],
-                        "modules": saved["modules"], "versions": saved["versions"],
+                        "modules": saved["modules"], "imports": saved["imports"], "versions": saved["versions"],
                         "bytes": sum(u["bytes"] for u in saved["units"]),
-                        "new_bytes": sum(u["bytes"] for u in saved["units"] if u["new"])}
+                        "new_bytes": sum(u["new_bytes"] for u in saved["units"])}
             d = self._checkpoint_dir(session.name)
             d.mkdir(parents=True, exist_ok=True)
             tmp = d / f".{job.params['name']}.json.tmp"
@@ -2892,7 +2892,7 @@ class Supervisor:
         if target not in self.sessions:
             await self.op_new({"name": target, "python": req.get("python") or manifest["python"],
                                "cwd": manifest["cwd"], "owner": req.get("owner")})
-        if manifest.get("format", 1) != 1:
+        if manifest.get("format") != 2:
             raise ValueError(f"checkpoint {ref} has format {manifest.get('format')}, which this Talo cannot read")
         units = manifest["units"]
         only = req.get("names") or None
@@ -2902,7 +2902,7 @@ class Supervisor:
         code = (f"# --- restored from checkpoint {ref}\n"
                 "import json as _talo_json\n"
                 f"talo._load({str(home() / 'store')!r}, _talo_json.loads({json.dumps(json.dumps(units))}), "
-                f"{only!r}, {manifest['modules']!r}, {manifest['versions']!r})")
+                f"{only!r}, {manifest['modules']!r}, {manifest['versions']!r}, {manifest.get('imports') or {}!r})")
         self.store_ops += 1
         try:  # atomic: a unit that fails to load leaves the session as it was
             out = await self.op_run({"session": target, "code": code, "timeout": req.get("timeout", 300),
@@ -3032,18 +3032,25 @@ class Supervisor:
         if self.store_ops:
             raise RuntimeError(f"{self.store_ops} saves or restores are in progress; run gc when they are done")
         store = home() / "store"
-        used = set()
+        used_units, used_buffers = set(), set()
         for path in (home() / "checkpoints").glob("*/*.json"):
-            used |= {u["hash"] for u in json.loads(path.read_text())["units"]}
+            used_units |= {u["hash"] for u in json.loads(path.read_text())["units"]}
+        for h in used_units:
+            index = store / "units" / h / "index.json"
+            if index.exists():
+                used_buffers |= {b for b, _ in json.loads(index.read_text())["buffers"]}
         freed, removed = 0, 0
-        for unit in store.iterdir() if store.exists() else []:
-            age = time.time() - unit.lstat().st_mtime
-            if unit.name in used or (unit.name.startswith(".tmp-") and age < 3600):
-                continue
-            size = sum(f.stat().st_size for f in unit.iterdir() if f.is_file())
-            if not req.get("dry_run"):
-                shutil.rmtree(unit, ignore_errors=True)
-            freed, removed = freed + size, removed + 1
+        for kind, used in (("units", used_units), ("buffers", used_buffers)):
+            folder = store / kind
+            for entry in folder.iterdir() if folder.exists() else []:
+                age = time.time() - entry.lstat().st_mtime
+                if entry.name in used or (entry.name.startswith(".tmp-") and age < 3600):
+                    continue
+                size = (sum(f.stat().st_size for f in entry.iterdir() if f.is_file()) if entry.is_dir()
+                        else entry.lstat().st_size)
+                if not req.get("dry_run"):
+                    shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink(missing_ok=True)
+                freed, removed = freed + size, removed + 1
         return {"removed": removed, "freed_bytes": freed, "dry_run": bool(req.get("dry_run"))}
 
     # ---------------------------------------------------------------- verify
