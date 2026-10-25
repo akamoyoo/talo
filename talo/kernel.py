@@ -115,7 +115,7 @@ class Bridge:
             s = sessions[self.session]
             rss = f"{s['rss'] / (1 << 30):.1f} GB" if s.get("rss") else "?"
             self.notice = (f"[Talo kept session {self.session} ({rss}, rev {s.get('rev', '?')}); its variables are as "
-                           f"you left them. %checkout or `talo kill {self.session}` resets it.]\n")
+                           f"you left them. `talo kill {self.session}` starts it empty; %checkout SNAPSHOT returns to a snapshot.]\n")
         else:
             await self.talo("new", name=self.session, python=self.python or sys.executable, cwd=self.cwd)
         jobs = (await self.talo("jobs", session=self.session, last=1))["jobs"]
@@ -147,23 +147,41 @@ class Bridge:
         lines = [ln for ln in code.splitlines() if ln.strip()]
         if lines and all(ln.lstrip().startswith("%") for ln in lines):
             return await self.magics(lines, msg)
-        job = await self.talo("run", session=self.session, code=code, timeout=0)
+        job = await self.talo("run", session=self.session, code=code, timeout=0, silent=silent)
         self.mine.add(job["id"])
         self.running = job["id"]
-        offset, count_sent = 0, False
+        offset, count_sent, shown = 0, False, 0
         try:
             while True:
-                out = await self.talo("output", id=job["id"], offset=offset, max_bytes=1 << 20)
-                if out["text"] and not silent:
-                    await self.stream(out["text"], msg)
-                offset = out["next_offset"]
-                if not count_sent:
-                    j = await self.talo("job", id=job["id"])
-                    if j.get("execution_count") and not silent:
-                        await self.iopub("execute_input", {"code": code, "execution_count": j["execution_count"]}, msg)
-                        count_sent = True
-                if out["status"] not in ("running", "queued") and offset >= out["size"]:
+                j = await self.talo("job", id=job["id"])
+                if not count_sent and j.get("execution_count") and not silent:
+                    await self.iopub("execute_input", {"code": code, "execution_count": j["execution_count"]}, msg)
+                    count_sent = True
+                displays = [d for d in j.get("displays") or [] if d.get("offset") is not None]
+                # stream the text up to the next display, then the display, then the text after it
+                while True:
+                    nxt = displays[shown] if shown < len(displays) else None
+                    limit = (nxt["offset"] - offset) if nxt else 1 << 20
+                    if limit > 0:
+                        out = await self.talo("output", id=job["id"], offset=offset, max_bytes=limit)
+                        if out["text"] and not silent:
+                            await self.stream(out["text"], msg)
+                        offset = out["next_offset"]
+                    if nxt and offset >= nxt["offset"]:
+                        if not silent:
+                            await self.send_display(nxt, msg)
+                        offset, shown = max(offset, nxt.get("end") or offset), shown + 1
+                        continue
                     break
+                done = j["status"] not in ("running", "queued")
+                if done:
+                    out = await self.talo("output", id=job["id"], offset=offset, max_bytes=1 << 20)
+                    if out["text"] and not silent:
+                        await self.stream(out["text"], msg)
+                    if out["next_offset"] >= out["size"]:
+                        break
+                    offset = out["next_offset"]
+                    continue
                 await asyncio.sleep(POLL_S)
         finally:
             self.running = None
@@ -172,17 +190,15 @@ class Bridge:
         if not count_sent and not silent:
             await self.iopub("execute_input", {"code": code, "execution_count": n}, msg)
         if not silent:
-            for o in job.get("outputs") or []:
-                if o["mime"] in IMAGE_MIMES and Path(o["path"]).exists():
-                    raw = Path(o["path"]).read_bytes()
-                    value = raw.decode(errors="replace") if o["mime"] == "image/svg+xml" else base64.b64encode(raw).decode()
-                    await self.iopub("display_data", {"data": {o["mime"]: value, "text/plain": f"<{Path(o['path']).name}>"},
-                                                      "metadata": {}, "transient": {}}, msg)
+            for d in (job.get("displays") or [])[shown:]:  # displays without a position, if any
+                await self.send_display(d, msg)
             result = job.get("result")
             if job["status"] == "ok" and result and "data" in result:
-                data = {k: v for k, v in result["data"].items()}
-                await self.iopub("execute_result", {"execution_count": n, "data": data,
-                                                    "metadata": {}}, msg)
+                data = dict(result["data"])
+                for mime, path in (result.get("metadata") or {}).get("talo_files", {}).items():
+                    if (value := self.file_value(mime, path)) is not None:
+                        data[mime] = value
+                await self.iopub("execute_result", {"execution_count": n, "data": data, "metadata": {}}, msg)
         if job["status"] == "ok":
             return {"status": "ok", "execution_count": n, "user_expressions": {}, "payload": []}, {}
         error = job.get("error") or {"ename": job["status"], "evalue": "", "traceback": []}
@@ -191,6 +207,21 @@ class Bridge:
         if not silent:
             await self.iopub("error", err, msg)
         return {"status": "error", "execution_count": n, **err}, {}
+
+    @staticmethod
+    def file_value(mime: str, path: str) -> str | None:
+        """An image file as a Jupyter mime value: base64 for PNG / JPEG, text for SVG."""
+        if not Path(path).exists():
+            return None
+        raw = Path(path).read_bytes()
+        return raw.decode(errors="replace") if mime == "image/svg+xml" else base64.b64encode(raw).decode()
+
+    async def send_display(self, d: dict, msg: dict) -> None:
+        data = dict(d.get("data") or {})
+        for mime, path in (d.get("files") or {}).items():
+            if (value := self.file_value(mime, path)) is not None:
+                data[mime] = value
+        await self.iopub("display_data", {"data": data, "metadata": {}, "transient": {}}, msg)
 
     async def magics(self, lines: list[str], msg: dict) -> tuple[dict, dict]:
         from talo.cli import main
@@ -387,7 +418,7 @@ def install_kernelspec(session: str, name: str | None = None, python: str | None
     argv = [sys.executable, "-m", "talo.cli", "kernel", "--session", session, "-f", "{connection_file}"]
     if python:
         argv[-2:-2] = ["--python", python]
-    spec = {"argv": argv, "display_name": f"Talo: {session}", "language": "python",
+    spec = {"argv": argv, "display_name": f"Talo: {session} (persistent)", "language": "python",
             "metadata": {"talo": {"session": session}}, "interrupt_mode": "message"}
     if "TALO_HOME" in os.environ:
         spec["env"] = {"TALO_HOME": os.environ["TALO_HOME"]}

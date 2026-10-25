@@ -66,6 +66,15 @@ def test_execute_streams_results_errors_and_images(kernel):
     assert images and images[0]["data"]["image/png"] == "UE5H"   # base64 of b"PNG"
 
 
+def test_displays_stay_in_order_with_printed_text(kernel):
+    kc = kernel()
+    code = ("class H:\n    def _repr_html_(self):\n        return '<b>hi</b>'\n    def __repr__(self):\n        return 'H'\n"
+            "print('before')\ndisplay(H())\nprint('after')")
+    reply, outs = run(kc, code)
+    seq = [(t, c.get("text") or c.get("data", {}).get("text/html")) for t, c in outs if t in ("stream", "display_data")]
+    assert seq == [("stream", "before\n"), ("display_data", "<b>hi</b>"), ("stream", "after\n")]
+
+
 def test_magics_rollback_and_restart_keeps_the_session(kernel, talo):
     kc = kernel()
     run(kc, "x = 1")
@@ -111,7 +120,7 @@ def test_kernelspec_install(talo_home, tmp_path):
     out = subprocess.run([sys.executable, "-m", "talo.cli", "kernelspec", "install", "-s", "research", "--json"],
                          capture_output=True, text=True, env=env, timeout=30)
     spec = json.loads((tmp_path / "kernels" / "talo-research" / "kernel.json").read_text())
-    assert out.returncode == 0 and spec["display_name"] == "Talo: research"
+    assert out.returncode == 0 and spec["display_name"] == "Talo: research (persistent)"
     assert spec["argv"][-4:] == ["--session", "research", "-f", "{connection_file}"]
 
 

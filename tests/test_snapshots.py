@@ -170,6 +170,7 @@ def test_autosnap_and_undo(talo):
         talo("run", f"x = {i}")
     rc, snaps = run_json(talo, "snaps")
     assert [s["name"] for s in snaps["snapshots"]] == ["@4", "@5", "@6"] and all(s["auto"] for s in snaps["snapshots"])
+    # the baseline @1 (taken when autosnap was turned on) was dropped with the oldest
     rc, out = run_json(talo, "undo")
     assert rc == 0 and x() == "4"
     talo("run", "x = 'oops'")        # @6 again on another branch: the abandoned @6 is replaced
@@ -178,3 +179,12 @@ def test_autosnap_and_undo(talo):
     assert x() == "'oops'"
     talo("checkout", "@4", "--discard")
     assert x() == "3"
+
+
+def test_autosnap_baseline_makes_the_first_undo_work(talo):
+    talo("run", "x = 'before'")
+    rc, d = run_json(talo, "autosnap", "on")
+    assert d["baseline"] == "default:s1"
+    talo("run", "x = 'after'")
+    talo("undo")
+    assert run_json(talo, "show", "x")[1]["text"] == "'before'"

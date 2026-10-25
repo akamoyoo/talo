@@ -747,10 +747,23 @@ class Worker:
         its images to files."""
         for obj in objs:
             data, meta = mime_bundle(obj, self.save if self.out_path else None)
+            start = self.output_offset()
             if "talo_files" not in meta:
-                print(data["text/plain"])
+                print(data["text/plain"])  # the CLI shows the text in place; Jupyter front ends show the bundle
+            meta["talo_offset"], meta["talo_end"] = start, self.output_offset()
             if self.parent is not None:
                 self.send("display_data", {"data": data, "metadata": meta, "transient": {}}, self.parent)
+
+    def output_offset(self) -> int | None:
+        """Bytes written to the job's output so far: where a display sits among the printed text."""
+        if not self.out_path:
+            return None
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            return os.fstat(1).st_size
+        except OSError:
+            return None
 
     def flush_figures(self, *_, **__):
         """Save and close the open matplotlib figures (Jupyter's inline backend does the same after each cell)."""
@@ -771,7 +784,9 @@ class Worker:
                 print(f"[talo: figure {num} could not be saved: {type(error).__name__}: {error}]", file=sys.stderr)
                 continue
             path = self.save(buf.getvalue(), ".png")
-            self.send("display_data", {"data": {"text/plain": repr(fig)}, "metadata": {"talo_files": {"image/png": path}},
+            at = self.output_offset()
+            self.send("display_data", {"data": {"text/plain": repr(fig)},
+                                       "metadata": {"talo_files": {"image/png": path}, "talo_offset": at, "talo_end": at},
                                        "transient": {}}, self.parent)
         plt.close("all")
 

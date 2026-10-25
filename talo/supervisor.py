@@ -137,6 +137,7 @@ class Job:
     error: dict | None = None   # ename / evalue / traceback
     metrics: dict = field(default_factory=dict)
     outputs: list = field(default_factory=list)  # files of rich outputs: {"mime", "path"}
+    displays: list = field(default_factory=list)  # display() / figures in order: {offset, end, data, files}
     owner: str = "user"                        # who submitted it ($TALO_AGENT / --owner)
     session_id: str | None = None              # the incarnation of the session it was submitted to
     key: str | None = None                     # idempotency key (run --key)
@@ -157,7 +158,7 @@ class Job:
 
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
-                                            "execution_count", "result", "error", "metrics", "output", "outputs", "owner", "key",
+                                            "execution_count", "result", "error", "metrics", "output", "outputs", "displays", "owner", "key",
                                             "rev", "atomic", "termination", "phase", "published", "autosnap")}
         out["progress"] = self.progress
         if self.status == "running":
@@ -503,7 +504,7 @@ class Session:
                     status = await (self._execute_atomic(job) if job.params.get("atomic") else self._execute(job))
                     if status == "ok" and job.staged:
                         await self._publish(job)
-                    if status == "ok" and self.autosnap and job.execution_count:
+                    if status == "ok" and self.autosnap and job.execution_count and not job.params.get("silent"):
                         await self._autosnap(job)
                     self._finish(job, status)
                 elif job.kind == "snap":
@@ -545,7 +546,8 @@ class Session:
         if self.state == "dead":
             job.error = {"ename": "SessionDead", "evalue": self.death, "traceback": []}
             return "lost"
-        msg = wire.message("execute_request", {"code": job.code, "silent": False, "store_history": True,
+        silent = bool(job.params.get("silent"))
+        msg = wire.message("execute_request", {"code": job.code, "silent": silent, "store_history": not silent,
                                                "user_expressions": {}, "allow_stdin": False, "stop_on_error": True},
                            session=self.name, metadata={"talo_output": job.output, "talo_job": job.id})
         job.phase, job.exec_pid = "executing", self.worker_pid
@@ -563,8 +565,11 @@ class Session:
                     job.result = {"data": got["content"]["data"], "metadata": got["content"].get("metadata", {})}
                     job.outputs += [{"mime": m, "path": p} for m, p in job.result["metadata"].get("talo_files", {}).items()]
                 elif kind == "display_data":
-                    job.outputs += [{"mime": m, "path": p}
-                                    for m, p in got["content"].get("metadata", {}).get("talo_files", {}).items()]
+                    meta = got["content"].get("metadata", {})
+                    job.outputs += [{"mime": m, "path": p} for m, p in meta.get("talo_files", {}).items()]
+                    job.displays.append({"offset": meta.get("talo_offset"), "end": meta.get("talo_end"),
+                                         "data": {k: v for k, v in got["content"]["data"].items()},
+                                         "files": meta.get("talo_files", {})})
                 elif kind == "error":
                     job.error = dict(got["content"])
                 elif kind == "talo_progress":
@@ -1044,7 +1049,8 @@ class Supervisor:
                               f"back, or `talo kill {session.name}` and create it again)")
         job = await self._submit(session, "execute", req["code"], owner=req.get("owner"), key=req.get("key"),
                                  fingerprint=fingerprint, expect_rev=req.get("expect_rev"),
-                                 **({"atomic": True} if req.get("atomic") else {}))
+                                 **({"atomic": True} if req.get("atomic") else {}),
+                                 **({"silent": True} if req.get("silent") else {}))
         return await self._wait(job, req.get("timeout", 30))
 
     async def op_job(self, req):
@@ -1191,9 +1197,20 @@ class Supervisor:
 
     async def op_autosnap(self, req):
         session = self._session(req["session"])
+        baseline = None
         if req.get("on") is not None:
+            was_on = session.autosnap is not None
             session.autosnap = {"keep": max(1, int(req.get("keep") or 10))} if req["on"] else None
-        return {"session": session.name, "autosnap": session.autosnap}
+            if req["on"] and not was_on and (session.base is None or session.jobs_since_base):
+                # a baseline, so that the first undo has a state to return to
+                counts = [j.execution_count for j in self.jobs.values()
+                          if j.session_id == session.id and j.kind == "execute" and j.execution_count]
+                out = await self._control(session, "snap", req.get("timeout", 300), {}, name=f"@{counts[-1] if counts else 0}",
+                                          message="autosnap baseline", strict=False)
+                if "job" not in out:
+                    session.find(out["name"]).auto = True
+                    baseline = out["ref"]
+        return {"session": session.name, "autosnap": session.autosnap, "baseline": baseline}
 
     async def op_undo(self, req):
         """Check out the state before the last execution: the base if jobs ran since it, else the base's parent."""
