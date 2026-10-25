@@ -614,7 +614,9 @@ $ talo reject clean                        # or drop it
 - `run --retain-error` keeps the failed state: if the code fails, the worker keeps the exception (with its traceback
   and the frames' local variables) as `_talo_error`, Talo takes a snapshot `error-JOB` of that state, and the live
   worker drops the reference. `talo new debug --from error-JOB` then gives a session where the failure can be
-  examined without running the expensive computation again. With `--atomic`, the snapshot is taken before the
+  examined without running the expensive computation again. The traceback starts at the user's code
+  (`_talo_error.__traceback__.tb_next.tb_frame.f_locals` are the locals of the next frame down); everything those
+  frames reference stays in the snapshot's memory until it is dropped. With `--atomic`, the snapshot is taken before the
   restore.
 
 ### Files: `talo.artifact_path()`

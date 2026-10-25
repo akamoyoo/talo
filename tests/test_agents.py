@@ -303,3 +303,27 @@ def test_killing_a_job_tree_spares_the_snapshots(talo):
     assert out["job"]["status"] == "lost"
     rc, out = run_json(talo, "checkout", "keep")             # the snapshot (a child of the worker) survived
     assert rc == 0 and run_json(talo, "show", "x")[1]["text"] == "1"
+
+
+def test_diagnose_a_running_job(talo):
+    talo("run", "import time\ndef inner():\n    time.sleep(30)\ndef outer():\n    inner()")
+    rc, out = run_json(talo, "run", "outer()", "-t", "0.5")
+    jid = out["job"]["id"]
+    rc, d = run_json(talo, "diagnose", jid)
+    assert rc == 0 and "inner" in d["stack"] and "outer" in d["stack"] and d["cpu_percent"] is not None
+    rc, d = run_json(talo, "jobs", "--last", "1")
+    assert d["jobs"][0]["status"] == "running"            # diagnosing did not stop it
+    talo("interrupt", jid)
+
+
+def test_retain_error_keeps_the_failed_state(talo):
+    talo("run", "def compute(n):\n    partial = [i * i for i in range(n)]\n    raise ValueError('bad input')")
+    rc, out = run_json(talo, "run", "result = compute(5)", "--retain-error")
+    name = out["job"]["retained"]["name"]
+    assert out["job"]["status"] == "error" and name.startswith("error-")
+    assert run_json(talo, "run", "'_talo_error' in globals()")[1]["job"]["result"]["data"]["text/plain"] == "False"
+    talo("new", "debug", "--from", name)
+    rc, out = run_json(talo, "run", "-s", "debug", "_talo_error.__traceback__.tb_next.tb_frame.f_locals['partial']")
+    assert out["job"]["result"]["data"]["text/plain"] == "[0, 1, 4, 9, 16]"
+    rc, out = run_json(talo, "run", "--atomic", "--retain-error", "x = 1\nraise KeyError('k')")
+    assert out["job"]["atomic"]["outcome"] == "restored" and out["job"]["retained"]["name"].startswith("error-")

@@ -139,6 +139,8 @@ def status_line(job: dict) -> str:
         return (f"[job {jid} {status}{elapsed}{live}] `talo wait {jid}` for the result, `talo tail {jid}` for output, "
                 f"`talo interrupt {jid}` to stop it")
     atomic = job.get("atomic") or {}
+    if (job.get("retained") or {}).get("name"):
+        status += f", failed state kept as {job['retained']['name']} (`talo new debug --from {job['retained']['name']}`)"
     if job.get("termination"):
         status += {"memory_limit": ", stopped by the memory limit", "deadline": ", stopped at its deadline",
                    "output_limit": ", stopped: too much output"}.get(job["termination"], f", stopped ({job['termination']})")
@@ -239,7 +241,8 @@ def cmd_run(args):
     code = read_code(args)
     ensure_session(name, args.python)
     job = call("run", session=name, code=code, timeout=args.timeout, key=args.key, expect_rev=args.expect_rev,
-               atomic=args.atomic, deadline=args.deadline, max_output=parse_size(args.max_output))
+               atomic=args.atomic, deadline=args.deadline, max_output=parse_size(args.max_output),
+               retain_error=args.retain_error)
     show_job(args, job)
     return exit_code(job)
 
@@ -484,6 +487,23 @@ def cmd_jobs(args):
             print(f"{status_line(j)}  {(preview[0] if preview else '')[:80]}")
     session = None if args.all_sessions else session_name(args)
     emit(args, call("jobs", session=session, last=args.last), human)
+
+
+def cmd_diagnose(args):
+    def human(d):
+        cpu = f"{d['cpu_percent']:.0f}%" if d["cpu_percent"] is not None else "?"
+        st = d["status"]
+        print(f"job {d['job']} pid {d['pid']}: running {d['elapsed_s']:.0f}s, cpu {cpu}, {st.get('State', '?')}, "
+              f"{st.get('Threads', '?')} threads, rss {st.get('VmRSS', '?')} (peak {st.get('VmHWM', '?')})")
+        if d["io"]:
+            print(f"io: read {human_bytes(d['io'].get('rchar'))}, written {human_bytes(d['io'].get('wchar'))}")
+        if d.get("last_output_age_s") is not None:
+            print(f"last output {d['last_output_age_s']:.0f}s ago" + (f", progress {d['progress']}" if d.get("progress") else ""))
+        for c in d["children"]:
+            print(f"child {c['pid']}: {c['cmdline']}")
+        if d["stack"]:
+            print(d["stack"].rstrip())
+    emit(args, call("diagnose", id=args.id, stack=not args.no_stack), human)
 
 
 def cmd_interrupt(args):
@@ -966,6 +986,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deadline", type=float, metavar="SECONDS",
                    help="stop the job after this long (independent of -t, which only bounds the wait)")
     p.add_argument("--max-output", metavar="SIZE", help="stop the job if its output grows past this (e.g. 100M)")
+    p.add_argument("--retain-error", action="store_true",
+                   help="if the code fails, keep the failed state (with the exception as _talo_error) as a snapshot")
     p.add_argument("--atomic", action="store_true",
                    help="run inside a checkpoint: if the code fails, the session is restored to its state before it")
     p = add("wait", cmd_wait, "wait for a job to finish", session=False)
@@ -984,6 +1006,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("jobs", cmd_jobs, "list jobs")
     p.add_argument("--last", type=int, default=20)
     p.add_argument("--all-sessions", action="store_true", help="jobs of every session")
+    p = add("diagnose", cmd_diagnose, "what a running job is doing: thread stacks, CPU, IO, memory, child processes",
+            session=False)
+    p.add_argument("id")
+    p.add_argument("--no-stack", action="store_true", help="skip the stack dump")
     p = add("interrupt", cmd_interrupt, "interrupt a running job (a queued job is cancelled)", session=False)
     p.add_argument("id")
     p = add("vars", cmd_vars, "list the session's variables (name, type, shape, memory)")

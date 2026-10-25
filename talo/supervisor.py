@@ -248,6 +248,7 @@ class Job:
     published: dict | None = None              # {"versions": [...]} or {"error": ...} after publication
     autosnap: dict | None = None               # the snapshot taken after it by talo autosnap
     user_expressions: dict | None = None       # Jupyter user_expressions evaluated after the code
+    retained: dict | None = None               # run --retain-error: the snapshot of the failed state
     progress: dict | None = None               # the last talo.progress() of a running job
     progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
@@ -258,7 +259,7 @@ class Job:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "displays", "owner", "key",
                                             "rev", "atomic", "termination", "phase", "published", "autosnap",
-                                            "user_expressions")}
+                                            "user_expressions", "retained")}
         out["progress"] = self.progress
         if self.status == "running":
             out["last_progress_age_s"] = round(time.monotonic() - self.progress_at, 1) if self.progress_at else None
@@ -618,6 +619,8 @@ class Session:
                 if job.kind == "execute":
                     autosnap = self.autosnap  # the setting when the job started, whatever changes meanwhile
                     status = await (self._execute_atomic(job) if job.params.get("atomic") else self._execute(job))
+                    if status in ("error", "interrupted") and job.params.get("retain_error") and not job.params.get("atomic"):
+                        await self._keep_error(job)
                     if status == "ok" and job.staged:
                         await self._publish(job)
                     if status == "ok" and autosnap and job.execution_count and not job.params.get("silent"):
@@ -671,7 +674,8 @@ class Session:
                                                "store_history": job.params.get("store_history", True) and not silent,
                                                "user_expressions": job.params.get("user_expressions") or {},
                                                "allow_stdin": False, "stop_on_error": True},
-                           session=self.name, metadata={"talo_output": job.output, "talo_job": job.id})
+                           session=self.name, metadata={"talo_output": job.output, "talo_job": job.id,
+                                                        "talo_retain_error": bool(job.params.get("retain_error"))})
         job.phase, job.exec_pid = "executing", self.worker_pid
         q = self._send(msg)
         guard = asyncio.create_task(self._guard(job))  # deadline and output limit
@@ -723,6 +727,24 @@ class Session:
             guard.cancel()
             job.exec_pid = None
             self.waiters.pop(msg["header"]["msg_id"], None)
+
+    async def _keep_error(self, job: Job, drop_reference: bool = True) -> None:
+        """run --retain-error: snapshot the failed state (the worker holds the exception, its traceback and the
+        frames' locals as `_talo_error`), then let the live worker drop that reference."""
+        try:
+            snap = await self._fork(f"e{job.id}", strict=False, name=f"error-{job.id}",
+                                    message=f"state when job {job.id} failed; the exception is _talo_error",
+                                    owner=job.owner)
+        except Exception as error:  # noqa: BLE001
+            job.retained = {"error": f"{type(error).__name__}: {error}"}
+            return
+        self.snapshots[snap.id] = snap  # a named snapshot, but the session's base and lineage are unchanged
+        job.retained = {"snapshot": snap.ref, "name": snap.name}
+        self.emit("snapshot.created", session=self.name, snapshot=snap.ref, name=snap.name, owner=job.owner)
+        if drop_reference and self.state != "dead":
+            await self.request("execute_request", {"code": "globals().pop('_talo_error', None)", "silent": True,
+                                                   "store_history": False, "user_expressions": {},
+                                                   "allow_stdin": False}, timeout=60)
 
     async def _guard(self, job: Job) -> None:
         """Stop a job that passes its deadline (--deadline) or writes more than its output limit (--max-output): an
@@ -779,6 +801,8 @@ class Session:
                 job.atomic = {"outcome": "committed"}
                 return status
             job.phase = "restoring"
+            if job.params.get("retain_error") and status in ("error", "interrupted"):
+                await self._keep_error(job, drop_reference=False)  # before the restore replaces this state
             try:
                 await self._replace_from(checkpoint)
                 self.base, self.jobs_since_base = base, before  # the failed job leaves the lineage
@@ -1238,6 +1262,7 @@ class Supervisor:
         fingerprint = {"op": "run", "code": req["code"], "expect_rev": req.get("expect_rev"),
                        "atomic": bool(req.get("atomic")), "silent": bool(req.get("silent")),
                        "store_history": req.get("store_history", True), "deadline": req.get("deadline"),
+                       "retain_error": bool(req.get("retain_error")),
                        "max_output": req.get("max_output")}
         if job := self._deduplicated(session, req, fingerprint):
             return {**await self._wait(job, req.get("timeout", 30)), "deduplicated": True}
@@ -1249,6 +1274,7 @@ class Supervisor:
                                  **({"atomic": True} if req.get("atomic") else {}),
                                  **({"silent": True} if req.get("silent") else {}),
                                  **({"deadline": float(req["deadline"])} if req.get("deadline") else {}),
+                                 **({"retain_error": True} if req.get("retain_error") else {}),
                                  **({"max_output": int(req["max_output"])} if req.get("max_output") else {}),
                                  **({"store_history": False} if req.get("store_history") is False else {}),
                                  **({"user_expressions": req["user_expressions"]} if req.get("user_expressions") else {}))
@@ -1284,6 +1310,67 @@ class Supervisor:
             import base64
             return {**out, "data": base64.b64encode(data).decode()}
         return {**out, "text": strip_marks(data.decode(errors="replace"))}
+
+    async def op_diagnose(self, req):
+        """A running job's thread stacks, CPU, IO, memory and child processes, without stopping it."""
+        job = self._job(req["id"])
+        session = self._session(job.session)
+        pid = job.exec_pid
+        if job.status != "running" or not pid:
+            raise RuntimeError(f"job {job.id} is {job.status}; diagnose looks at running jobs")
+
+        def cpu_ticks() -> int | None:
+            try:
+                fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                return int(fields[11]) + int(fields[12])
+            except (OSError, IndexError, ValueError):
+                return None
+        stack_path = Path(job.output.removesuffix(".out") + ".stack")
+        before, t0 = cpu_ticks(), time.monotonic()
+        size = stack_path.stat().st_size if stack_path.exists() else 0
+        if req.get("stack", True):
+            os.kill(pid, signal.SIGUSR1)
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if stack_path.exists() and stack_path.stat().st_size > size:
+                break
+        await asyncio.sleep(max(0.0, 0.5 - (time.monotonic() - t0)))
+        after = cpu_ticks()
+        cpu = None
+        if before is not None and after is not None:
+            cpu = round(100 * (after - before) / os.sysconf("SC_CLK_TCK") / (time.monotonic() - t0), 1)
+        stack = stack_path.read_text(errors="replace")[size:] if stack_path.exists() else ""
+        status = {}
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                k, _, v = line.partition(":")
+                if k in ("State", "Threads", "VmRSS", "VmHWM"):
+                    status[k] = v.strip()
+        except OSError:
+            pass
+        io = {}
+        try:
+            for line in Path(f"/proc/{pid}/io").read_text().splitlines():
+                k, _, v = line.partition(":")
+                if k in ("rchar", "wchar", "read_bytes", "write_bytes"):
+                    io[k] = int(v)
+        except OSError:
+            pass
+        try:
+            wchan = Path(f"/proc/{pid}/wchan").read_text().strip()
+        except OSError:
+            wchan = None
+        children = []
+        for c in descendants(pid, session.snapshot_pids()):
+            try:
+                cmd = Path(f"/proc/{c}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+            except OSError:
+                continue
+            children.append({"pid": c, "cmdline": cmd[:200]})
+        return {"job": job.id, "pid": pid, "elapsed_s": round(time.time() - (job.started or time.time()), 1),
+                "cpu_percent": cpu, "status": status, "wchan": wchan, "io": io, "children": children,
+                "stack": stack[-20_000:], "progress": job.progress,
+                "last_output_age_s": job.to_dict().get("last_output_age_s")}
 
     async def op_interrupt(self, req):
         if str(req["id"]) in self.calls:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import faulthandler
 import hashlib
 import importlib
 import importlib.util
@@ -843,6 +844,10 @@ class Worker:
         self.send("execute_input", {"code": code, "execution_count": n}, msg)
         out_path = meta.get("talo_output")
         self.parent, self.out_path, self.files, self.displays = msg, out_path, 0, 0
+        stack_file = None
+        if out_path:  # talo diagnose: SIGUSR1 dumps every thread's stack here, even inside C code
+            stack_file = open(out_path.removesuffix(".out") + ".stack", "w")
+            faulthandler.register(signal.SIGUSR1, file=stack_file, all_threads=True, chain=False)
         if "talo_bind" in meta:  # an ephemeral worker: names the code expects (map's `case`)
             self.namespace.update(meta["talo_bind"])
             self.namespace["talo"].case = meta.get("talo_case")
@@ -872,6 +877,11 @@ class Worker:
             if store:
                 self.namespace["In"].append(code)
         except BaseException as error:  # noqa: BLE001 - report KeyboardInterrupt / SystemExit instead of exiting
+            if meta.get("talo_retain_error"):  # run --retain-error: the frames stay reachable for a snapshot
+                tb = error.__traceback__
+                while tb is not None and tb.tb_frame.f_code.co_filename == __file__:  # start at the user's code
+                    tb = tb.tb_next
+                self.namespace["_talo_error"] = error.with_traceback(tb)
             frames = traceback.TracebackException.from_exception(error)
             frames.stack = traceback.StackSummary.from_list(
                 [f for f in frames.stack if not f.filename.endswith("talo/worker.py")])  # drop the worker's own frames
@@ -879,6 +889,9 @@ class Worker:
             reply = {"status": "error", "execution_count": n, "ename": type(error).__name__,
                      "evalue": str(error), "traceback": text.splitlines()}
         finally:
+            if stack_file is not None:
+                faulthandler.unregister(signal.SIGUSR1)
+                stack_file.close()
             try:
                 self.flush_figures()  # also after an error, as Jupyter does
             except Exception:  # noqa: BLE001
