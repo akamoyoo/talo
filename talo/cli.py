@@ -665,7 +665,7 @@ def cmd_resources(args):
             print(f"{s['name']:16s} {s['state']:8s} {human_bytes(s['pss_total'])}{unknown}{limit}")
             for p in s["processes"]:
                 mem = p["memory"] or {}
-                label = p["kind"] if p["kind"] != "snapshot" else f"snapshot {p['name']}"
+                label = p["kind"] if p["kind"] in ("worker", "checkpoint") else f"{p['kind']} {p['name']}"
                 print(f"  {label:24s} pid {p['pid']}  pss {human_bytes(mem.get('pss'))}  rss {human_bytes(mem.get('rss'))}"
                       f"  private {human_bytes((mem.get('private_dirty') or 0) + (mem.get('private_clean') or 0)) if mem else '-'}")
             if s["over_limit"]:

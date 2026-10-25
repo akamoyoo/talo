@@ -77,7 +77,7 @@ async def run(socket_path: str, code: str, output: str, *, bind: dict | None = N
             pass
         out["elapsed_s"] = round(time.monotonic() - t0, 3)
         return out
-    except asyncio.CancelledError:
+    except BaseException:  # cancelled, or the connection failed: never leave the child running
         if pid:
             try:
                 os.kill(pid, signal.SIGKILL)
