@@ -743,6 +743,43 @@ across separately saved units. Writing speed is that of the disk; buffers are wr
 them shares the session's memory copy-on-write, so a session that keeps changing large arrays during a save pays
 for the pages it changes; restoring needs the memory of the restored values.
 
+## Shared datasets (M6)
+
+One session prepares a table; other sessions, agents and map cases use it without loading it again and without
+copying it, and move to a newer version when they choose. Versions are immutable; there is no live shared object.
+
+```console
+$ talo publish panel -s loader              # the variable panel, as version 1 of dataset "panel"
+dataset panel v1: 2.4 GB (2.4 GB new), from loader job 12
+```
+```python
+panel = talo.get("panel")                   # in any session: the latest version, mapped, not copied
+panel = talo.get("panel", version=1)        # a specific version
+panel = talo.get("panel", copy=True)        # a private, writable copy
+```
+
+- **Format.** A dataset version is a checkpoint unit (the M9 format: a pickle stream plus buffers stored by content)
+  in a store on `/dev/shm` (`talo-UID/datasets`, falling back to `TALO_HOME` when there is no `/dev/shm`). A new
+  version only writes the buffers that changed: an unchanged column is the same file, and the same memory.
+- **Reading.** `talo.get` maps each buffer read-only (`mmap`), so NumPy arrays and the data of pandas objects point
+  into the shared pages: every session reading a version shares one copy in memory. The arrays are read-only; writing
+  to them raises, and `copy=True` returns private writable memory. Objects that are not buffers (indexes of Python
+  objects, small metadata) are unpickled privately in each reader. Sizes are checked on every read; content hashes
+  are checked when the version is published and with `talo.get(..., verify=True)`.
+- **Publishing.** `talo publish NAME [VAR] [-s SESSION]` writes from a fork of the session through the queue (like
+  `save`); `talo.publish(name, value)` writes from running code. The version's manifest is written last and
+  `latest` is moved atomically, so a reader always gets a complete version. The manifest records the publishing
+  session, job, revision and time.
+- **Versions are explicit.** `talo.get(name)` resolves `latest` once; the arrays it returned stay that version for as
+  long as they are used, whatever is published later. Each job records the dataset versions it read
+  (`datasets` on the job), so the ledger, export and verify know what a result depended on.
+- **Lifetime.** `talo dataset drop NAME [--version V]` removes versions; sessions that hold a version keep using it
+  (the kernel keeps the pages of unlinked files that are mapped) and its memory is freed when the last one lets go.
+  `talo datasets` lists datasets, versions, sizes, and the memory they occupy in `/dev/shm`; `talo dataset gc` removes
+  buffers no version uses.
+- **Memory accounting.** Pages of `/dev/shm` are shared memory: they count once for the machine, not per reader, and
+  `talo resources` reports the datasets' memory separately. A cgroup charges them to the session that wrote them.
+
 ## Known limitations
 
 - Linux only (relies on `fork`, `/proc`, Unix sockets).
