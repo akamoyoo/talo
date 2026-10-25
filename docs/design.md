@@ -240,61 +240,98 @@ recent jobs  #41 ok 3.2s  ic = evaluate(gap_mom)  ·  #42 error 0.1s  KeyError: 
 running      #43 running 12m, progress 61% (412/672 days), last output 3s ago
 ```
 
-- `talo note TEXT [--job ID]` appends a note to the session (`notes.jsonl`): time, owner, revision, base and the job
-  it refers to. `talo notes` lists them; `brief` shows the most recent. Notes are kept with the session's history,
-  so they survive rollbacks, and `export` writes them as comments.
-- `brief --json` returns the same fields, each list bounded, with counts of what was left out.
+- `talo note TEXT [--job ID]` appends a note to the session (`notes.jsonl`) with an id, time, owner, the revision it
+  was recorded at, the base, and the job it is about. `talo notes` lists them; `brief` shows the most recent. Notes
+  are kept with the session's history, so they survive rollbacks, and `export` writes them into the header.
+- `brief` is built from what the supervisor already knows, so it answers while a job runs. Variables come from the
+  worker when it is idle; otherwise the last summary is shown with the revision and time it was observed and
+  `stale: true`. The whole reply is bounded (notes and previews are cut, lists are limited, and every list says how
+  many items were left out and which command shows them).
 
 ### Several agents and retries: owners, keys and revisions
 
 - **Owner.** Every request carries an owner: `--owner NAME`, else `$TALO_AGENT`, else `user`. Jobs, snapshots and notes
-  record it, and listings show it. `checkout` that would discard jobs of another owner names them in its refusal.
-- **Revision.** Each session has a revision number that increases whenever its state may change (an execution or a
-  checkout). `run --expect-rev N` (and `checkout --expect-rev N`) is refused, when the job starts, if the revision is
-  no longer `N`, with the current revision and what changed. An agent that planned against a state can therefore not
-  act on a state someone else has changed in the meantime.
-- **Idempotency key.** `run --key K` returns the existing job when a job with key `K` was already submitted to the
-  session (with the same code; different code under the same key is an error). A shell call that timed out after
-  submitting can simply be retried. Keys are kept for the lifetime of the supervisor.
+  record it, and listings show it. Owners are attribution, not locks: `checkout` that would discard other owners'
+  jobs names them in its refusal, and `--discard` still overrides it.
+- **Revision.** Each session has a revision number that increases when an operation that may change the state is
+  dispatched to the worker: an execution (including from `attach`), a checkout, a reload. It never goes back: a failed
+  or rolled-back job still consumed a revision. Snapshots do not change it. `run`, `checkout` and `reload` accept
+  `--expect-rev N` and are refused when they reach the front of the queue if the revision is no longer `N`; the
+  error says the current revision and the jobs in between. Inspection (`vars`, `show`, `brief`) reports the revision
+  it observed. `show` only evaluates names, attributes and constant subscripts (`df`, `df.x`, `d["k"]`); anything else
+  must go through `run`, so that it is recorded and counted. The guarantee covers operations made through Talo:
+  background threads or writes to shared files can still change the state without a revision.
+- **Idempotency key.** `run --key K` returns the job already submitted under `K` in this session — whatever its
+  outcome, even if it failed or was refused — with `deduplicated: true`. The key identifies the whole request (code
+  and options that affect execution, such as `--atomic` and `--expect-rev`, but not `-t`): reusing it for a different
+  request is an error, so a new attempt needs a new key. Keys are looked up before anything else (a retry after the
+  worker died still returns the original job) and are kept for the lifetime of the supervisor; the reply carries the
+  supervisor's `epoch`, so a retry can detect that the supervisor restarted in between. `snap` and `checkout` accept
+  `--key` as well.
 
 ### Failing without leaving half a mutation: `run --atomic`
 
-`run --atomic CODE` takes a temporary snapshot first. If the code fails or is interrupted, the session checks out
-that snapshot, so the state is exactly as before the job; on success the snapshot is dropped. The job records
-`rolled_back: true`. The cost is one snapshot (milliseconds) and the pages the job modified. Side effects outside the
-process are not undone.
+`run --atomic CODE` runs the job inside a checkpoint:
 
-### Progress and liveness
+1. *prepare*: the worker forks an internal checkpoint. It is not a named snapshot: it does not change the session's
+   base or the jobs since it, it does not appear in `snaps` or `tree`, and its memory counts against the budget. If it
+   cannot be taken (budget, `--strict` threads), the job fails before running any code.
+2. *execute* the code.
+3. *commit* on success: the checkpoint is dropped and the job joins the lineage like any other.
+   *restore* on error, interruption or a memory-limit kill: the worker is replaced by a fork of the checkpoint (the old
+   worker is kept until the new one answers), so variables, `_`, `Out` and the execution counter are as before the job.
+   The job stays in the history with its error but is left out of the lineage, so `export` does not replay it.
+
+The job reports `atomic: {"outcome": "committed" | "restored" | "restore_failed", "error": ...}`; the session's queue
+stays blocked until commit or restore has finished, so `wait` never returns in between. A shell call that times out
+does not restore anything: the job keeps running. External side effects are not undone, and the limits of `fork()`
+apply (see "Fork safety").
+
+### Progress and activity
 
 User code can call `talo.progress(done, total=None, note="")` (a `talo` object is available in the namespace, as
-`display` is). The job then reports `progress` (`done`, `total`, `note`, time); every job also reports
-`last_output_s`: seconds since its output file or its progress last changed. `jobs` and `brief` show both, so an
-agent can tell a slow computation from a stuck one without reading the output.
+`display` is; it is hidden from `vars`). Updates are rate-limited to a few per second and belong to the running job.
+Every running job reports `progress` and three ages measured on a monotonic clock: `last_output_age_s`,
+`last_progress_age_s` and `last_activity_age_s` (the smaller of the two). They are evidence of activity, not a stall
+detector: a native computation can be silent for an hour, so Talo never interrupts a job for being quiet.
 
 ### Output that respects the context window
 
-The output shown by `run`, `wait` and `tail` (not the file itself) is condensed: for lines rewritten with carriage
-returns (progress bars) only the final state is kept, and runs of identical lines are folded into one with a count
-(`[... repeated 120 times]`). Results are cut to `--max-result` characters (default 10 000) with a note saying where
-the full text is. `--raw` shows the output unchanged.
+The output shown by `run`, `wait` and `tail` (never the file, and never the byte offsets) is condensed: for lines
+rewritten with carriage returns (progress bars) only the final state is kept, and runs of identical lines are folded
+into one with a count (`[... repeated 120 times]`). Condensing applies to each reply separately. A result's text is
+cut to `--max-result` characters (default 10 000); the full `text/plain` is saved next to the job's output
+(`ID.result.txt`) and the reply gives its path and size. Each reply is bounded as a whole. `--raw` shows the output
+without condensing (the size limits still apply).
 
 ### Resources on shared machines
 
-- `talo resources` lists, per session, the worker's and each snapshot's private memory (pages only it holds), the
-  memory they share, the machine's available memory and the memory used by other users' processes. Shared pages are
-  counted once, so the numbers add up.
-- `new --memory-limit SIZE` bounds a session's private memory (worker plus snapshots). The supervisor checks it
-  twice a second; a worker over the limit is killed by Talo (not by the kernel, which may choose another process), its
-  job ends as `killed: memory limit`, and with `--on-limit rollback` the session checks out its base snapshot. The
-  limit is enforced by polling, so a very fast allocation can overshoot between two checks; a cgroup limit (for
-  example `systemd-run --user -p MemoryMax=`) remains the hard guarantee.
+- `talo resources` reports, per session, the worker's and each snapshot's memory as separate named metrics: `rss`,
+  `pss` (proportional: shared pages divided among the processes that map them), `private_dirty` and `private_clean`,
+  with the time they were sampled; plus the machine's available memory. Unknown values are reported as unknown,
+  never as zero. PSS sums are the honest total for a family of forks, but they are an apportionment, not the exact
+  memory each process would free.
+- `new --memory-limit SIZE` sets a **soft** limit on the PSS of the session's worker plus its snapshots. The supervisor
+  samples it twice a second. When a job exceeds it, Talo interrupts the job, then kills the worker if it does not stop
+  within a few seconds; the job ends with `termination: "memory_limit"` (distinct from a kernel out-of-memory kill), and
+  an `--atomic` job is restored to its checkpoint. If the session is over the limit because of its snapshots alone,
+  Talo does not kill anything: `snap` is refused and `brief` / `resources` say which snapshots to drop. Sampling can
+  miss a fast allocation; a cgroup limit (for example `systemd-run --user -p MemoryMax=`) is the hard guarantee.
+- `--memory-budget` (refusing new snapshots) stays as is and is measured the same way.
 
 ### Editing code while data stays loaded: `talo reload`
 
-`talo reload [MODULE ...]` reloads project modules (`importlib.reload`). Without arguments it reloads every imported
-module whose file is under the session's working directory and changed since it was loaded. The report lists objects
-in the namespace still bound to the old code: instances of old classes and functions imported by name before the
-reload (`from factors import f` keeps the old `f`), with the command to rebind them.
+- `talo reload MODULE ...` reloads the named modules (`importlib.reload`), in the order given, as a queued operation
+  (it increments the revision and accepts `--expect-rev` and `--key`). `talo reload --changed [--root DIR]` selects the
+  imported modules whose source file is under `DIR` (default: the session's working directory, excluding virtual
+  environments and `site-packages`) and changed since it was imported, judged by a content hash recorded at import
+  time; `--dry-run` only lists them.
+- The report gives, per module, `status` (`reloaded`, `unchanged`, `failed` with the error), old and new hashes, and
+  `stale_bindings`: names in the session's namespace that are bound directly to a function or class from the module's
+  previous version, or to an instance of such a class (`from factors import f` keeps the old `f`). Only the namespace
+  itself is scanned (`scan_scope: "direct_namespace"`); references inside containers, closures and other objects are
+  not followed. Talo does not rebind anything automatically.
+- Extension modules cannot be reloaded and are reported as such.
 
 ## Known limitations
 
