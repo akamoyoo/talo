@@ -29,7 +29,7 @@ def test_tree_follows_branches_across_sessions(talo):
 def test_diff_reports_added_removed_changed_and_content(talo):
     talo("run", "import numpy as np, pandas as pd\n"
                 "df = pd.DataFrame({'x': np.arange(10_000.0)})\nprices = np.arange(10_000.0)\ntmp = [1, 2]\n"
-                "same = {'a': 1}\nbig = np.zeros(2_000_000)\nf = lambda: 1")
+                "same = {'a': 1}\nbig = np.zeros(2_000_000)\nf = (i for i in range(3))")
     talo("snap", "loaded")
     talo("run", "df = df[df.x > 10]\nprices[5] = -1\ndel tmp\nmask = prices > 0\nbig[0] = 1")
     rc, d = run_json(talo, "diff", "loaded", "--max-bytes", "1M")
