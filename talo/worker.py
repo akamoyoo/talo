@@ -442,6 +442,28 @@ class Snapshot:
 
 # ---------------------------------------------------------------- execution
 
+def _plain(value):
+    """NumPy / pandas scalars and small arrays as plain Python values, for JSON."""
+    if hasattr(value, "item") and getattr(value, "shape", None) == ():
+        return value.item()
+    if hasattr(value, "tolist") and getattr(value, "size", 0) <= 10_000:
+        return value.tolist()
+    if hasattr(value, "to_dict") and getattr(value, "size", 0) <= 10_000:
+        return value.to_dict()
+    raise TypeError(f"{type(value).__name__} is not JSON-serializable")
+
+
+def json_result(value, limit: int) -> dict:
+    """``{"value": ...}`` when the value is JSON-serializable within ``limit`` bytes, else ``{"error": ...}``."""
+    try:
+        text = json.dumps(value, default=_plain, allow_nan=True)
+    except (TypeError, ValueError) as error:
+        return {"error": f"not JSON: {error}"[:300]}
+    if len(text) > limit:
+        return {"error": f"result is {len(text)} bytes of JSON, over the limit of {limit}"}
+    return {"value": json.loads(text)}
+
+
 # ---------------------------------------------------------------- reload
 
 def _source_hash(path: str) -> str | None:
@@ -562,6 +584,7 @@ class Helper:
     def __init__(self, worker: "Worker"):
         self._worker = worker
         self._last = 0.0
+        self.case = None  # in a map case: {"map": id, "index": i}
 
     def progress(self, done, total=None, note: str = "") -> None:
         """Report progress of the running job: ``talo.progress(i, n, "day 2024-03-01")``. Shown by ``talo jobs``,
@@ -668,6 +691,9 @@ class Worker:
         self.send("execute_input", {"code": code, "execution_count": n}, msg)
         out_path = meta.get("talo_output")
         self.parent, self.out_path, self.files = msg, out_path, 0
+        if "talo_bind" in meta:  # an ephemeral worker: names the code expects (map's `case`)
+            self.namespace.update(meta["talo_bind"])
+            self.namespace["talo"].case = meta.get("talo_case")
         saved = None
         if out_path:
             sys.stdout.flush()
@@ -717,6 +743,8 @@ class Worker:
             self.send("error", {k: reply[k] for k in ("ename", "evalue", "traceback")}, msg)
         elif result is not None:
             data, data_meta = mime_bundle(result, self.save if out_path else None)
+            if meta.get("talo_json_result") is not None:
+                data_meta["talo_json"] = json_result(result, int(meta["talo_json_result"]))
             self.send("execute_result", {"execution_count": n, "data": data, "metadata": data_meta}, msg)
         metrics = {"talo_duration_s": round(time.time() - started, 6), "talo_rss_before": rss_before,
                    "talo_rss_after": rss_bytes()}

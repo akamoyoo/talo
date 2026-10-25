@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from talo import wire
+from talo import ephemeral, wire
 from talo.paths import home, socket_for, socket_path
 
 log = logging.getLogger("talo")
@@ -131,6 +131,7 @@ class Job:
     termination: str | None = None             # why Talo stopped the job ("memory_limit")
     phase: str | None = None                   # preparing | executing | restoring | committing (signals only while executing)
     exec_pid: int | None = None                # the worker running the user code, the only process ever signalled
+    handle: object = field(default=None, repr=False)  # a "fork" job's internal snapshot
     progress: dict | None = None               # the last talo.progress() of a running job
     progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
@@ -179,6 +180,42 @@ class Snapshot:
                 "pid": self.pid, "created": self.created, "message": self.message, "owner": self.owner,
                 "execution_count": self.execution_count, "jobs": self.jobs, "threads": self.threads,
                 "private_bytes": private_dirty(self.pid), "alive": private_dirty(self.pid) is not None}
+
+
+@dataclass
+class MapRun:
+    """A fan-out of one snapshot into ephemeral workers (see "Fan-out" in docs/design.md)."""
+    id: str
+    session: str
+    code: str
+    cases: list
+    snap: "Snapshot"
+    owns_snap: bool           # an internal snapshot of the current state, released when the map ends
+    parallel: int
+    memory_limit: int | None
+    case_memory_limit: int | None
+    json_limit: int
+    owner: str
+    dir: Path
+    status: str = "running"   # running -> ok (all cases ran) / interrupted / error
+    rows: dict = field(default_factory=dict)      # index -> result row
+    running: dict = field(default_factory=dict)   # index -> pid
+    interrupt_requested: bool = False
+    started: float = field(default_factory=time.time)
+    finished: float | None = None
+    done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+    def summary(self, rows: int | None = 50) -> dict:
+        counts: dict = {}
+        for r in self.rows.values():
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        ordered = [self.rows[i] for i in sorted(self.rows)]
+        return {"id": self.id, "kind": "map", "session": self.session, "status": self.status, "from": self.snap.ref if self.owns_snap else f"{self.snap.name} ({self.snap.ref})",
+                "cases": len(self.cases), "finished_cases": len(self.rows), "running": sorted(self.running),
+                "counts": counts, "owner": self.owner, "started": self.started, "finished": self.finished,
+                "elapsed_s": round((self.finished or time.time()) - self.started, 3),
+                "rows": ordered[:rows] if rows is not None else ordered, "rows_total": len(ordered),
+                "results": str(self.dir / "results.jsonl")}
 
 
 class SessionDead(RuntimeError):
@@ -394,6 +431,9 @@ class Session:
                     self._finish(job, "ok", result=(await self._snap(**job.params, owner=job.owner)).to_dict())
                 elif job.kind == "checkout":
                     self._finish(job, "ok", result=await self._checkout(**job.params, owner=job.owner))
+                elif job.kind == "fork":  # an internal snapshot of the current state, for map
+                    job.handle = await self._fork(f"f{job.id}", strict=False)
+                    self._finish(job, "ok", result={"ref": job.handle.ref, "pid": job.handle.pid})
                 elif job.kind == "reload":
                     if self.state == "dead":
                         raise SessionDead(f"session {self.name} is dead ({self.death})")
@@ -716,6 +756,8 @@ class Supervisor:
         self.sessions: dict[str, Session] = {}
         self.jobs: dict[str, Job] = {}
         self.keys: dict[tuple[str, str], tuple] = {}  # (session id, idempotency key) -> (job id, request fingerprint)
+        self.maps: dict[str, MapRun] = {}
+        self.next_map = 1
         self.last_rev: dict[str, int] = {}             # session name -> its revision when it was closed
         self.epoch = wire.new_id()[:12]               # changes when the supervisor restarts (keys do not survive it)
         self.state_file = home() / "state.json"
@@ -807,6 +849,7 @@ class Supervisor:
 
     async def op_kill(self, req):
         session = self._session(req["name"])
+        self._kill_maps(session.name)
         await session.stop()
         self.last_rev[session.name] = session.rev
         del self.sessions[req["name"]]
@@ -837,6 +880,8 @@ class Supervisor:
         return await self._wait(job, req.get("timeout", 30))
 
     async def op_job(self, req):
+        if str(req["id"]) in self.maps:
+            return await self._wait_map(self.maps[str(req["id"])], req.get("wait", 0))
         return await self._wait(self._job(req["id"]), req.get("wait", 0))
 
     async def op_jobs(self, req):
@@ -860,6 +905,15 @@ class Supervisor:
                 "text": data.decode(errors="replace"), "status": job.status}
 
     async def op_interrupt(self, req):
+        if str(req["id"]) in self.maps:
+            m = self.maps[str(req["id"])]
+            m.interrupt_requested = True
+            for pid in m.running.values():
+                try:
+                    os.kill(pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+            return {"id": m.id, "result": "interrupting" if m.status == "running" else m.status}
         job = self._job(req["id"])
         return {"id": job.id, "result": self._session(job.session).interrupt(job)}
 
@@ -950,8 +1004,154 @@ class Supervisor:
     async def op_drop(self, req):
         session = self._session(req["session"])
         snap = session.find(req["name"])
+        users = [m.id for m in self.maps.values() if m.snap is snap and m.status == "running"]
+        if users:
+            raise RuntimeError(f"snapshot {snap.name} is used by running map {', '.join(users)}; interrupt it first")
         session.drop(snap)
         return {"dropped": snap.ref}
+
+    # ---------------------------------------------------------------- map
+
+    async def op_map(self, req):
+        session = self._session(req["session"])
+        cases = req.get("cases")
+        if cases is None:
+            cases = list(range(int(req.get("range") or 0)))
+        if not isinstance(cases, list) or not cases:
+            raise ValueError("map needs a non-empty JSON list of cases (--cases) or --range N")
+        key = req.get("key")
+        if key is not None and (session.id, "map:" + key) in self.keys:
+            map_id, known = self.keys[(session.id, "map:" + key)]
+            if known != {"code": req["code"], "cases": cases, "from": req.get("from")}:
+                raise ValueError(f"key {key!r} was used for map {map_id} with a different request; use a new key")
+            out = await self._wait_map(self.maps[map_id], req.get("timeout", 30))
+            return {**out, "map": {**out["map"], "deduplicated": True}}
+        if req.get("from"):
+            snap, owns = self._snapshot(req["from"], session.name), False
+        else:  # the current state: an internal snapshot taken in the queue, after running jobs
+            job = await self._submit(session, "fork", owner=req.get("owner"))
+            await job.done.wait()
+            if job.status != "ok":
+                raise RuntimeError(f"could not snapshot the current state: {(job.error or {}).get('evalue')}")
+            snap, owns = job.handle, True
+        map_id = f"m{self.next_map}"
+        self.next_map += 1
+        m = MapRun(map_id, session.name, req["code"], cases, snap, owns, max(1, int(req.get("parallel") or 4)),
+                   req.get("memory_limit") or session.memory_limit, req.get("case_memory_limit"),
+                   int(req.get("max_result") or 65536), req.get("owner") or "user", session.dir / "maps" / map_id)
+        m.dir.mkdir(parents=True, exist_ok=True)
+        self.maps[map_id] = m
+        if key is not None:
+            self.keys[(session.id, "map:" + key)] = (map_id, {"code": req["code"], "cases": cases, "from": req.get("from")})
+        asyncio.create_task(self._run_map(session, m))
+        return await self._wait_map(m, req.get("timeout", 30))
+
+    def _kill_maps(self, session: str | None = None) -> None:
+        """Stop the cases of running maps (when their session or the supervisor goes away)."""
+        for m in self.maps.values():
+            if m.status == "running" and (session is None or m.session == session):
+                m.interrupt_requested = True
+                for pid in list(m.running.values()):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    async def op_maps(self, req):
+        name = req.get("session")
+        return {"maps": [m.summary(rows=0) for m in self.maps.values() if not name or m.session == name]}
+
+    async def _wait_map(self, m: MapRun, timeout: float | None) -> dict:
+        if timeout is None or timeout > 0:
+            try:
+                await asyncio.wait_for(m.done.wait(), timeout)
+            except asyncio.TimeoutError:
+                pass
+        return {"map": m.summary(), "epoch": self.epoch}
+
+    async def _run_map(self, session: Session, m: MapRun) -> None:
+        sem = asyncio.Semaphore(m.parallel)
+        results = open(m.dir / "results.jsonl", "a")
+
+        def family_pss() -> int:
+            used, _ = session.memory_usage()
+            return used + sum((memory(pid) or {}).get("pss", 0) for pid in m.running.values())
+
+        async def one(index: int, case) -> None:
+            async with sem:
+                while m.memory_limit and m.running and family_pss() > m.memory_limit and not m.interrupt_requested:
+                    await asyncio.sleep(0.2)  # admission: wait until running cases free memory
+                if m.interrupt_requested:
+                    row = {"index": index, "case": case, "status": "cancelled"}
+                else:
+                    row = await self._run_case(m, index, case)
+                m.rows[index] = row
+                results.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                results.flush()
+
+        try:
+            await asyncio.gather(*(one(i, c) for i, c in enumerate(m.cases)))
+            m.status = "interrupted" if m.interrupt_requested else "ok"
+        except Exception as error:  # noqa: BLE001
+            log.exception("map %s failed", m.id)
+            m.status = "error"
+            m.rows.setdefault(-1, {"index": -1, "status": "error", "error": f"{type(error).__name__}: {error}"})
+        finally:
+            results.close()
+            m.finished = time.time()
+            if m.owns_snap:
+                session._release(m.snap)
+            m.done.set()
+
+    async def _run_case(self, m: MapRun, index: int, case) -> dict:
+        output = str(m.dir / f"{index}.out")
+        Path(output).touch()
+        peak = {"pss": 0}
+        stop = {"reason": None}
+
+        def started(pid: int) -> None:
+            m.running[index] = pid
+
+        async def watch() -> None:
+            killed_at = None
+            while True:
+                await asyncio.sleep(0.5)
+                pid = m.running.get(index)
+                pss = (memory(pid) or {}).get("pss") if pid else None
+                if pss is None:
+                    continue
+                peak["pss"] = max(peak["pss"], pss)
+                if m.case_memory_limit and pss > m.case_memory_limit:
+                    stop["reason"] = "memory_limit"
+                    sig = signal.SIGINT if killed_at is None else signal.SIGKILL
+                    if killed_at is None or time.monotonic() - killed_at > MEMORY_LIMIT_GRACE:
+                        try:
+                            os.kill(pid, sig)
+                        except ProcessLookupError:
+                            pass
+                        killed_at = killed_at or time.monotonic()
+
+        watcher = asyncio.create_task(watch())
+        try:
+            out = await ephemeral.run(m.snap.socket, m.code, output, bind={"case": case},
+                                      case={"map": m.id, "index": index}, json_limit=m.json_limit, started=started)
+        except Exception as error:  # noqa: BLE001
+            out = {"status": "error", "error": {"ename": type(error).__name__, "evalue": str(error), "traceback": []}}
+        finally:
+            watcher.cancel()
+            m.running.pop(index, None)
+        status = out["status"]
+        if status == "error" and (out.get("error") or {}).get("ename") == "KeyboardInterrupt" \
+                and (m.interrupt_requested or stop["reason"]):
+            status = "interrupted"
+        error = out.get("error")
+        if error:
+            error = {"ename": error.get("ename"), "evalue": str(error.get("evalue"))[:500],
+                     "traceback": (error.get("traceback") or [])[-20:]}
+        return {"index": index, "case": case, "status": status, "result": out.get("result"),
+                "result_error": out.get("result_error"), "text": out.get("text"), "error": error,
+                "termination": stop["reason"], "elapsed_s": out.get("elapsed_s"), "peak_pss": peak["pss"] or None,
+                "output": output, "outputs": out.get("outputs", [])}
 
     async def op_complete(self, req):
         return await self._ask_idle(self._session(req["session"]), "complete_request",
@@ -1204,6 +1404,7 @@ class Supervisor:
         log.info("supervisor started: pid %s, %s", os.getpid(), path)
         async with server:
             await self.stopping.wait()
+        self._kill_maps()
         for s in list(self.sessions.values()):
             await s.stop()
         path.unlink(missing_ok=True)

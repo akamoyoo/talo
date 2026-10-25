@@ -229,8 +229,64 @@ def cmd_run(args):
 
 def cmd_wait(args):
     job = call("job", id=args.id, wait=args.timeout)
+    if "map" in job:
+        return show_map(args, job["map"])
     show_job(args, job)
     return exit_code(job)
+
+
+# ---------------------------------------------------------------- map
+
+def show_map(args, m: dict) -> int:
+    code = 3 if m["status"] == "running" else (0 if m["status"] == "ok" and set(m["counts"]) <= {"ok"} else 1)
+    if args.json:
+        print(json.dumps({"map": m}, ensure_ascii=False, default=str))
+        return code
+    print(f"map {m['id']}: {m['cases']} cases from {m['from']}, {m['status']}")
+    for r in m["rows"]:
+        if r.get("status") == "ok":
+            shown = json.dumps(r["result"], ensure_ascii=False, default=str) if r.get("result") is not None \
+                else (r.get("text") or "")
+        else:
+            e = r.get("error") or {}
+            shown = f"{e.get('ename')}: {e.get('evalue')}" if e else ""
+        if r.get("termination"):
+            shown += f"  [{r['termination']}]"
+        el = f"{r['elapsed_s']:.1f}s" if r.get("elapsed_s") is not None else "-"
+        print(f"{r['index']:>4}  {r['status']:11s} {el:>8}  {shown[:200]}")
+    if m["rows_total"] > len(m["rows"]):
+        print(f"... {m['rows_total'] - len(m['rows'])} more rows in {m['results']}")
+    counts = ", ".join(f"{v} {k}" for k, v in sorted(m["counts"].items()))
+    running = f"; running cases {', '.join(map(str, m['running']))}" if m["running"] else ""
+    sys.stdout.flush()
+    print(f"({m['finished_cases']}/{m['cases']} cases: {counts or 'none yet'}{running}; results in {m['results']})",
+          file=sys.stderr)
+    if m["status"] == "running":
+        print(f"[map {m['id']} running {m['elapsed_s']:.1f}s] `talo wait {m['id']}`, `talo interrupt {m['id']}`",
+              file=sys.stderr)
+    return code
+
+
+def cmd_map(args):
+    code = read_code(args)
+    cases = None
+    if args.cases:
+        text = sys.stdin.read() if args.cases == "-" else (open(args.cases).read() if os.path.exists(args.cases) else args.cases)
+        cases = json.loads(text)
+    d = call("map", session=session_name(args), code=code, cases=cases, range=args.range, **{"from": args.from_},
+             parallel=args.parallel, timeout=args.timeout, memory_limit=parse_size(args.memory_limit),
+             case_memory_limit=parse_size(args.case_memory_limit), max_result=args.max_result, key=args.key)
+    return show_map(args, d["map"])
+
+
+def cmd_maps(args):
+    def human(d):
+        if not d["maps"]:
+            print("(no maps)")
+        for m in d["maps"]:
+            counts = ", ".join(f"{v} {k}" for k, v in sorted(m["counts"].items()))
+            print(f"{m['id']:6s} {m['status']:11s} {m['finished_cases']}/{m['cases']} from {m['from']}  {counts}")
+    emit(args, call("maps", session=args.session), human)
 
 
 def cmd_tail(args):
@@ -696,6 +752,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
     p.add_argument("--expect-rev", type=int, metavar="N", help="refuse unless the session is at revision N")
     p.add_argument("--key", help="idempotency key")
+    p = add("map", cmd_map, "run code once per case, each in a fork of a snapshot, in parallel")
+    p.add_argument("code", nargs="?", help="code to run for each case (the variable `case` holds it)")
+    p.add_argument("-f", "--file", help="read the code from this file")
+    p.add_argument("--cases", help="JSON list of cases: inline, a file, or - for stdin")
+    p.add_argument("--range", type=int, metavar="N", help="cases 0 .. N-1")
+    p.add_argument("--from", dest="from_", metavar="SNAPSHOT", help="snapshot to fork (default: the current state)")
+    p.add_argument("-j", "--parallel", type=int, default=4, help="cases running at once (default 4)")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT, help="seconds to wait; the map continues after")
+    p.add_argument("--memory-limit", metavar="SIZE", help="start no case while the session and its cases use more")
+    p.add_argument("--case-memory-limit", metavar="SIZE", help="stop a case that uses more than this")
+    p.add_argument("--max-result", type=int, default=65536, help="bytes of JSON kept per result")
+    p.add_argument("--key", help="idempotency key")
+    add("maps", cmd_maps, "fan-outs and their progress")
     add("resources", cmd_resources, "memory of every session's worker and snapshots, and of the machine")
     p = add("brief", cmd_brief, "what an agent needs to resume the session's work (state, notes, variables, jobs)")
     p.add_argument("--notes", type=int, default=10, help="most recent notes shown")
