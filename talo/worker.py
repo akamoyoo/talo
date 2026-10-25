@@ -85,22 +85,65 @@ def mime_bundle(value) -> tuple[dict, dict]:
 
 # ---------------------------------------------------------------- variable summaries
 
-def _nbytes(value) -> int | None:
-    """A cheap estimate of the memory an object holds (no deep traversal)."""
-    nbytes = getattr(value, "nbytes", None)  # numpy, pyarrow, torch
+SIZE_DEPTH = 4         # how deep estimate_nbytes looks into containers and object attributes
+SIZE_BUDGET = 20_000   # at most this many objects visited per estimate
+
+
+def _buffer_nbytes(value) -> int | None:
+    """Size of objects that know their own buffer size (no traversal), else None."""
+    nbytes = getattr(type(value), "nbytes", None) and getattr(value, "nbytes", None)  # numpy, pyarrow, torch
     if isinstance(nbytes, int):
         return nbytes
     usage = getattr(value, "memory_usage", None)  # pandas DataFrame / Series
-    if callable(usage):
+    if callable(usage) and hasattr(value, "shape"):
         try:
             total = usage(index=True, deep=False)
             return int(total.sum()) if hasattr(total, "sum") else int(total)
         except Exception:  # noqa: BLE001
-            pass
-    try:
-        return sys.getsizeof(value)
-    except Exception:  # noqa: BLE001
-        return None
+            return None
+    return None
+
+
+def estimate_nbytes(value) -> tuple[int | None, bool]:
+    """(bytes, complete): memory held by ``value``, following containers and object attributes a few levels deep
+    and counting each object once. ``complete`` is False when the depth or object budget cut the walk short."""
+    total, complete, seen, visited = 0, True, set(), 0
+    stack = [(value, 0)]
+    while stack:
+        obj, depth = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        visited += 1
+        if visited > SIZE_BUDGET:
+            return total, False
+        known = _buffer_nbytes(obj)
+        if known is not None:
+            total += known
+            continue
+        try:
+            total += sys.getsizeof(obj)
+        except Exception:  # noqa: BLE001
+            complete = False
+            continue
+        if isinstance(obj, (str, bytes, bytearray, int, float, complex, bool, type(None), type, type(sys))) \
+                or callable(obj):
+            continue
+        if isinstance(obj, dict):
+            children = [*obj.keys(), *obj.values()]
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            children = list(obj)
+        elif hasattr(obj, "__dict__"):
+            children = list(vars(obj).values())
+        else:
+            continue
+        if not children:
+            continue
+        if depth >= SIZE_DEPTH:
+            complete = False
+            continue
+        stack.extend((c, depth + 1) for c in children)
+    return total, complete
 
 
 def _type_name(value) -> str:
@@ -111,7 +154,10 @@ def _type_name(value) -> str:
 
 def describe(name: str, value) -> dict:
     """A one-line variable summary: name, type, shape / length, dtype, memory estimate."""
-    out = {"name": name, "type": _type_name(value), "nbytes": _nbytes(value)}
+    nbytes, complete = estimate_nbytes(value)
+    out = {"name": name, "type": _type_name(value), "nbytes": nbytes}
+    if not complete:
+        out["nbytes_partial"] = True  # at least this much
     shape = getattr(value, "shape", None)
     if isinstance(shape, tuple):
         out["shape"] = list(shape)
@@ -134,9 +180,14 @@ def describe(name: str, value) -> dict:
 
 
 def is_user_variable(name: str, value) -> bool:
+    """Names the user created: not private names, modules, or classes / functions imported from other modules."""
     if name.startswith("_") or name in ("In", "Out", "exit", "quit", "get_ipython"):
         return False
-    return not isinstance(value, type(sys))  # modules are not variables
+    if isinstance(value, type(sys)):
+        return False
+    if isinstance(value, type) or callable(value) and hasattr(value, "__module__") and hasattr(value, "__qualname__"):
+        return getattr(value, "__module__", None) == "__main__"
+    return True
 
 
 def show(value, rows: int) -> str:

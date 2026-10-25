@@ -141,3 +141,13 @@ def test_long_talo_home_uses_a_short_socket_path(tmp_path, monkeypatch):
     assert len(str(path)) <= SOCKET_PATH_LIMIT and path.name.startswith("talo-")
     monkeypatch.setenv("TALO_HOME", str(tmp_path / "short"))
     assert socket_path() == tmp_path / "short" / "supervisor.sock"
+
+
+def test_vars_hides_imports_and_sizes_nested_objects(talo):
+    talo("run", "import numpy as np\nfrom pathlib import Path\nfrom os.path import join\n"
+                "class Holder:\n    def __init__(self):\n        self.x = {'a': np.zeros(1000), 'b': [np.ones(500)]}\n"
+                "def helper(): pass\nh = Holder()")
+    _, rows = run_json(talo, "vars")
+    by_name = {v["name"]: v for v in rows["variables"]}
+    assert set(by_name) == {"Holder", "helper", "h"}  # imported Path / join are hidden, own definitions are listed
+    assert by_name["h"]["nbytes"] >= 1500 * 8 and "nbytes_partial" not in by_name["h"]

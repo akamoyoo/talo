@@ -188,7 +188,8 @@ def cmd_vars(args):
             shape = f" {tuple(v['shape'])}" if "shape" in v else (f" len={v['len']}" if "len" in v else "")
             dtype = f" {v['dtype']}" if "dtype" in v else ""
             value = f" = {v['value']}" if "value" in v else ""
-            print(f"{v['name']:20s} {v['type']}{shape}{dtype}  {human_bytes(v.get('nbytes'))}{value}")
+            size = ("≥ " if v.get("nbytes_partial") else "") + human_bytes(v.get("nbytes"))
+            print(f"{v['name']:20s} {v['type']}{shape}{dtype}  {size}{value}")
         print(f"(worker memory {human_bytes(d.get('rss'))})", file=sys.stderr)
     emit(args, call("vars", session=session_name(args), pattern=args.pattern), human)
 
