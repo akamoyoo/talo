@@ -118,6 +118,14 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `share` | `session`, `user`, `level` (`read` / `call` / `run`) | `user`, `uid`, `session`, `level`, `connect` (the shared socket's path), `warning` |
 | `unshare` | `user`, `session` (optional) | `revoked` |
 | `shares` | – | `shares`, `connect` |
+| `verify` | `session`, `cold`, `from`, `max_bytes` | `status` (match / mismatch / inconclusive / replay_failed), `mode`, `source`, `target`, `replayed`, `hazards`, `inconclusive`, `comparison`, `failed` |
+| `run` with `trial` | as `run`, plus `trial` (a name) | the trial's job, with `trial` (its id) |
+| `trials` / `review` / `adopt` / `reject` | `session`, `name`; `review`: `current`; `adopt`: `discard`, `expect_rev`, `key` | trials; the trial, `diff`, `current_rev`; the session; the trial |
+| `diagnose` | `id`, `stack` | `pid`, `cpu_percent`, `status`, `wchan`, `io`, `children`, `stack`, `progress`, `last_output_age_s` |
+| `artifacts` | `id` | `root`, `files` (`path`, `bytes`, `modified`), `complete` |
+| `queue` | `session`, `action` (pause / resume), `reason` | `paused`, `queued` |
+| `lease` | `session`, `ttl` (seconds), `reason`, `release`, `force` | `lease` (`id`, `owner`, `until`, `reason`) or null |
+| `memory` | `session`, `apply` | `processes` (as `resources`), `objects` (estimated), `prune`, `applied` |
 | `record` | `session`, `fields`, `key` | `record` |
 | `ledger` | `session`, `owner`, `outcome`, `has` (list), `where` (list of `KEY=VALUE`), `sort` (`KEY` or `-KEY`), `last` | `records`: `{id, key, time, owner, session, session_id, producer ({kind: job / case / shell, ...}), rev, source_snapshot, source_state (kept / gone / none), code_hash, modules, fields, outcome}`, `total` |
 | `events` | `after` (cursor `EPOCH:SEQ`; default: now), `all`, `wait` (seconds), `session`, `type` (comma-separated), `limit` | `events`, `next` (cursor), `has_more`, `oldest`; `CursorExpired` for a cursor of another epoch or older than the journal |

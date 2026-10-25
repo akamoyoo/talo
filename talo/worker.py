@@ -678,6 +678,22 @@ class Helper:
         self._worker.send("talo_expose", {"name": name}, self._worker.parent)
         return name
 
+    def artifact_path(self, name: str = "") -> str:
+        """A path in this job's own directory for files it writes (``sessions/S/artifacts/JOB/NAME``): rolling back
+        memory never removes files, so each job's outputs are kept apart, listed by ``talo artifacts JOB`` and
+        published deliberately. ``name`` must be relative and stay inside the directory."""
+        out = self._worker.out_path
+        if not out:
+            raise RuntimeError("talo.artifact_path can only be used while code runs in a Talo session")
+        if os.path.isabs(name) or ".." in Path(name).parts:
+            raise ValueError(f"artifact name {name!r} must be a relative path inside the job's directory")
+        base = Path(out)
+        root = (base.parent.parent / "artifacts" / base.stem) if base.parent.name == "jobs" \
+            else base.with_suffix(".artifacts")
+        path = root / name
+        (path.parent if name else path).mkdir(parents=True, exist_ok=True)
+        return str(path)
+
     def _serve_call(self, name: str, kwargs: dict):
         """Run a service function (in a fork of a service version)."""
         self.in_call = True
@@ -1013,6 +1029,7 @@ class Worker:
             pattern = msg["content"].get("pattern")
             rows = [describe(k, v) for k, v in list(self.namespace.items())
                     if is_user_variable(k, v) and (not pattern or pattern in k)]
+            rows += [describe(k, self.namespace[k]) for k in msg["content"].get("extra") or [] if k in self.namespace]
             self.send("talo_vars_reply", {"status": "ok", "variables": rows, "rss": rss_bytes()}, msg)
         elif kind == "complete_request":
             c = msg["content"]

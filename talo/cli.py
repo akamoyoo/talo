@@ -4,6 +4,7 @@ default output is for humans. See ``talo --help``."""
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import contextlib
 import io
 import json
@@ -905,6 +906,88 @@ def cmd_reject(args):
          lambda d: print(f"rejected trial {d['trial']['name']}"))
 
 
+def cmd_queue(args):
+    d = call("queue", session=session_name(args), action=args.action, reason=args.message)
+    emit(args, d, lambda x: print(f"session {x['session']}: " + (f"paused ({x['queued']} jobs waiting)" if x["paused"]
+                                                                   else f"running jobs again ({x['queued']} queued)")))
+
+
+def cmd_lease(args):
+    d = call("lease", session=session_name(args), ttl=parse_duration(args.ttl), reason=args.message,
+             release=args.release, force=args.force)
+
+    def human(x):
+        if x["lease"] is None:
+            print(f"session {x['session']}: lease released")
+        else:
+            until = time.strftime("%H:%M:%S", time.localtime(x["lease"]["until"]))
+            print(f"session {x['session']} leased to {x['lease']['owner']} until {until}: only their jobs start")
+    emit(args, d, human)
+
+
+def parse_duration(text: str | None) -> float | None:
+    """'30m', '2h', '90s' or seconds."""
+    if not text:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600}
+    return float(text[:-1]) * units[text[-1]] if text[-1] in units else float(text)
+
+
+def cmd_artifacts(args):
+    import shutil
+    d = call("artifacts", id=args.id)
+    if args.copy_to:
+        dest = Path(args.copy_to)
+        copied = []
+        for f in d["files"]:
+            src, dst = Path(d["root"]) / f["path"], dest / f["path"]
+            if src.is_symlink() or not src.is_file():
+                continue
+            if dst.exists() and not args.overwrite:
+                raise TaloError("BadArgument", f"{dst} exists; --overwrite replaces it")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst, follow_symlinks=False)
+            copied.append(str(dst))
+        d = {**d, "copied": copied}
+
+    def human(x):
+        if not x["files"]:
+            print(f"(job {x['job']} wrote no artifacts; talo.artifact_path(name) gives a path for one)")
+        for f in x["files"]:
+            print(f"{human_bytes(f['bytes']):>10}  {f['path']}")
+        if not x["complete"]:
+            print("(the job is still running: the list may grow)")
+        for c in x.get("copied", []):
+            print(f"copied {c}")
+    emit(args, d, human)
+
+
+def cmd_memory(args):
+    d = call("memory", session=session_name(args), apply=args.apply)
+
+    def human(x):
+        pr = x["processes"]
+        print(f"processes of session {x['session']} (measured): {human_bytes(pr['pss_total'])} pss")
+        for p in pr["processes"]:
+            mem = p["memory"] or {}
+            label = p["kind"] if p["kind"] in ("worker", "checkpoint") else f"{p['kind']} {p.get('name', '')}"
+            print(f"  {label:28s} pss {human_bytes(mem.get('pss')):>9}  private "
+                  f"{human_bytes((mem.get('private_dirty') or 0) + (mem.get('private_clean') or 0)):>9}")
+        if x["objects"]:
+            print("largest objects (estimated; not additive):")
+            for v in x["objects"]["largest"]:
+                print(f"  {v['name']:28s} {v['type']:20s} {('≥ ' if v.get('nbytes_partial') else '') + human_bytes(v.get('nbytes'))}")
+        if x["prune"]:
+            print("could be released" + (" (released):" if x["applied"] else " (`--apply` releases them):"))
+            for c in x["prune"]:
+                what = c.get("name") or "Out / _"
+                size = f" ~{human_bytes(c['private_bytes'])} private" if c.get("private_bytes") else ""
+                print(f"  {c['action']:10s} {what:24s}{size}  ({c['why']})")
+        else:
+            print("nothing to release automatically (variables are yours to `del`)")
+    emit(args, d, human)
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -1221,6 +1304,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
     p = add("reject", cmd_reject, "drop a trial")
     p.add_argument("name")
+    p = add("queue", cmd_queue, "pause or resume starting jobs (running ones finish)")
+    p.add_argument("action", choices=("pause", "resume"))
+    p.add_argument("-m", "--message", help="why (shown to whoever waits)")
+    p = add("lease", cmd_lease, "only your jobs start for a while (others wait, in order)")
+    p.add_argument("--ttl", default="30m", help="how long (30m, 2h, 90s)")
+    p.add_argument("-m", "--message")
+    p.add_argument("--release", action="store_true")
+    p.add_argument("--force", action="store_true", help="with --release: release someone else's lease")
+    p = add("artifacts", cmd_artifacts, "files a job wrote with talo.artifact_path", session=False)
+    p.add_argument("id")
+    p.add_argument("--copy-to", metavar="DIR", help="copy them (regular files, no links) to DIR")
+    p.add_argument("--overwrite", action="store_true")
+    p = add("memory", cmd_memory, "where the session's memory is, and what could be released")
+    p.add_argument("--prune", action="store_true", help="list what could be released (shown anyway)")
+    p.add_argument("--apply", action="store_true", help="release it")
     p = add("verify", cmd_verify, "replay the lineage of the current state and check it gives the same variables")
     p.add_argument("--cold", action="store_true", help="replay from the start in a fresh interpreter")
     p.add_argument("--from", dest="from_", metavar="SNAPSHOT", help="hot: replay from this snapshot on the lineage")

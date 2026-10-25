@@ -60,6 +60,7 @@ def private_dirty(pid: int | None) -> int | None:
 
 MEMORY_FIELDS = {"Rss:": "rss", "Pss:": "pss", "Private_Clean:": "private_clean", "Private_Dirty:": "private_dirty"}
 MEMORY_LIMIT_INTERVAL = 0.5  # seconds between samples of a session with --memory-limit
+RETAINED_ERRORS = 5          # error-JOB snapshots kept by --retain-error (older unpinned ones are dropped)
 GUARD_GRACE = 5.0           # seconds a job past its deadline or output limit gets to stop after the interrupt
 MEMORY_LIMIT_GRACE = 3.0     # seconds an interrupted job gets to stop before its worker is killed
 
@@ -175,6 +176,19 @@ def memory_events_path(pid: int) -> Path | None:
     except (OSError, IndexError):
         return None
     return Path(f"/sys/fs/cgroup{rel}/memory.events")
+
+
+def effective_limits(events: Path | None) -> dict | None:
+    """memory.max, memory.swap.max, pids.max and cpu.max of the scope, as the kernel applies them."""
+    if events is None:
+        return None
+    out = {}
+    for name in ("memory.max", "memory.swap.max", "pids.max", "cpu.max"):
+        try:
+            out[name] = (events.parent / name).read_text().strip()
+        except OSError:
+            pass
+    return out
 
 
 def oom_kills(events: Path | None) -> int | None:
@@ -383,10 +397,11 @@ def visible_only(reply: dict, sessions: set) -> dict:
 SHARE_LISTINGS = {"ping", "ls", "tree", "services", "handoffs", "maps", "ledger", "events", "jobs", "resources"}
 # Read: metadata the supervisor already has. No live inspection: completion, show, diff and fresh variable
 # summaries call methods of the owner's objects (properties, __repr__, keys, pickling), so they need `run`.
-SHARE_READ = {"brief", "vars", "snaps", "history", "notes", "job", "output", "resume"}
+SHARE_READ = {"brief", "vars", "snaps", "history", "notes", "job", "output", "resume", "artifacts", "trials"}
 SHARE_CALL = SHARE_READ | {"call"}
 SHARE_RUN = SHARE_CALL | {"run", "interrupt", "snap", "checkout", "drop", "reload", "map", "note", "record", "handoff",
-                          "export", "expose", "unexpose", "show", "diff", "complete"}
+                          "export", "expose", "unexpose", "show", "diff", "complete", "diagnose", "queue", "lease",
+                          "verify", "review", "adopt", "reject", "memory", "autosnap", "undo"}
 SHARE_LEVELS = ("read", "call", "run")
 SHARE_STATE_PARAMS = {"diff": ("a", "b"), "map": ("from",), "checkout": ("name",), "handoff": ("snap",),
                       "export": ("snap",)}
@@ -404,6 +419,7 @@ class Session:
         self.scope: str | None = None
         self.oom_kills: int | None = None   # the scope's oom_kill count when the worker started
         self.memory_events: Path | None = None
+        self.effective_limits: dict | None = None  # read back from the scope's cgroup
         self.over_limit: str | None = None  # why the session is over its limit without anything to kill
         self.dir = home() / "sessions" / name
         for sub in ("jobs", "snapshots"):
@@ -436,6 +452,9 @@ class Session:
         self.on_adopt = None                         # set by the supervisor: switch to a trial's state
         self.on_finish = lambda job: None            # set by the supervisor: fill in the outcome of the job's records  # set by the supervisor: append to the event journal
         self.autosnap: dict | None = None  # {"keep": N} while talo autosnap is on
+        self.pending: list = []            # queued jobs taken off the queue but not yet allowed to start
+        self.paused: dict | None = None    # talo queue pause: {"by", "reason", "since"}
+        self.lease: dict | None = None     # talo lease: {"id", "owner", "until", "reason"}
         self.counts: list = []             # execution counts of finished executions, latest last
         self.resolve = None                # set by the supervisor: "session:id" -> Snapshot (any session)
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
@@ -512,6 +531,7 @@ class Session:
         self.worker_pid = info["content"].get("talo_pid")
         if self.limits and self.memory_events is None:
             self.memory_events = memory_events_path(self.worker_pid)
+            self.effective_limits = effective_limits(self.memory_events)
         self.oom_kills = oom_kills(self.memory_events) if self.limits else None
         self.death = None
         self.state = "busy" if self.current is not None else "idle"  # an atomic restore is still part of its job
@@ -599,9 +619,35 @@ class Session:
 
     # ---------------------------------------------------------------- the queue
 
+    def _eligible(self, job: Job) -> bool:
+        if self.paused is not None:
+            return False
+        if self.lease is not None:
+            if time.time() >= self.lease["until"]:
+                self.emit("lease.expired", session=self.name, owner=self.lease["owner"])
+                self.lease = None
+            elif job.owner != self.lease["owner"]:
+                return False
+        return True
+
+    async def _next_job(self) -> Job:
+        """The oldest queued job that may start now (a pause or another owner's lease holds the others back, in
+        order)."""
+        while True:
+            while not self.queue.empty():
+                self.pending.append(self.queue.get_nowait())
+            self.pending = [j for j in self.pending if j.status != "cancelled"]
+            for i, job in enumerate(self.pending):
+                if self._eligible(job):
+                    return self.pending.pop(i)
+            try:
+                self.pending.append(await asyncio.wait_for(self.queue.get(), 1.0))
+            except asyncio.TimeoutError:
+                pass  # leases expire with time
+
     async def _execute_loop(self) -> None:
         while True:
-            job = await self.queue.get()
+            job = await self._next_job()
             if job.status == "cancelled":
                 continue
             self.current, job.status, job.started = job, "running", time.time()
@@ -744,6 +790,10 @@ class Session:
             return
         self.snapshots[snap.id] = snap  # a named snapshot, but the session's base and lineage are unchanged
         job.retained = {"snapshot": snap.ref, "name": snap.name}
+        errors = [s for s in self.snapshots.values() if s.name.startswith("error-")]
+        for s in errors[:-RETAINED_ERRORS]:  # failed states hold their frames' memory: keep only the latest
+            if not s.pins and s.ref != self.base:
+                self.drop(s)
         self.emit("snapshot.created", session=self.name, snapshot=snap.ref, name=snap.name, owner=job.owner)
         if drop_reference and self.state != "dead":
             await self.request("execute_request", {"code": "globals().pop('_talo_error', None)", "silent": True,
@@ -1103,12 +1153,14 @@ class Session:
     def to_dict(self) -> dict:
         return {"name": self.name, "state": self.state, "python": self.python, "cwd": self.cwd,
                 "pid": self.worker_pid, "rss": resident(self.worker_pid) if self.state != "dead" else None,
-                "created": self.created, "queued": self.queue.qsize(),
+                "created": self.created, "queued": self.queue.qsize() + len(self.pending),
+                "paused": self.paused, "lease": self.lease,
                 "current_job": self.current.id if self.current else None, "death": self.death, "base": self.base,
                 "jobs_since_base": list(self.jobs_since_base), "snapshots": len(self.snapshots), "rev": self.rev,
                 "id": self.id,
                 "memory_budget": self.memory_budget, "memory_limit": self.memory_limit, "over_limit": self.over_limit,
-                "limits": self.limits, "scope": self.scope, "max_output": self.max_output}
+                "limits": self.limits, "effective_limits": self.effective_limits, "scope": self.scope,
+                "max_output": self.max_output}
 
 
 async def compare_states(ask_a, ask_b, limit: int | None) -> dict:
@@ -1551,6 +1603,94 @@ class Supervisor:
     async def op_undo(self, req):
         session = self._session(req["session"])
         return await self._control(session, "undo", req.get("timeout", 300), req)
+
+    async def op_queue(self, req):
+        """Pause or resume starting jobs (never queued itself)."""
+        session = self._session(req["session"])
+        if req["action"] == "pause":
+            session.paused = {"by": req.get("owner") or "user", "reason": req.get("reason") or "", "since": time.time()}
+            self.emit("queue.paused", session=session.name, by=session.paused["by"])
+        elif req["action"] == "resume":
+            session.paused = None
+            self.emit("queue.resumed", session=session.name)
+        return {"session": session.name, "paused": session.paused, "queued": session.queue.qsize() + len(session.pending)}
+
+    async def op_lease(self, req):
+        """Give one owner the session for a while (never queued itself, so the holder is never stuck behind it)."""
+        session = self._session(req["session"])
+        owner = req.get("owner") or "user"
+        lease = session.lease
+        if lease is not None and time.time() >= lease["until"]:
+            lease = session.lease = None
+        if req.get("release"):
+            if lease is not None and lease["owner"] != owner and not req.get("force"):
+                raise RuntimeError(f"the lease is held by {lease['owner']}; --force releases it anyway")
+            session.lease = None
+            self.emit("lease.released", session=session.name, owner=owner)
+            return {"session": session.name, "lease": None}
+        if lease is not None and lease["owner"] != owner:
+            raise RuntimeError(f"session {session.name} is leased by {lease['owner']} until "
+                               f"{time.strftime('%H:%M:%S', time.localtime(lease['until']))}")
+        ttl = float(req.get("ttl") or 1800)
+        session.lease = {"id": (lease or {}).get("id") or wire.new_id()[:8], "owner": owner, "until": time.time() + ttl,
+                         "reason": req.get("reason") or ""}
+        self.emit("lease.taken", session=session.name, owner=owner, until=session.lease["until"])
+        return {"session": session.name, "lease": session.lease}
+
+    async def op_artifacts(self, req):
+        """Files a job wrote with talo.artifact_path (regular files only; links are not followed)."""
+        job = self._job(req["id"])
+        session = self._session(job.session)
+        root = session.dir / "artifacts" / job.id
+        files = []
+        if root.is_dir():
+            for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+                for f in filenames:
+                    path = Path(dirpath) / f
+                    st = path.lstat()
+                    if not path.is_symlink() and os.path.isfile(path):
+                        files.append({"path": str(path.relative_to(root)), "bytes": st.st_size, "modified": st.st_mtime})
+        return {"job": job.id, "root": str(root), "files": sorted(files, key=lambda f: f["path"]),
+                "complete": job.status not in ("queued", "running")}
+
+    async def op_memory(self, req):
+        """Where the session's memory is: processes (measured) and objects (estimated), and what could be released."""
+        session = self._session(req["session"])
+        processes = (await self.op_resources({"session": session.name}))["sessions"][0]
+        objects = None
+        if session.state == "idle":
+            reply = await self._ask_idle(session, "talo_vars_request", {"pattern": None, "extra": ["_", "Out"]})
+            rows = sorted(reply["variables"], key=lambda v: -(v.get("nbytes") or 0))
+            objects = {"largest": [{k: v[k] for k in ("name", "type", "nbytes", "nbytes_partial") if k in v}
+                                   for v in rows[:15]], "count": len(rows), "estimated": True}
+
+        def private(s: Snapshot) -> int | None:
+            m = memory(s.pid)
+            return None if m is None else m.get("private_dirty", 0) + m.get("private_clean", 0)
+        candidates = []
+        for s in list(session.snapshots.values()):
+            if s.pins or s.ref == session.base:
+                continue
+            if s.auto or s.name.startswith("error-"):
+                candidates.append({"action": "drop", "snapshot": s.ref, "name": s.name, "private_bytes": private(s),
+                                   "why": "automatic snapshot" if s.auto else "retained failed state"})
+        if objects and any(v["name"] == "Out" and (v.get("nbytes") or 0) > 0 for v in objects["largest"]):
+            candidates.append({"action": "clear_out", "why": "results kept in Out and _", "private_bytes": None})
+        applied = []
+        if req.get("apply"):
+            for c in candidates:
+                if c["action"] == "drop":
+                    s = next((x for x in session.snapshots.values() if x.ref == c["snapshot"]), None)
+                    if s is not None and not s.pins and s.ref != session.base:  # checked again: pins may have changed
+                        session.drop(s)
+                        applied.append(c)
+                elif c["action"] == "clear_out" and session.state == "idle":
+                    await session.request("execute_request", {"code": "Out.clear(); globals().pop('_', None)",
+                                                              "silent": True, "store_history": False,
+                                                              "user_expressions": {}, "allow_stdin": False}, timeout=60)
+                    applied.append(c)
+        return {"session": session.name, "processes": processes, "objects": objects, "prune": candidates,
+                "applied": applied, "note": "object sizes are estimates and do not add up to process memory"}
 
     async def op_drop(self, req):
         session = self._session(req["session"])
@@ -2669,7 +2809,7 @@ class Supervisor:
             self.emit("share.request", user=user, op=op)
             return req
         target = req.get("session")
-        if op in ("job", "output", "interrupt"):
+        if op in ("job", "output", "interrupt", "artifacts", "diagnose"):
             ident = str(req.get("id"))
             target = (self.calls[ident]["session"] if ident in self.calls else
                       self.maps[ident].session if ident in self.maps else

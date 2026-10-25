@@ -327,3 +327,49 @@ def test_retain_error_keeps_the_failed_state(talo):
     assert out["job"]["result"]["data"]["text/plain"] == "[0, 1, 4, 9, 16]"
     rc, out = run_json(talo, "run", "--atomic", "--retain-error", "x = 1\nraise KeyError('k')")
     assert out["job"]["atomic"]["outcome"] == "restored" and out["job"]["retained"]["name"].startswith("error-")
+
+
+def test_artifacts(talo, tmp_path):
+    rc, out = run_json(talo, "run", "p = talo.artifact_path('out/table.csv')\nopen(p, 'w').write('a,b\\n1,2\\n')\np")
+    jid = out["job"]["id"]
+    assert f"/artifacts/{jid}/out/table.csv" in out["job"]["result"]["data"]["text/plain"]
+    rc, out = run_json(talo, "run", "talo.artifact_path('../escape')")
+    assert out["job"]["error"]["ename"] == "ValueError"
+    rc, d = run_json(talo, "artifacts", jid, "--copy-to", str(tmp_path / "pub"))
+    assert [f["path"] for f in d["files"]] == ["out/table.csv"] and (tmp_path / "pub" / "out" / "table.csv").exists()
+
+
+def test_pause_and_lease(talo):
+    talo("run", "x = 0")
+    talo("queue", "pause", "-m", "inspecting")
+    rc, out = run_json(talo, "run", "x = 1", "-t", "0.5")
+    assert out["job"]["status"] == "queued"
+    rc, b = run_json(talo, "brief")
+    assert b["session"]["paused"]["reason"] == "inspecting"
+    talo("queue", "resume")
+    assert run_json(talo, "wait", out["job"]["id"], "-t", "30")[1]["job"]["status"] == "ok"
+    talo("lease", "--ttl", "60", "--owner", "human")
+    rc, a = run_json(talo, "run", "x = 'agent'", "--owner", "agent", "-t", "0.5")
+    assert a["job"]["status"] == "queued"                                 # another owner waits ...
+    rc, h = run_json(talo, "run", "x = 'human'", "--owner", "human", "-t", "10")
+    assert h["job"]["status"] == "ok"                                     # ... the holder is not stuck behind it
+    rc, out = run_json(talo, "lease", "--ttl", "60", "--owner", "agent")
+    assert rc == 2 and "leased by human" in out["error"]["message"]
+    talo("lease", "--release", "--owner", "human")
+    assert run_json(talo, "wait", a["job"]["id"], "-t", "30")[1]["job"]["status"] == "ok"
+    assert run_json(talo, "show", "x")[1]["text"] == "'agent'"
+
+
+def test_memory_explain_and_prune(talo):
+    talo("run", "import numpy as np\nbig = np.ones(2_000_000)\nnp.zeros(1_000_000)")
+    talo("autosnap", "on", "--keep", "5")
+    talo("run", "big[:] = 2")
+    talo("run", "y = 1")
+    rc, d = run_json(talo, "memory")
+    assert d["objects"]["largest"][0]["name"] in ("big", "Out", "_")
+    names = {c.get("name") for c in d["prune"]}
+    assert any(n and n.startswith("@") for n in names)               # automatic snapshots that are not the base
+    rc, d = run_json(talo, "memory", "--apply")
+    assert d["applied"]
+    rc, s = run_json(talo, "snaps")
+    assert [x["ref"] for x in s["snapshots"]] == [s["base"]]          # only the base is left

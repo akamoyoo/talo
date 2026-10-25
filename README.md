@@ -81,7 +81,10 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
 - Jupyter front ends and MCP: a kernel bridge for JupyterLab / VS Code / nbclient, notebook magics, autosnap and
   undo, `talo notebook`, `talo mcp` (M7).
 
-Next: trust and safety (M8: verify, trial / adopt, hard limits), then shared datasets (M6).
+- trust and safety: `verify`, trial / review / adopt, hard limits, deadlines, `diagnose`, `--retain-error`,
+  artifacts, pause and lease, `memory` (M8).
+
+Next: shared datasets (M6), then durability (M9).
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
@@ -170,6 +173,11 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo share --user NAME --level read/call/run` | share a session with another user on the machine |
 | `talo notebook -s NAME` / `kernelspec install` | open a session in JupyterLab / VS Code: a notebook of its code, attached to it |
 | `talo autosnap on` / `undo` | a snapshot after every execution; undo the last one (`%undo` in notebooks) |
+| `talo verify [--cold]` | replay the lineage and check it gives the same variables |
+| `talo run --trial NAME` / `review` / `adopt` | run in a fork, review, then switch the session to the result |
+| `talo new --limit memory=100G,pids=512` / `run --deadline 600` | hard limits by the kernel; deadlines and output limits |
+| `talo diagnose JOB` / `run --retain-error` | stacks of a running job; keep a failed state to debug |
+| `talo queue pause` / `lease` / `memory` | a human takes over; where the memory is and what can be released |
 | `talo mcp` | the same tools for an MCP client (stdio) |
 | `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
