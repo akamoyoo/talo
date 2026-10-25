@@ -373,3 +373,23 @@ def test_memory_explain_and_prune(talo):
     assert d["applied"]
     rc, s = run_json(talo, "snaps")
     assert [x["ref"] for x in s["snapshots"]] == [s["base"]]          # only the base is left
+
+
+def test_review_fixes_for_m8(talo, tmp_path):
+    import os
+    # an oversized write that finishes between two checks is still caught
+    rc, out = run_json(talo, "run", "--atomic", "x = 1\nprint('y' * 3_000_000)", "--max-output", "1M")
+    assert out["job"]["termination"] == "output_limit" and out["job"]["atomic"]["outcome"] == "restored"
+    # clearing Out is a recorded execution through the queue
+    talo("run", "[1] * 10")
+    rev = run_json(talo, "brief")[1]["session"]["rev"]
+    rc, d = run_json(talo, "memory", "--apply")
+    assert run_json(talo, "brief")[1]["session"]["rev"] > rev
+    # an artifact name that leads out through a link is refused
+    code = ("import os\np = talo.artifact_path('')\nos.symlink('/tmp', os.path.join(p, 'link'))\n"
+            "talo.artifact_path('link/x.txt')")                    # the same job: its own directory
+    rc, out = run_json(talo, "run", code)
+    assert out["job"]["error"]["ename"] == "ValueError"
+    # diagnose refuses outside the executing phase instead of signalling
+    rc, out = run_json(talo, "diagnose", "1")
+    assert rc == 2

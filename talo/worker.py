@@ -690,8 +690,13 @@ class Helper:
         base = Path(out)
         root = (base.parent.parent / "artifacts" / base.stem) if base.parent.name == "jobs" \
             else base.with_suffix(".artifacts")
+        if root.is_symlink() or any(p.is_symlink() for p in root.parents if p != Path("/")):
+            raise ValueError(f"the artifact directory {root} goes through a symbolic link")
         path = root / name
         (path.parent if name else path).mkdir(parents=True, exist_ok=True)
+        real_root = os.path.realpath(root)
+        if os.path.realpath(path) != real_root and not os.path.realpath(path).startswith(real_root + os.sep):
+            raise ValueError(f"artifact name {name!r} leads outside the job's directory (through a link)")
         return str(path)
 
     def _serve_call(self, name: str, kwargs: dict):
@@ -1078,6 +1083,7 @@ def main(argv=None) -> None:
     ap.add_argument("--session", default="")
     args = ap.parse_args(argv)
     signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)  # talo diagnose between executions: harmless, never fatal
     sock = socket.socket(fileno=args.fd)
     sys.argv = [""]  # user code sees the same sys.argv as in an interactive interpreter
     Worker(sock, args.session).serve()

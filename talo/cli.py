@@ -939,14 +939,24 @@ def cmd_artifacts(args):
     if args.copy_to:
         dest = Path(args.copy_to)
         copied = []
+        root = os.path.realpath(d["root"])
         for f in d["files"]:
             src, dst = Path(d["root"]) / f["path"], dest / f["path"]
-            if src.is_symlink() or not src.is_file():
-                continue
-            if dst.exists() and not args.overwrite:
-                raise TaloError("BadArgument", f"{dst} exists; --overwrite replaces it")
+            if not os.path.realpath(src).startswith(root + os.sep):
+                continue  # a link somewhere on the way out of the job's directory
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst, follow_symlinks=False)
+            part = dst.parent
+            while part != dest.parent and part != part.parent:  # no link on the way into the destination
+                if part.is_symlink():
+                    raise TaloError("BadArgument", f"{part} is a symbolic link; not copying through it")
+                part = part.parent
+            flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_TRUNC if args.overwrite else os.O_EXCL)
+            try:
+                with os.fdopen(os.open(src, os.O_RDONLY | os.O_NOFOLLOW), "rb") as fin, \
+                        os.fdopen(os.open(dst, flags, 0o644), "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+            except FileExistsError:
+                raise TaloError("BadArgument", f"{dst} exists; --overwrite replaces it") from None
             copied.append(str(dst))
         d = {**d, "copied": copied}
 

@@ -59,3 +59,21 @@ def test_session_stays_usable_while_a_trial_runs(talo):
     assert rc == 0 and time.time() - t0 < 2.5                        # not queued behind the trial
     rc, d = run_json(talo, "wait", out["job"]["id"], "-t", "30")
     assert d["job"]["status"] == "ok"
+
+
+def test_trial_options_names_and_retries(talo):
+    talo("run", "import time\nx = 1")
+    rc, out = run_json(talo, "run", "--trial", "slow", "time.sleep(30)", "--deadline", "1", "-t", "30")
+    assert out["job"]["termination"] == "deadline" and out["job"]["status"] in ("interrupted", "lost")
+    rc, out = run_json(talo, "run", "--trial", "boom", "y = [1, 2]\nraise ValueError('x')", "--retain-error")
+    assert out["job"]["retained"]["name"].startswith("error-")
+    talo("run", "--trial", "same", "x = 2")
+    talo("reject", "same")
+    talo("run", "--trial", "same", "x = 3")                    # the name is reused after rejection
+    rc, r = run_json(talo, "review", "same")
+    assert r["trial"]["status"] == "ready" and r["trial"]["id"] != "t3"
+    rc, a = run_json(talo, "adopt", "same", "--key", "k")
+    rc, b = run_json(talo, "adopt", "same", "--key", "k")      # a retry after success returns the same result
+    assert rc == 0 and b["deduplicated"] and run_json(talo, "show", "x")[1]["text"] == "3"
+    rc, out = run_json(talo, "reject", "same")
+    assert rc == 2 and "adopted" in out["error"]["message"]

@@ -97,27 +97,34 @@ class Channel:
     @classmethod
     async def from_snapshot(cls, socket_path: str) -> "Channel":
         reader, writer = await asyncio.open_unix_connection(socket_path, limit=wire.MAX_LINE)
-        writer.write(b'{"op": "spawn"}\n')
-        await writer.drain()
-        line = await asyncio.wait_for(reader.readline(), 30)
-        reply = json.loads(line) if line else {}
-        if not reply.get("ok"):
+        try:
+            writer.write(b'{"op": "spawn"}\n')
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), 30)
+            reply = json.loads(line) if line else {}
+            if not reply.get("ok"):
+                raise EphemeralFailed("the snapshot did not spawn a worker")
+        except BaseException:
             writer.close()
-            raise EphemeralFailed("the snapshot did not spawn a worker")
+            raise
         return cls(reader, writer, reply["pid"])
 
     @classmethod
-    async def fresh(cls, python: str, worker: str, cwd: str, env: dict) -> "Channel":
+    async def fresh(cls, python: str, worker: str, cwd: str, env: dict, prefix: list | None = None) -> "Channel":
         import socket as _socket
         parent, child = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
         proc = await asyncio.create_subprocess_exec(
-            python, worker, "--fd", str(child.fileno()), "--session", "verify", cwd=cwd, env=env,
+            *(prefix or []), python, worker, "--fd", str(child.fileno()), "--session", "verify", cwd=cwd, env=env,
             pass_fds=(child.fileno(),), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
         child.close()
         reader, writer = await asyncio.open_unix_connection(sock=parent, limit=wire.MAX_LINE)
         channel = cls(reader, writer, proc.pid, proc)
-        await channel.request("kernel_info_request", {})
+        try:
+            await channel.request("kernel_info_request", {}, timeout=60)
+        except BaseException:
+            await channel.close()
+            raise
         return channel
 
     async def request(self, msg_type: str, content: dict, *, metadata: dict | None = None,
@@ -141,10 +148,12 @@ class Channel:
                 others.append(got)
         return await asyncio.wait_for(read(), timeout), others
 
-    async def execute(self, code: str, output: str) -> dict:
+    async def execute(self, code: str, output: str, *, silent: bool = False, store_history: bool = True,
+                      retain_error: bool = False) -> dict:
         reply, others = await self.request(
-            "execute_request", {"code": code, "silent": False, "store_history": True, "user_expressions": {},
-                                "allow_stdin": False, "stop_on_error": False}, metadata={"talo_output": output})
+            "execute_request", {"code": code, "silent": silent, "store_history": store_history and not silent,
+                                "user_expressions": {}, "allow_stdin": False, "stop_on_error": False},
+            metadata={"talo_output": output, "talo_retain_error": retain_error})
         error = next((m["content"] for m in others if wire.msg_type(m) == "error"), None)
         result = next((m["content"] for m in others if wire.msg_type(m) == "execute_result"), None)
         return {"status": reply["content"]["status"], "error": error, "execution_count":
