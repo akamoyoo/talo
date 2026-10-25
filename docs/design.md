@@ -152,9 +152,69 @@ kernel connection file so that Jupyter front ends can attach. See [protocol.md](
 
 ## Execution history
 
-Every finished job appends one line to `sessions/NAME/history.jsonl`: code, status, execution count, start and end
-times, resident memory before and after, result preview and error. M3 exports a session's history (or the path to a
-snapshot) as a replayable `.py` file or `.ipynb`.
+Every finished job — executions, snapshots and checkouts — appends one line to `sessions/NAME/history.jsonl`: code,
+status, execution count, start and end times, resident memory before and after, result preview, error, and the files
+of rich outputs. Snapshot records carry the snapshot's ref, parent and the jobs between them, so the path that led to
+any state can be reconstructed from the history alone, even after snapshots are dropped.
+
+## For humans (M3)
+
+### `talo attach`: an interactive prompt on a resident session
+
+```console
+$ talo attach                       # the "default" session; -s NAME for another
+talo default (Python 3.12, 31.4 GB) — Ctrl-C interrupts, Ctrl-D detaches, %help for commands
+[4]: df.groupby("code").ret.mean().head()
+...
+[5]: %snap grouped
+snapshot grouped (default:s3)
+[5]: ^D
+detached; the session keeps running
+```
+
+- Each input is submitted as an ordinary job: it is queued with jobs from other clients, appears in `history`, and
+  its output is streamed as it is written. A human and an agent can work on the same session at the same time.
+- Before each prompt, attach reports jobs that other clients ran in the meantime (`[jobs 7, 8 ran from another
+  client; %history shows them]`).
+- Multi-line input is detected as in the standard interactive interpreter (`codeop`): a block continues with `...:`
+  until it is complete.
+- Tab completes names, attributes and keys from the live namespace through the Jupyter `complete_request`. Input
+  history is kept per session in `sessions/NAME/input_history` (readline).
+- Ctrl-C while a job runs interrupts it; at the prompt it clears the line. Ctrl-D (or `%detach`) leaves; the session,
+  its variables and its jobs stay.
+- Lines starting with `%` run Talo commands on the same session: `%vars`, `%show df`, `%snap NAME`, `%snaps`,
+  `%tree`, `%diff A [B]`, `%checkout NAME`, `%history`, `%export ...`; `%help` lists them. Python code that begins with
+  `%` is not valid Python anyway, so there is no ambiguity.
+
+### Rich outputs saved as files
+
+Images and other binary outputs are written next to the job's output file (`jobs/ID-N.png`, `jobs/ID-N.svg`), and
+the job lists them: `outputs: [{"mime": "image/png", "path": ...}]`. The CLI prints `[image/png: PATH]`; an agent
+that can read images opens the file, a human opens it with any viewer.
+
+- A result object with `_repr_png_`, `_repr_jpeg_` or `_repr_svg_` produces the image alongside its `text/plain`.
+- `display(obj, ...)` is available in the namespace (as in Jupyter): each object becomes a `display_data` message;
+  text goes to the job's output, images to files.
+- matplotlib: the worker sets `MPLBACKEND=Agg` unless the user chose a backend. After each execution, figures that are
+  still open are saved as PNG and closed, as Jupyter's inline backend does, and `plt.show()` does the same
+  immediately.
+
+### `talo export`: a replayable script or notebook
+
+```console
+$ talo export -o analysis.py                 # the code that produced the current state
+$ talo export --to ipynb -o analysis.ipynb   # the same as a notebook, with outputs
+$ talo export --snap loaded                  # the path to a snapshot
+$ talo export --all                          # every job, in order, including rolled-back branches
+```
+
+- By default the export follows the **lineage** of the session's current state: the jobs between each snapshot on the
+  chain of bases, across sessions for a branch, then the jobs since the base. Code that was rolled back is left out,
+  so running the script from an empty interpreter reproduces the state (side effects outside the process aside).
+- Failed and interrupted jobs are kept as comments (`# [job 4 failed: NameError: ...]`) in `.py`, and as cells with
+  their error in `.ipynb`; snapshots appear as comments (`# --- snapshot loaded (default:s1)`) or Markdown cells.
+- `.ipynb` is nbformat 4.5, written with the standard library. Outputs come from the job records and output files:
+  streams (truncated to their last 100 KB, with a note), results, errors and saved images (embedded).
 
 ## Known limitations
 

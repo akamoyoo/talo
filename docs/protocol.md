@@ -27,6 +27,7 @@ Replies and side messages carry the request's header as `parent_header`.
 |---|---|---|
 | `execute_request` (`code`, `silent`, `store_history`, …) | `status` busy, `execute_input`, `execute_result` or `error`, `execute_reply`, `status` idle | metadata `talo_output`: path of the job's output file (fds 1 and 2 are redirected to it). `execute_reply` metadata: `talo_duration_s`, `talo_rss_before`, `talo_rss_after` |
 | `kernel_info_request` | `kernel_info_reply` | adds `talo_pid`, `talo_executable` |
+| `complete_request` (`code`, `cursor_pos`) | `complete_reply` (`matches`, `cursor_start`, `cursor_end`) | names, attributes and dictionary keys of the live namespace |
 | `shutdown_request` | `shutdown_reply` | the worker exits |
 
 Interrupts are signals (SIGINT to the worker), as in Jupyter's `interrupt_mode: signal`. Output is delivered through
@@ -35,7 +36,11 @@ front ends.
 
 `execute_result.data` is a mime bundle: `text/plain` always (truncated to 100 000 characters, with
 `metadata.talo_truncated` set to the number of characters cut), plus `text/html` / `text/markdown` when the object
-provides `_repr_html_` / `_repr_markdown_`.
+provides `_repr_html_` / `_repr_markdown_`. Binary representations (`image/png`, `image/jpeg`, `image/svg+xml`) are not sent inline: the worker
+writes each one to a file next to the job's output file (`ID-N.png`, ...) and lists it in `metadata.talo_files`
+(`{mime: path}`); the M4 bridge inlines them (base64) for Jupyter front ends. `display_data` messages (from
+`display()` and matplotlib figures) follow the same rules. The supervisor collects the files of a job into its
+`outputs` list.
 
 ### Talo extensions
 
@@ -83,6 +88,8 @@ Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}
 | `snaps` | `session` | `snapshots`, `base`, `jobs_since_base` |
 | `checkout` | `session`, `name`, `discard`, `snap` (name to save the current state under first) | the session |
 | `drop` | `session`, `name` | `dropped` |
+| `complete` | `session`, `code`, `cursor_pos` | as `complete_reply` (answered only while idle) |
+| `export` | `session`, `snap` (export the path to this snapshot), `all` (every job) | `jobs`: job records in order, each with `code`, `status`, `outputs`, and markers for snapshots (`kind: "snap"`) |
 | `tree` | – | `nodes`: snapshots (`kind: "snapshot"`, as below) and live workers (`kind: "worker"`, `session`, `state`, `base`, `jobs_since_base`), each with `parent` (a snapshot ref or null) |
 | `diff` | `session` (for `@` and bare names), `a`, `b` (default `@`), `max_bytes` (content limit, null for no limit) | `added`, `removed`: variable summaries; `changed`: `{name, a, b, fields}` (`fields` lists the differing summary keys, or `["content"]`); `unchanged`: count; `not_compared`: `{name, reason}` |
 | `shutdown` | – | `stopping` |
