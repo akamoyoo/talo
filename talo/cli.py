@@ -157,7 +157,7 @@ def cmd_run(args):
     name = session_name(args)
     code = read_code(args)
     ensure_session(name, args.python)
-    job = call("run", session=name, code=code, timeout=args.timeout)
+    job = call("run", session=name, code=code, timeout=args.timeout, key=args.key, expect_rev=args.expect_rev)
     show_job(args, job)
     return exit_code(job)
 
@@ -284,7 +284,7 @@ def cmd_snaps(args):
 
 def cmd_checkout(args):
     d = call("checkout", session=session_name(args), name=args.name, discard=args.discard, snap=args.snap,
-             timeout=args.timeout)
+             timeout=args.timeout, expect_rev=args.expect_rev)
     if (code := pending(args, d)) is not None:
         return code
     emit(args, d, lambda x: print(f"session {x['name']} now runs a fork of {x['base']} (pid {x['pid']})"))
@@ -306,8 +306,9 @@ def cmd_export(args):
     session = session_name(args)
     d = call("export", session=session, snap=args.snap, all=args.all)
     to = args.to or ("ipynb" if args.output and args.output.endswith(".ipynb") else "py")
+    notes = "".join(f"\nnote {note_line(n)}" for n in d.get("notes", []))
     what = "every job" if args.all else (f"the path to snapshot {args.snap}" if args.snap else "lineage of the current state")
-    text = (export.to_ipynb if to == "ipynb" else export.to_py)(d["jobs"], export.header(session, what))
+    text = (export.to_ipynb if to == "ipynb" else export.to_py)(d["jobs"], export.header(session, what) + notes)
     if not args.output:
         if args.json:
             print(json.dumps({"format": to, "jobs": len(d["jobs"]), "text": text}, ensure_ascii=False))
@@ -318,6 +319,67 @@ def cmd_export(args):
         f.write(text)
     summary = {"path": os.path.abspath(args.output), "format": to, "jobs": len(d["jobs"])}
     emit(args, summary, lambda x: print(f"wrote {x['path']} ({x['jobs']} records, {x['format']})"))
+
+
+def cmd_note(args):
+    d = call("note", session=session_name(args), text=" ".join(args.text), job=args.job)
+    emit(args, d, lambda x: print(f"noted at revision {x['note']['rev']}"))
+
+
+def note_line(n: dict) -> str:
+    job = f" · job {n['job']}" if n.get("job") else ""
+    return f"[rev {n['rev']} · {n['owner']}{job}] {n['text']}"
+
+
+def cmd_notes(args):
+    def human(d):
+        if not d["notes"]:
+            print("(no notes; `talo note TEXT` adds one)")
+        for n in d["notes"]:
+            print(note_line(n))
+    emit(args, call("notes", session=session_name(args), last=args.last), human)
+
+
+def cmd_brief(args):
+    def human(d):
+        s = d["session"]
+        since = len(s["jobs_since_base"])
+        print(f"session {s['name']}  {s['state']}  rev {s['rev']}  base {s['base'] or '(session start)'}  "
+              f"{since} job{'s' if since != 1 else ''} since  memory {human_bytes(s['rss'])} "
+              f"(private {human_bytes(d['private_bytes'])})")
+        if s.get("death"):
+            print(f"dead: {s['death']}")
+        notes = d["notes"]
+        if notes["last"]:
+            more = f" (last {len(notes['last'])} of {notes['total']}; `talo notes`)" if notes["total"] > len(notes["last"]) else ""
+            print(f"notes{more}")
+            for n in notes["last"]:
+                print(f"  {note_line(n)[:300]}")
+        if d["snapshots"]:
+            print("snapshots  " + "  ·  ".join(
+                f"{x['name']} ({x['ref']})" + (f" \"{x['message'][:60]}\"" if x["message"] else "") for x in d["snapshots"]))
+        v = d["variables"]
+        if "largest" in v:
+            items = [f"{x['name']} {x['type']}" + (f" {tuple(x['shape'])}" if "shape" in x else "")
+                     + f" {human_bytes(x.get('nbytes'))}" for x in v["largest"]]
+            print(f"variables (largest {len(items)} of {v['total']})  " + " · ".join(items))
+        else:
+            print(f"variables  ({v['skipped']})")
+
+        def line(j):
+            preview = (j["code_preview"].strip().splitlines() or [""])[0][:70]
+            err = f"  {j['error'][:120]}" if j.get("error") else ""
+            el = f" {j['elapsed_s']:.1f}s" if j.get("elapsed_s") is not None else ""
+            kind = "" if j["kind"] == "execute" else f"{j['kind']} "
+            return f"#{j['id']} {kind}{j['status']}{el} [{j['owner']}]  {preview}{err}"
+        recent = d["recent_jobs"]
+        if recent["last"]:
+            print(f"recent jobs (last {len(recent['last'])} of {recent['total']})")
+            for j in recent["last"]:
+                print(f"  {line(j)}")
+        for j in d["active_jobs"]:
+            print(f"active  {line(j)}")
+    emit(args, call("brief", session=session_name(args), notes=args.notes, jobs=args.jobs), human)
 
 
 def cmd_tree(args):
@@ -421,6 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add(name, fn, help_, session=True):
         p = sub.add_parser(name, help=help_, description=help_)
         p.add_argument("--json", action="store_true", help="machine-readable output (for agents and scripts)")
+        p.add_argument("--owner", help="who is acting (default: $TALO_AGENT, else user); recorded on jobs and notes")
         if session:
             p.add_argument("-s", "--session", help=f"session name (default: $TALO_SESSION or {DEFAULT_SESSION})")
         p.set_defaults(fn=fn)
@@ -445,6 +508,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "returned and the computation continues in the background")
     p.add_argument("-n", "--lines", type=int, default=LINES, help=f"show only the last N output lines (default {LINES})")
     p.add_argument("--python", help="interpreter for the session if it has to be created")
+    p.add_argument("--key", help="idempotency key: retrying with the same key returns the job already submitted")
+    p.add_argument("--expect-rev", type=int, metavar="N", help="refuse to run unless the session is at revision N")
     p = add("wait", cmd_wait, "wait for a job to finish", session=False)
     p.add_argument("id")
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
@@ -477,6 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", help="[SESSION:]SNAPSHOT")
     p.add_argument("--discard", action="store_true", help="drop the state of jobs run since the current base")
     p.add_argument("--snap", metavar="NAME", help="snapshot the current state under NAME before checking out")
+    p.add_argument("--expect-rev", type=int, metavar="N", help="refuse unless the session is at revision N")
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT, help="seconds to wait (it stays queued after)")
     p = add("drop", cmd_drop, "free a snapshot")
     p.add_argument("name")
@@ -486,6 +552,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", choices=("py", "ipynb"), help="format (default: from the file name, else py)")
     p.add_argument("--snap", metavar="NAME", help="export the path to this snapshot instead")
     p.add_argument("--all", action="store_true", help="every job of the session, including rolled-back ones")
+    p = add("brief", cmd_brief, "what an agent needs to resume the session's work (state, notes, variables, jobs)")
+    p.add_argument("--notes", type=int, default=10, help="most recent notes shown")
+    p.add_argument("--jobs", type=int, default=8, help="most recent finished jobs shown")
+    p = add("note", cmd_note, "attach a note (goal, finding, next step) to the session's current state")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--job", help="the job the note is about")
+    p = add("notes", cmd_notes, "the session's notes")
+    p.add_argument("--last", type=int)
     add("tree", cmd_tree, "all snapshots and live workers of all sessions, as a tree", session=False)
     p = add("diff", cmd_diff, "variables added, removed or changed between two states")
     p.add_argument("a", help="[SESSION:]SNAPSHOT, or @ / SESSION:@ for a live worker")
@@ -500,6 +574,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "owner", None):
+        os.environ["TALO_AGENT"] = args.owner  # read by every request (client.call)
     try:
         try:
             return args.fn(args) or 0

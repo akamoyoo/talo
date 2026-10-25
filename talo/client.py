@@ -53,7 +53,8 @@ def call(op: str, *, autostart: bool = True, **params) -> dict:
         start_supervisor()
         s = _connect()
     with s:
-        s.sendall(json.dumps({"op": op, **params}, ensure_ascii=False).encode() + b"\n")
+        request = {"op": op, "owner": os.environ.get("TALO_AGENT") or "user", **params}
+        s.sendall(json.dumps(request, ensure_ascii=False).encode() + b"\n")
         data = s.makefile("rb").readline()
     if not data:
         raise TaloError("Disconnected", "the supervisor closed the connection (see supervisor.log)")

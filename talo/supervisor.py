@@ -89,12 +89,17 @@ class Job:
     error: dict | None = None   # ename / evalue / traceback
     metrics: dict = field(default_factory=dict)
     outputs: list = field(default_factory=list)  # files of rich outputs: {"mime", "path"}
+    owner: str = "user"                        # who submitted it ($TALO_AGENT / --owner)
+    key: str | None = None                     # idempotency key (run --key)
+    expect_rev: int | None = None              # refuse to start unless the session is at this revision
+    rev: int | None = None                     # the session's revision when the job started
     interrupt_requested: bool = False
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
-                                            "execution_count", "result", "error", "metrics", "output", "outputs")}
+                                            "execution_count", "result", "error", "metrics", "output", "outputs", "owner", "key",
+                                            "rev")}
         out["elapsed_s"] = round((self.finished or time.time()) - (self.started or time.time()), 3) if self.started else None
         return out
 
@@ -111,6 +116,7 @@ class Snapshot:
     execution_count: int
     threads: list
     message: str = ""
+    owner: str = "user"
     created: float = field(default_factory=time.time)
     hold: socket.socket | None = field(default=None, repr=False)
 
@@ -120,12 +126,16 @@ class Snapshot:
 
     def to_dict(self) -> dict:
         return {"id": self.id, "name": self.name, "session": self.session, "ref": self.ref, "parent": self.parent,
-                "pid": self.pid, "created": self.created, "message": self.message,
+                "pid": self.pid, "created": self.created, "message": self.message, "owner": self.owner,
                 "execution_count": self.execution_count, "jobs": self.jobs, "threads": self.threads,
                 "private_bytes": private_dirty(self.pid), "alive": private_dirty(self.pid) is not None}
 
 
 class SessionDead(RuntimeError):
+    pass
+
+
+class StaleRevision(RuntimeError):
     pass
 
 
@@ -152,6 +162,8 @@ class Session:
         self.next_snapshot = 1
         self.base: str | None = None        # ref of the snapshot the current worker descends from
         self.jobs_since_base: list[str] = []
+        self.rev = 0                        # increases whenever the state may change (execution, checkout)
+        self.owners: dict[str, str] = {}    # job id -> owner, for refusals that name whose work would be lost
         self.tasks: list[asyncio.Task] = []
 
     # ---------------------------------------------------------------- workers
@@ -281,12 +293,21 @@ class Session:
             if self.state != "dead":
                 self.state = "busy"
             try:
+                if job.expect_rev is not None and job.expect_rev != self.rev:
+                    since = [j for j in self.jobs_since_base]
+                    raise StaleRevision(f"session {self.name} is at revision {self.rev}, not {job.expect_rev}; "
+                                        f"base {self.base or 'session start'}, jobs since: {', '.join(since) or 'none'} "
+                                        f"(`talo brief` shows the current state)")
+                if job.kind in ("execute", "checkout"):
+                    self.rev += 1
+                job.rev = self.rev
+                self.owners[job.id] = job.owner
                 if job.kind == "execute":
                     await self._execute(job)
                 elif job.kind == "snap":
-                    self._finish(job, "ok", result=(await self._snap(**job.params)).to_dict())
+                    self._finish(job, "ok", result=(await self._snap(**job.params, owner=job.owner)).to_dict())
                 elif job.kind == "checkout":
-                    self._finish(job, "ok", result=await self._checkout(**job.params))
+                    self._finish(job, "ok", result=await self._checkout(**job.params, owner=job.owner))
             except Exception as error:  # noqa: BLE001 - a failed control job is reported, the session goes on
                 if not job.done.is_set():
                     self._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error),
@@ -353,7 +374,8 @@ class Session:
     def memory_in_use(self) -> int:
         return (resident(self.worker_pid) or 0) + sum(private_dirty(s.pid) or 0 for s in self.snapshots.values())
 
-    async def _snap(self, name: str | None = None, message: str = "", strict: bool = False) -> Snapshot:
+    async def _snap(self, name: str | None = None, message: str = "", strict: bool = False,
+                    owner: str = "user") -> Snapshot:
         if self.state == "dead":
             raise SessionDead(f"session {self.name} is dead ({self.death}); check out a snapshot first")
         sid = f"s{self.next_snapshot}"
@@ -372,7 +394,7 @@ class Session:
             raise RuntimeError(f"{content.get('ename')}: {content.get('evalue')}")
         self.next_snapshot += 1
         snap = Snapshot(sid, name, self.name, path, content["pid"], self.base, list(self.jobs_since_base),
-                        content.get("execution_count", 0), content.get("threads", []), message)
+                        content.get("execution_count", 0), content.get("threads", []), message, owner)
         snap.hold = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         snap.hold.connect(path)
         snap.hold.sendall(b'{"op": "hold"}\n')
@@ -388,13 +410,15 @@ class Session:
             return None
         raise KeyError(f"session {self.name} has no snapshot {name!r} (`talo snaps -s {self.name}` lists them)")
 
-    async def _checkout(self, snap: Snapshot, discard: bool = False, save_as: str | None = None) -> dict:
+    async def _checkout(self, snap: Snapshot, discard: bool = False, save_as: str | None = None,
+                        owner: str = "user") -> dict:
         if self.jobs_since_base and self.state != "dead" and not discard and not save_as:
-            raise RuntimeError(f"jobs {', '.join(self.jobs_since_base)} ran since this worker's base "
+            by = sorted({self.owners.get(j, "user") for j in self.jobs_since_base})
+            raise RuntimeError(f"jobs {', '.join(self.jobs_since_base)} (by {', '.join(by)}) ran since this worker's base "
                                f"({self.base or 'session start'}); use --discard to drop that state or "
                                f"--snap NAME to save it first")
         if save_as and self.state != "dead":
-            await self._snap(save_as, message=f"saved before checking out {snap.name}")
+            await self._snap(save_as, message=f"saved before checking out {snap.name}", owner=owner)
         if private_dirty(snap.pid) is None:
             raise RuntimeError(f"snapshot {snap.name} (pid {snap.pid}) is gone")
         await self._retire()
@@ -448,7 +472,7 @@ class Session:
                 "pid": self.worker_pid, "rss": resident(self.worker_pid) if self.state != "dead" else None,
                 "created": self.created, "queued": self.queue.qsize(),
                 "current_job": self.current.id if self.current else None, "death": self.death, "base": self.base,
-                "jobs_since_base": list(self.jobs_since_base), "snapshots": len(self.snapshots),
+                "jobs_since_base": list(self.jobs_since_base), "snapshots": len(self.snapshots), "rev": self.rev,
                 "memory_budget": self.memory_budget}
 
 
@@ -456,6 +480,7 @@ class Supervisor:
     def __init__(self):
         self.sessions: dict[str, Session] = {}
         self.jobs: dict[str, Job] = {}
+        self.keys: dict[tuple[str, str], str] = {}  # (session, idempotency key) -> job id
         self.state_file = home() / "state.json"
         state = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
         self.next_job = int(state.get("next_job", 1))
@@ -500,8 +525,12 @@ class Supervisor:
                 pass
         return job.to_dict()
 
-    async def _submit(self, session: Session, kind: str, code: str = "", **params) -> Job:
-        job = Job(self._new_job_id(), session.name, code, "", kind=kind, params=params)
+    async def _submit(self, session: Session, kind: str, code: str = "", *, owner: str | None = None,
+                      key: str | None = None, expect_rev: int | None = None, **params) -> Job:
+        job = Job(self._new_job_id(), session.name, code, "", kind=kind, params=params, owner=owner or "user",
+                  key=key, expect_rev=expect_rev)
+        if key is not None:
+            self.keys[(session.name, key)] = job.id
         job.output = str(session.dir / "jobs" / f"{job.id}.out")
         Path(job.output).touch()
         self.jobs[job.id] = job
@@ -546,7 +575,14 @@ class Supervisor:
         if session.state == "dead":
             raise SessionDead(f"session {session.name} is dead: {session.death} (`talo checkout SNAPSHOT` to roll "
                               f"back, or `talo kill {session.name}` and create it again)")
-        job = await self._submit(session, "execute", req["code"])
+        key = req.get("key")
+        if key is not None and (session.name, key) in self.keys:  # a retry: the job that was already submitted
+            job = self.jobs[self.keys[(session.name, key)]]
+            if job.code != req["code"]:
+                raise ValueError(f"key {key!r} was used for job {job.id} with different code")
+        else:
+            job = await self._submit(session, "execute", req["code"], owner=req.get("owner"), key=key,
+                                     expect_rev=req.get("expect_rev"))
         return await self._wait(job, req.get("timeout", 30))
 
     async def op_job(self, req):
@@ -595,8 +631,8 @@ class Supervisor:
         lines = path.read_text().splitlines() if path.exists() else []
         return {"history": [json.loads(x) for x in lines[-int(req.get("last", 20)):]]}
 
-    async def _control(self, session: Session, kind: str, timeout: float, **params) -> dict:
-        job = await self._submit(session, kind, **params)
+    async def _control(self, session: Session, kind: str, timeout: float, req: dict, **params) -> dict:
+        job = await self._submit(session, kind, owner=req.get("owner"), expect_rev=req.get("expect_rev"), **params)
         out = await self._wait(job, timeout)
         if out["status"] == "error":
             raise RuntimeError(out["error"]["evalue"])
@@ -606,7 +642,7 @@ class Supervisor:
 
     async def op_snap(self, req):
         session = self._session(req["session"])
-        return await self._control(session, "snap", req.get("timeout", 300), name=req.get("name"),
+        return await self._control(session, "snap", req.get("timeout", 300), req, name=req.get("name"),
                                    message=req.get("message", ""), strict=bool(req.get("strict")))
 
     async def op_snaps(self, req):
@@ -617,7 +653,7 @@ class Supervisor:
     async def op_checkout(self, req):
         session = self._session(req["session"])
         snap = self._snapshot(req["name"], session.name)
-        return await self._control(session, "checkout", req.get("timeout", 300), snap=snap,
+        return await self._control(session, "checkout", req.get("timeout", 300), req, snap=snap,
                                    discard=bool(req.get("discard")), save_as=req.get("snap"))
 
     async def op_drop(self, req):
@@ -647,7 +683,8 @@ class Supervisor:
         records = self._records()
         if req.get("all"):
             path = session.dir / "history.jsonl"
-            return {"jobs": [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []}
+            return {"jobs": [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else [],
+                    "notes": self._notes(session)}
         snaps = {r["result"]["ref"]: r for r in records.values() if r["kind"] == "snap" and r["status"] == "ok"}
         if req.get("snap"):
             base, tail = self._snapshot(req["snap"], session.name).ref, []
@@ -666,7 +703,59 @@ class Supervisor:
                 out.append(part)
             else:
                 out += [records[j] for j in part if j in records]
-        return {"jobs": out}
+        return {"jobs": out, "notes": self._notes(session)}
+
+    # ---------------------------------------------------------------- notes and brief
+
+    async def op_note(self, req):
+        session = self._session(req["session"])
+        if req.get("job"):
+            self._job(req["job"])  # must exist
+        note = {"time": time.time(), "owner": req.get("owner") or "user", "rev": session.rev, "base": session.base,
+                "job": req.get("job"), "text": req["text"]}
+        with open(session.dir / "notes.jsonl", "a") as f:
+            f.write(json.dumps(note, ensure_ascii=False) + "\n")
+        return {"note": note}
+
+    def _notes(self, session: Session) -> list:
+        path = session.dir / "notes.jsonl"
+        return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+    async def op_notes(self, req):
+        notes = self._notes(self._session(req["session"]))
+        last = req.get("last")
+        return {"notes": notes[-int(last):] if last else notes, "total": len(notes)}
+
+    async def op_brief(self, req):
+        """What an agent needs to continue the session's work, every list bounded (see "Resuming" in design.md)."""
+        session = self._session(req["session"])
+        n_notes, n_jobs, n_vars = int(req.get("notes", 10)), int(req.get("jobs", 8)), int(req.get("vars", 15))
+        notes = self._notes(session)
+        jobs = [j for j in self.jobs.values() if j.session == session.name]
+        finished = [j for j in jobs if j.status not in ("queued", "running")]
+
+        def job_line(j: Job) -> dict:
+            d = {k: v for k, v in j.to_dict().items() if k in ("id", "kind", "status", "elapsed_s", "owner", "rev")}
+            d["code_preview"] = j.code[:120]
+            if j.error:
+                d["error"] = f"{j.error.get('ename')}: {str(j.error.get('evalue'))[:200]}"
+            return d
+
+        variables = {"skipped": f"session is {session.state}"}
+        if session.state == "idle":
+            rows = (await self._ask_idle(session, "talo_vars_request", {"pattern": None}))["variables"]
+            rows.sort(key=lambda v: -(v.get("nbytes") or 0))
+            variables = {"largest": rows[:n_vars], "total": len(rows)}
+        return {
+            "session": session.to_dict(),
+            "private_bytes": private_dirty(session.worker_pid),
+            "notes": {"last": notes[-n_notes:], "total": len(notes)},
+            "snapshots": [{k: s.to_dict()[k] for k in ("name", "ref", "parent", "message", "owner", "private_bytes")}
+                          for s in session.snapshots.values()],
+            "variables": variables,
+            "recent_jobs": {"last": [job_line(j) for j in finished[-n_jobs:]], "total": len(finished)},
+            "active_jobs": [job_line(j) for j in jobs if j.status in ("queued", "running")],
+        }
 
     async def op_tree(self, req):
         nodes = []

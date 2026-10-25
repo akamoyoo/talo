@@ -67,7 +67,7 @@ one per connection:
 
 ## Control requests
 
-Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}` or
+Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` defaults to `user`; the CLI sends `$TALO_AGENT`). Reply: `{"ok": true, ...result}` or
 `{"ok": false, "error": {"type": "...", "message": "..."}}`.
 
 | `op` | Parameters | Result |
@@ -76,7 +76,7 @@ Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}
 | `new` | `name`, `python`, `cwd`, `env`, `from` (`[session:]snapshot`), `memory_budget` (bytes) | the session |
 | `ls` | – | `sessions` |
 | `kill` | `name` | `killed` |
-| `run` | `session`, `code`, `timeout` (seconds) | the job, possibly still `running` |
+| `run` | `session`, `code`, `timeout` (seconds), `key` (idempotency), `expect_rev` | the job, possibly still `running`; for a known `key`, the job already submitted |
 | `job` | `id`, `wait` (seconds) | the job |
 | `jobs` | `session` (optional), `last` | `jobs` (the last `last`, each with `code_preview`: the first 200 characters of its code), `total` |
 | `output` | `id`, `offset` (default: the end), `max_bytes` | `text`, `offset`, `next_offset`, `size`, `status` |
@@ -92,12 +92,15 @@ Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}
 | `export` | `session`, `snap` (export the path to this snapshot), `all` (every job) | `jobs`: job records in order, each with `code`, `status`, `outputs`, and markers for snapshots (`kind: "snap"`) |
 | `tree` | – | `nodes`: snapshots (`kind: "snapshot"`, as below) and live workers (`kind: "worker"`, `session`, `state`, `base`, `jobs_since_base`), each with `parent` (a snapshot ref or null) |
 | `diff` | `session` (for `@` and bare names), `a`, `b` (default `@`), `max_bytes` (content limit, null for no limit) | `added`, `removed`: variable summaries; `changed`: `{name, a, b, fields}` (`fields` lists the differing summary keys, or `["content"]`); `unchanged`: count; `not_compared`: `{name, reason}` |
+| `note` | `session`, `text`, `job` | `note`: `{time, owner, rev, base, job, text}` |
+| `notes` | `session`, `last` | `notes`, `total` |
+| `brief` | `session`, `notes`, `jobs`, `vars` (how many of each) | `session`, `private_bytes`, `notes`, `snapshots`, `variables` (`largest`, `total`, or `skipped` while busy), `recent_jobs`, `active_jobs` |
 | `shutdown` | – | `stopping` |
 
 A **session** is `{name, state (starting | idle | busy | dead), python, cwd, pid, rss, created, queued, current_job,
-death, base, memory_budget}`. A **snapshot** is `{id, name, session, parent, pid, created, message, execution_count,
-jobs (ids run between its parent and itself), private_bytes, threads}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
-started, finished, elapsed_s, execution_count, result, error, metrics, output}`.
+death, base, jobs_since_base, snapshots, rev, memory_budget}`. A **snapshot** is `{id, name, session, parent, pid, created, message, execution_count,
+jobs (ids run between its parent and itself), private_bytes, threads, owner}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
+started, finished, elapsed_s, execution_count, result, error, metrics, output, outputs, owner, key, rev}`.
 
 The control protocol is versioned together with Talo while it is pre-alpha; it will be frozen and versioned
 separately at 1.0.
