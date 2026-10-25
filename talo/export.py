@@ -31,6 +31,13 @@ def _checkout_title(rec: dict) -> str:
         " (the state below continues from there)"
 
 
+def _reload_title(rec: dict) -> str:
+    modules = (rec.get("result") or {}).get("modules") or []
+    parts = [f"{m['module']} {m['status']}" + (f" ({m.get('old_hash')} -> {m.get('new_hash')})" if m.get("new_hash") else "")
+             for m in modules]
+    return ("reload " + ", ".join(parts) + "; a replay imports the source files as they are now, which may differ")
+
+
 def to_py(jobs: list, header: str) -> str:
     parts = [f"# {line}" if line else "#" for line in header.splitlines()]
     for rec in jobs:
@@ -38,6 +45,8 @@ def to_py(jobs: list, header: str) -> str:
             parts.append(f"\n# --- {_snap_title(rec)}")
         elif rec["kind"] == "checkout":
             parts.append(f"\n# --- {_checkout_title(rec)}")
+        elif rec["kind"] == "reload":
+            parts.append(f"\n# --- {_reload_title(rec)}")
         elif rec["kind"] == "execute":
             code = rec["code"].rstrip("\n")
             if rec["status"] == "ok":
@@ -77,8 +86,8 @@ def _cell_id(n: int) -> str:
 def to_ipynb(jobs: list, header: str) -> str:
     cells = [{"cell_type": "markdown", "id": _cell_id(0), "metadata": {}, "source": header.splitlines(keepends=True)}]
     for rec in jobs:
-        if rec["kind"] in ("snap", "checkout"):
-            title = _snap_title(rec) if rec["kind"] == "snap" else _checkout_title(rec)
+        if rec["kind"] in ("snap", "checkout", "reload"):
+            title = {"snap": _snap_title, "checkout": _checkout_title, "reload": _reload_title}[rec["kind"]](rec)
             cells.append({"cell_type": "markdown", "id": _cell_id(len(cells)), "metadata": {},
                           "source": [f"**{title}**"]})
             continue

@@ -36,6 +36,7 @@ from talo.paths import home, socket_for, socket_path
 
 log = logging.getLogger("talo")
 WORKER = Path(__file__).with_name("worker.py")
+BRIEF_MAX_BYTES = 16_000  # upper bound for the serialized brief
 NOTE_PREVIEW = 500  # characters of each note shown by brief (talo notes shows them in full)
 DIFF_MAX_BYTES = 256 << 20  # variables larger than this are compared by summary only, unless the request says otherwise
 
@@ -123,10 +124,13 @@ class Job:
     metrics: dict = field(default_factory=dict)
     outputs: list = field(default_factory=list)  # files of rich outputs: {"mime", "path"}
     owner: str = "user"                        # who submitted it ($TALO_AGENT / --owner)
+    session_id: str | None = None              # the incarnation of the session it was submitted to
     key: str | None = None                     # idempotency key (run --key)
     expect_rev: int | None = None              # refuse to start unless the session is at this revision
     rev: int | None = None                     # the session's revision when the job started
     termination: str | None = None             # why Talo stopped the job ("memory_limit")
+    phase: str | None = None                   # preparing | executing | restoring | committing (signals only while executing)
+    exec_pid: int | None = None                # the worker running the user code, the only process ever signalled
     progress: dict | None = None               # the last talo.progress() of a running job
     progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
@@ -136,7 +140,7 @@ class Job:
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "owner", "key",
-                                            "rev", "atomic", "termination")}
+                                            "rev", "atomic", "termination", "phase")}
         out["progress"] = self.progress
         if self.status == "running":
             out["last_progress_age_s"] = round(time.monotonic() - self.progress_at, 1) if self.progress_at else None
@@ -211,7 +215,8 @@ class Session:
         self.next_snapshot = 1
         self.base: str | None = None        # ref of the snapshot the current worker descends from
         self.jobs_since_base: list[str] = []
-        self.rev = 0                        # increases whenever the state may change (execution, checkout)
+        self.id = wire.new_id()[:12]        # unique per incarnation: a recreated session with the same name is another
+        self.rev = 0                        # increases whenever the state may change (execution, checkout, reload)
         self.owners: dict[str, str] = {}    # job id -> owner, for refusals that name whose work would be lost
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
@@ -255,14 +260,34 @@ class Session:
         self.base, self.jobs_since_base = snap.ref, []
 
     async def _attach(self, reader, writer, *, proc=None, children_file=None) -> None:
-        """Make this connection the session's worker channel (replacing the previous worker, if any)."""
+        """Make this connection the session's worker channel, replacing the previous worker only once the new one
+        has answered: if the handshake fails, the session is left exactly as it was."""
+        try:
+            msg = wire.message("kernel_info_request", {}, session=self.name)
+            writer.write(wire.encode(msg))
+            await writer.drain()
+
+            async def handshake() -> dict:
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        raise RuntimeError("the new worker closed its connection before answering")
+                    got = wire.decode(line)
+                    if got.get("parent_header", {}).get("msg_id") == msg["header"]["msg_id"] \
+                            and wire.msg_type(got) == "kernel_info_reply":
+                        return got
+            info = await asyncio.wait_for(handshake(), 60)
+        except BaseException:
+            writer.close()
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+            raise
         self.generation += 1
         self.proc, self.children_file, self.writer = proc, children_file, writer
-        self.state, self.death = "starting", None
-        self.tasks.append(asyncio.create_task(self._read(reader, self.generation)))
-        info = await self.request("kernel_info_request", {}, timeout=60)
         self.worker_pid = info["content"].get("talo_pid")
-        self.state = "idle"
+        self.death = None
+        self.state = "busy" if self.current is not None else "idle"  # an atomic restore is still part of its job
+        self.tasks.append(asyncio.create_task(self._read(reader, self.generation)))
 
     async def _retire(self) -> None:
         """Ask the current worker to exit (used when a checkout replaces it); its death is not reported."""
@@ -293,7 +318,7 @@ class Session:
             if parent in self.waiters:
                 await self.waiters[parent].put(msg)
         if generation == self.generation:
-            await self._died()
+            await self._died(generation)
 
     async def _exit_code(self) -> int | None:
         if self.proc is not None:
@@ -308,8 +333,11 @@ class Session:
                 await asyncio.sleep(0.02)
         return None
 
-    async def _died(self) -> None:
-        self.death = f"the worker process {describe_exit(await self._exit_code())}"
+    async def _died(self, generation: int) -> None:
+        death = f"the worker process {describe_exit(await self._exit_code())}"
+        if generation != self.generation:  # replaced while we waited for the exit status: not this worker's death
+            return
+        self.death = death
         self.state = "dead"
         log.warning("session %s: %s", self.name, self.death)
         for q in list(self.waiters.values()):
@@ -370,6 +398,8 @@ class Session:
                     if self.state == "dead":
                         raise SessionDead(f"session {self.name} is dead ({self.death})")
                     reply = (await self.request("talo_reload_request", job.params, timeout=600))["content"]
+                    if any(m["status"] in ("reloaded", "failed") for m in reply.get("modules", [])):
+                        self.jobs_since_base.append(job.id)  # module state changed (maybe partly): part of the lineage
                     failed = [m for m in reply.get("modules", []) if m["status"] == "failed"]
                     if failed:
                         job.error = {"ename": "ReloadFailed", "traceback": [],
@@ -392,6 +422,7 @@ class Session:
         msg = wire.message("execute_request", {"code": job.code, "silent": False, "store_history": True,
                                                "user_expressions": {}, "allow_stdin": False, "stop_on_error": True},
                            session=self.name, metadata={"talo_output": job.output, "talo_job": job.id})
+        job.phase, job.exec_pid = "executing", self.worker_pid
         q = self._send(msg)
         try:
             while True:
@@ -417,38 +448,57 @@ class Session:
                     job.metrics = dict(got.get("metadata", {}))
                     if status == "error" and job.interrupt_requested and (job.error or {}).get("ename") == "KeyboardInterrupt":
                         status = "interrupted"
+                    if job.termination == "memory_limit" and status == "ok":  # it caught the interrupt: still stopped
+                        status = "interrupted"
+                        job.error = {"ename": "MemoryLimit", "traceback": [],
+                                     "evalue": "the session went over its memory limit; the job caught the interrupt"}
                     self.jobs_since_base.append(job.id)
                     return status
         finally:
+            job.exec_pid = None
             self.waiters.pop(msg["header"]["msg_id"], None)
 
     async def _execute_atomic(self, job: Job) -> str:
         """run --atomic: checkpoint, execute, then commit or restore (see "run --atomic" in docs/design.md)."""
         if self.state == "dead":
             return await self._execute(job)
+        job.phase = "preparing"
         try:
             checkpoint = await self._fork(f"c{job.id}", strict=False)
         except Exception as error:  # noqa: BLE001 - no code ran
             job.error = {"ename": "CheckpointFailed", "evalue": str(error), "traceback": []}
             job.atomic = {"outcome": "not_started", "error": str(error)}
             return "error"
-        base, before = self.base, list(self.jobs_since_base)
-        self.checkpoint = checkpoint
+        keep = False
         try:
+            if job.interrupt_requested:  # interrupted while the checkpoint was taken: never start the code
+                job.error = {"ename": "KeyboardInterrupt", "evalue": "interrupted before it started", "traceback": []}
+                job.atomic = {"outcome": "not_started", "error": "interrupted"}
+                return "interrupted"
+            base, before = self.base, list(self.jobs_since_base)
+            self.checkpoint = checkpoint
             status = await self._execute(job)
             if status == "ok":
+                job.phase = "committing"
                 job.atomic = {"outcome": "committed"}
                 return status
+            job.phase = "restoring"
             try:
                 await self._replace_from(checkpoint)
                 self.base, self.jobs_since_base = base, before  # the failed job leaves the lineage
                 job.atomic = {"outcome": "restored"}
-            except Exception as error:  # noqa: BLE001
-                job.atomic = {"outcome": "restore_failed", "error": f"{type(error).__name__}: {error}"}
+            except Exception as error:  # noqa: BLE001 - keep the checkpoint so the state can still be recovered
+                keep = True
+                checkpoint.name = f"restore-{job.id}"
+                checkpoint.message = f"state before job {job.id}; restoring it failed"
+                self.snapshots[checkpoint.id] = checkpoint
+                job.atomic = {"outcome": "restore_failed", "error": f"{type(error).__name__}: {error}",
+                              "checkpoint": checkpoint.ref}
             return status
         finally:
             self.checkpoint = None
-            self._release(checkpoint)
+            if not keep:
+                self._release(checkpoint)
 
     async def _replace_from(self, snap: "Snapshot") -> None:
         """Replace the worker with a fork of ``snap``; the old worker is shut down only once the new one answers."""
@@ -488,22 +538,36 @@ class Session:
     def held(self) -> list:
         return [*self.snapshots.values(), *([self.checkpoint] if self.checkpoint else [])]
 
-    def memory_in_use(self) -> int:
-        """PSS of the worker plus its snapshots: shared pages are counted once across the family."""
+    def memory_usage(self) -> tuple[int, list]:
+        """(PSS of the worker plus its snapshots, pids whose memory could not be read). Shared pages are counted once
+        across the family. A dead worker is not counted; a live process that cannot be measured is listed, not
+        treated as zero."""
         pids = [self.worker_pid if self.state != "dead" else None] + [s.pid for s in self.held()]
-        return sum((memory(pid) or {}).get("pss", 0) for pid in pids if pid)
+        known, unknown = 0, []
+        for pid in filter(None, pids):
+            m = memory(pid)
+            if m is None or "pss" not in m:
+                if os.path.exists(f"/proc/{pid}"):
+                    unknown.append(pid)
+                continue
+            known += m["pss"]
+        return known, unknown
+
+    def memory_in_use(self) -> int:
+        return self.memory_usage()[0]
 
     async def _watch_memory(self) -> None:
         """Enforce --memory-limit (see "Resources on shared machines" in docs/design.md)."""
         while True:
             await asyncio.sleep(MEMORY_LIMIT_INTERVAL)
-            used = self.memory_in_use()
+            used, unknown = self.memory_usage()
             if used <= self.memory_limit:
-                self.over_limit = None
+                self.over_limit = (f"enforcement degraded: memory of pids {unknown} cannot be read; {used >> 20} MB "
+                                   "known") if unknown else None
                 continue
             job, generation, pid = self.current, self.generation, self.worker_pid
             snaps = sum((memory(s.pid) or {}).get("pss", 0) for s in self.held())
-            if job is None or job.kind != "execute" or job.status != "running" or snaps > self.memory_limit:
+            if job is None or job.kind != "execute" or job.phase != "executing" or snaps > self.memory_limit:
                 self.over_limit = (f"{used >> 20} MB in use (snapshots {snaps >> 20} MB) over the limit of "
                                    f"{self.memory_limit >> 20} MB; drop snapshots or free variables")
                 continue
@@ -517,7 +581,8 @@ class Session:
                     await asyncio.sleep(0.1)
                 if job.done.is_set() or self.memory_in_use() <= self.memory_limit:
                     continue  # stopped, or freed enough; if it grows again it is killed
-            if not job.done.is_set() and self.generation == generation:
+            if not job.done.is_set() and self.generation == generation and job.phase == "executing" \
+                    and job.exec_pid == pid:
                 log.warning("session %s: job %s still over the memory limit; killing the worker", self.name, job.id)
                 try:
                     os.kill(pid, signal.SIGKILL)
@@ -603,9 +668,14 @@ class Session:
             job.status, job.finished = "cancelled", time.time()
             job.done.set()
             return "cancelled"
-        if job.status == "running" and job.kind == "execute" and self.worker_pid:
+        if job.status == "running" and job.kind == "execute":
             job.interrupt_requested = True
-            os.kill(self.worker_pid, signal.SIGINT)
+            if job.phase != "executing" or not job.exec_pid:  # a checkpoint or restore is in progress
+                return "interrupt deferred" if job.phase == "preparing" else "finishing"
+            try:
+                os.kill(job.exec_pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
             return "interrupting"
         return job.status
 
@@ -637,6 +707,7 @@ class Session:
                 "created": self.created, "queued": self.queue.qsize(),
                 "current_job": self.current.id if self.current else None, "death": self.death, "base": self.base,
                 "jobs_since_base": list(self.jobs_since_base), "snapshots": len(self.snapshots), "rev": self.rev,
+                "id": self.id,
                 "memory_budget": self.memory_budget, "memory_limit": self.memory_limit, "over_limit": self.over_limit}
 
 
@@ -644,7 +715,8 @@ class Supervisor:
     def __init__(self):
         self.sessions: dict[str, Session] = {}
         self.jobs: dict[str, Job] = {}
-        self.keys: dict[tuple[str, str], tuple] = {}  # (session, idempotency key) -> (job id, request fingerprint)
+        self.keys: dict[tuple[str, str], tuple] = {}  # (session id, idempotency key) -> (job id, request fingerprint)
+        self.last_rev: dict[str, int] = {}             # session name -> its revision when it was closed
         self.epoch = wire.new_id()[:12]               # changes when the supervisor restarts (keys do not survive it)
         self.state_file = home() / "state.json"
         state = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
@@ -694,9 +766,9 @@ class Supervisor:
                       key: str | None = None, fingerprint: dict | None = None, expect_rev: int | None = None,
                       **params) -> Job:
         job = Job(self._new_job_id(), session.name, code, "", kind=kind, params=params, owner=owner or "user",
-                  key=key, expect_rev=expect_rev)
+                  key=key, expect_rev=expect_rev, session_id=session.id)
         if key is not None:
-            self.keys[(session.name, key)] = (job.id, fingerprint)
+            self.keys[(session.id, key)] = (job.id, fingerprint)
         job.output = str(session.dir / "jobs" / f"{job.id}.out")
         Path(job.output).touch()
         self.jobs[job.id] = job
@@ -712,12 +784,15 @@ class Supervisor:
         name = req["name"]
         if name in self.sessions and self.sessions[name].state != "dead":
             raise ValueError(f"session {name!r} already exists")
+        if name in self.sessions:  # replacing a dead session: its revisions are not reused
+            self.last_rev[name] = self.sessions[name].rev
         source = self._snapshot(req["from"], None) if req.get("from") else None
         if source:  # a fork keeps the snapshot's interpreter and working directory
             python, cwd = self.sessions[source.session].python, self.sessions[source.session].cwd
         else:
             python, cwd = req.get("python") or sys.executable, req.get("cwd") or os.getcwd()
         session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"), req.get("memory_limit"))
+        session.rev = self.last_rev.get(name, 0)  # revisions never repeat for a name, so a stale --expect-rev fails
         self.sessions[name] = session
         try:
             await (session.start_from(source) if source else session.start())
@@ -733,15 +808,16 @@ class Supervisor:
     async def op_kill(self, req):
         session = self._session(req["name"])
         await session.stop()
+        self.last_rev[session.name] = session.rev
         del self.sessions[req["name"]]
         return {"killed": req["name"]}
 
     def _deduplicated(self, session: Session, req: dict, fingerprint: dict) -> Job | None:
         """The job already submitted under ``req["key"]``, or None; an error if the key was used for another request."""
         key = req.get("key")
-        if key is None or (session.name, key) not in self.keys:
+        if key is None or (session.id, key) not in self.keys:
             return None
-        job_id, known = self.keys[(session.name, key)]
+        job_id, known = self.keys[(session.id, key)]
         if known != fingerprint:
             raise ValueError(f"key {key!r} was used for job {job_id} with a different request; use a new key")
         return self.jobs[job_id]
@@ -805,8 +881,11 @@ class Supervisor:
         return await self._vars(self._session(req["session"]), req.get("pattern"))
 
     async def op_show(self, req):
-        return await self._ask_idle(self._session(req["session"]), "talo_show_request",
-                                    {"name": req["name"], "rows": req.get("rows", 10)})
+        session = self._session(req["session"])
+        rev = session.rev
+        reply = await self._ask_idle(session, "talo_show_request", {"name": req["name"], "rows": req.get("rows", 10)},
+                                     timeout=120)
+        return {**reply, "rev": rev}
 
     async def op_history(self, req):
         path = self._session(req["session"]).dir / "history.jsonl"
@@ -822,20 +901,22 @@ class Supervisor:
                                  expect_rev=req.get("expect_rev"), **params)
         return {"job": await self._wait(job, timeout)}
 
-    async def _control(self, session: Session, kind: str, timeout: float, req: dict, **params) -> dict:
-        fingerprint = {"op": kind, "expect_rev": req.get("expect_rev"),
-                       **{k: (v.ref if isinstance(v, Snapshot) else v) for k, v in params.items()}}
+    async def _control(self, session: Session, kind: str, timeout: float, req: dict, fingerprint: dict | None = None,
+                       **params) -> dict:
+        fingerprint = fingerprint or {"op": kind, "expect_rev": req.get("expect_rev"), **params}
         if job := self._deduplicated(session, req, fingerprint):
-            out = {**await self._wait(job, timeout), "deduplicated": True}
-        else:
-            job = await self._submit(session, kind, owner=req.get("owner"), key=req.get("key"), fingerprint=fingerprint,
-                                     expect_rev=req.get("expect_rev"), **params)
-            out = await self._wait(job, timeout)
+            return self._control_reply({**await self._wait(job, timeout), "deduplicated": True})
+        job = await self._submit(session, kind, owner=req.get("owner"), key=req.get("key"), fingerprint=fingerprint,
+                                 expect_rev=req.get("expect_rev"), **params)
+        return self._control_reply(await self._wait(job, timeout))
+
+    def _control_reply(self, out: dict) -> dict:
+        """A finished control job's result (with the job id, epoch and deduplicated flag), or the job while pending."""
         if out["status"] == "error":
             raise RuntimeError(out["error"]["evalue"])
         if out["status"] != "ok":
             return {"job": out}
-        return out["result"]
+        return {**out["result"], "job_id": out["id"], "epoch": out["epoch"], "deduplicated": out.get("deduplicated", False)}
 
     async def op_snap(self, req):
         session = self._session(req["session"])
@@ -849,9 +930,13 @@ class Supervisor:
 
     async def op_checkout(self, req):
         session = self._session(req["session"])
+        fingerprint = {"op": "checkout", "expect_rev": req.get("expect_rev"), "name": req["name"],
+                       "discard": bool(req.get("discard")), "save_as": req.get("snap")}
+        if job := self._deduplicated(session, req, fingerprint):  # before resolving: the target may be gone by now
+            return self._control_reply({**await self._wait(job, req.get("timeout", 300)), "deduplicated": True})
         snap = self._snapshot(req["name"], session.name)
-        return await self._control(session, "checkout", req.get("timeout", 300), req, snap=snap,
-                                   discard=bool(req.get("discard")), save_as=req.get("snap"))
+        return await self._control(session, "checkout", req.get("timeout", 300), req, fingerprint=fingerprint,
+                                   snap=snap, discard=bool(req.get("discard")), save_as=req.get("snap"))
 
     async def op_reload(self, req):
         session = self._session(req["session"])
@@ -937,11 +1022,15 @@ class Supervisor:
         session = self._session(req["session"])
         n_notes, n_jobs, n_vars = int(req.get("notes", 10)), int(req.get("jobs", 8)), int(req.get("vars", 15))
         notes = self._notes(session)
-        jobs = [j for j in self.jobs.values() if j.session == session.name]
+        jobs = [j for j in self.jobs.values() if j.session_id == session.id]
         finished = [j for j in jobs if j.status not in ("queued", "running")]
+        active = [j for j in jobs if j.status in ("queued", "running")]
 
         def job_line(j: Job) -> dict:
-            d = {k: v for k, v in j.to_dict().items() if k in ("id", "kind", "status", "elapsed_s", "owner", "rev")}
+            d = {k: v for k, v in j.to_dict().items() if k in ("id", "kind", "status", "elapsed_s", "owner", "rev",
+                                                                 "progress", "last_activity_age_s", "phase")}
+            if d.get("progress"):
+                d["progress"] = {**d["progress"], "note": str(d["progress"].get("note", ""))[:80]}
             d["code_preview"] = j.code[:120]
             if j.error:
                 d["error"] = f"{j.error.get('ename')}: {str(j.error.get('evalue'))[:200]}"
@@ -961,16 +1050,31 @@ class Supervisor:
 
         def cut(note: dict) -> dict:
             return {**note, "text": note["text"][:NOTE_PREVIEW]} if len(note["text"]) > NOTE_PREVIEW else note
-        return {
-            "session": session.to_dict(),
-            "private_bytes": private_dirty(session.worker_pid),
-            "notes": {"last": [cut(n) for n in notes[-n_notes:]], "total": len(notes), "more": "talo notes"},
-            "snapshots": [{k: s.to_dict()[k] for k in ("name", "ref", "parent", "message", "owner", "private_bytes")}
-                          for s in session.snapshots.values()],
-            "variables": variables,
-            "recent_jobs": {"last": [job_line(j) for j in finished[-n_jobs:]], "total": len(finished)},
-            "active_jobs": [job_line(j) for j in jobs if j.status in ("queued", "running")],
-        }
+
+        info = session.to_dict()
+        since = info.pop("jobs_since_base")
+        info["jobs_since_base"] = {"count": len(since), "last": since[-10:]}
+        snaps = list(session.snapshots.values())
+        n_snaps = 10
+        while True:  # the whole reply is bounded: shrink the lists until it fits
+            out = {
+                "session": info,
+                "private_bytes": private_dirty(session.worker_pid),
+                "notes": {"last": [cut(n) for n in notes[-n_notes:]] if n_notes else [], "total": len(notes),
+                          "more": "talo notes"},
+                "snapshots": {"last": [{"name": s.name, "ref": s.ref, "parent": s.parent, "message": s.message[:120],
+                                        "owner": s.owner, "private_bytes": private_dirty(s.pid)}
+                                       for s in (snaps[-n_snaps:] if n_snaps else [])],
+                              "total": len(snaps), "more": "talo snaps"},
+                "variables": {**variables, "largest": variables["largest"][:n_vars]} if "largest" in variables else variables,
+                "recent_jobs": {"last": [job_line(j) for j in finished[-n_jobs:]] if n_jobs else [],
+                                "total": len(finished), "more": "talo jobs"},
+                "active_jobs": [job_line(j) for j in active[:5]],
+                "active_total": len(active),
+            }
+            if len(json.dumps(out, default=str)) <= BRIEF_MAX_BYTES or not (n_notes or n_jobs or n_vars or n_snaps):
+                return out
+            n_notes, n_jobs, n_vars, n_snaps = n_notes // 2, n_jobs // 2, n_vars // 2, n_snaps // 2
 
     async def op_resources(self, req):
         sessions = []

@@ -409,7 +409,7 @@ def cmd_notes(args):
 def cmd_brief(args):
     def human(d):
         s = d["session"]
-        since = len(s["jobs_since_base"])
+        since = s["jobs_since_base"]["count"]
         print(f"session {s['name']}  {s['state']}  rev {s['rev']}  base {s['base'] or '(session start)'}  "
               f"{since} job{'s' if since != 1 else ''} since  memory {human_bytes(s['rss'])} "
               f"(private {human_bytes(d['private_bytes'])})")
@@ -421,9 +421,11 @@ def cmd_brief(args):
             print(f"notes{more}")
             for n in notes["last"]:
                 print(f"  {note_line(n)[:300]}")
-        if d["snapshots"]:
-            print("snapshots  " + "  ·  ".join(
-                f"{x['name']} ({x['ref']})" + (f" \"{x['message'][:60]}\"" if x["message"] else "") for x in d["snapshots"]))
+        snaps = d["snapshots"]
+        if snaps["last"]:
+            more = f" (last {len(snaps['last'])} of {snaps['total']})" if snaps["total"] > len(snaps["last"]) else ""
+            print(f"snapshots{more}  " + "  ·  ".join(
+                f"{x['name']} ({x['ref']})" + (f" \"{x['message'][:60]}\"" if x["message"] else "") for x in snaps["last"]))
         v = d["variables"]
         if "largest" in v:
             items = [f"{x['name']} {x['type']}" + (f" {tuple(x['shape'])}" if "shape" in x else "")
@@ -445,7 +447,14 @@ def cmd_brief(args):
             for j in recent["last"]:
                 print(f"  {line(j)}")
         for j in d["active_jobs"]:
-            print(f"active  {line(j)}")
+            live = ""
+            if (p := j.get("progress")) is not None:
+                live += f", progress {p['done']}" + (f"/{p['total']}" if p.get("total") else "")
+            if j.get("last_activity_age_s") is not None:
+                live += f", active {j['last_activity_age_s']:.0f}s ago"
+            print(f"active  {line(j)}{live}")
+        if d["active_total"] > len(d["active_jobs"]):
+            print(f"  ... {d['active_total'] - len(d['active_jobs'])} more (`talo jobs`)")
     emit(args, call("brief", session=session_name(args), notes=args.notes, jobs=args.jobs), human)
 
 

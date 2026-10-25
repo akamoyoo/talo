@@ -50,6 +50,7 @@ RESULT_FILE_MIN = 10_000  # results longer than this are also saved in full next
 RESULT_LIMIT = 100_000  # characters of a result's text/plain kept; longer results are truncated and flagged
 TRACEBACK_LIMIT = 50_000
 CELL_FILENAME = "<talo-{n}>"
+SHOW_TIMEOUT = 60.0  # seconds an inspection may take before its fork is killed
 OUT_KEEP = 3  # results kept in Out (as IPython's _, __, ___); `_` is the last one
 
 
@@ -461,18 +462,27 @@ def _excluded(path: str) -> bool:
 
 
 class Reloader:
-    """Remembers the source hash of each module when it is first seen (after the job that imported it), so that
-    ``reload --changed`` can tell which modules changed on disk since they were loaded."""
+    """Remembers the source hash of each module when it is first seen, right after the job that imported it, so that
+    ``reload --changed`` can tell which modules changed on disk since they were loaded. If the file was modified
+    after that job started, the hash may not describe the code in memory: the module is marked uncertain and
+    ``--changed`` selects it."""
 
     def __init__(self):
         self.hashes: dict[str, str] = {}
+        self.uncertain: set[str] = set()
+        self.old_defs: dict[int, tuple] = {}  # id -> (module, attribute, object) of every replaced definition
 
-    def record(self) -> None:
+    def record(self, job_started: float | None = None) -> None:
         for name, module in list(sys.modules.items()):
             path = getattr(module, "__file__", None)
             if name not in self.hashes and path and path.endswith(".py"):
                 if (h := _source_hash(path)) is not None:
                     self.hashes[name] = h
+                    try:
+                        if job_started is not None and os.stat(path).st_mtime >= job_started - 1:
+                            self.uncertain.add(name)
+                    except OSError:
+                        pass
 
     def changed(self, root: str) -> list[str]:
         root = os.path.realpath(root)
@@ -483,7 +493,7 @@ class Reloader:
                 continue
             if not os.path.realpath(path).startswith(root + os.sep):
                 continue
-            if name in self.hashes and _source_hash(path) != self.hashes[name]:
+            if name in self.hashes and (name in self.uncertain or _source_hash(path) != self.hashes[name]):
                 out.append(name)
         return out
 
@@ -514,33 +524,31 @@ class Reloader:
                 report.append({"module": name, "status": "failed", "old_hash": old_hash, "new_hash": new_hash,
                                "error": f"{type(error).__name__}: {error}"})
                 continue
+            uncertain = name in self.uncertain
             self.hashes[name] = new_hash
-            report.append({"module": name, "status": "reloaded" if old_hash != new_hash else "unchanged",
+            self.uncertain.discard(name)
+            report.append({"module": name, "status": "reloaded" if old_hash != new_hash or uncertain else "unchanged",
                            "old_hash": old_hash, "new_hash": new_hash})
-        return {"modules": report, "stale_bindings": self.stale(namespace, previous),
-                "scan_scope": "direct_namespace"}
+            current = vars(module)
+            for attr, obj in previous[name].items():  # remember replaced definitions of every version
+                if (isinstance(obj, type) or callable(obj) and hasattr(obj, "__code__")) \
+                        and current.get(attr) is not obj and getattr(obj, "__module__", None) == name:
+                    self.old_defs[id(obj)] = (name, attr, obj)  # the reference keeps the id from being reused
+        return {"modules": report, "stale_bindings": self.stale(namespace), "scan_scope": "direct_namespace"}
 
-    @staticmethod
-    def stale(namespace: dict, previous: dict) -> list:
-        """Names bound directly to a function or class of a module's previous version, or to an instance of such a
-        class."""
-        old_defs = {}  # id(object) -> (module, attribute)
-        for module_name, attrs in previous.items():
-            current = vars(sys.modules[module_name])
-            for attr, obj in attrs.items():
-                if (isinstance(obj, type) or callable(obj) and hasattr(obj, "__code__")) and current.get(attr) is not obj \
-                        and getattr(obj, "__module__", None) == module_name:
-                    old_defs[id(obj)] = (module_name, attr)
+    def stale(self, namespace: dict) -> list:
+        """Names bound directly to a function or class of any earlier version of a reloaded module, or to an
+        instance of such a class."""
         out = []
         for name, value in list(namespace.items()):
             if name.startswith("_"):
                 continue
-            if id(value) in old_defs:
-                module_name, attr = old_defs[id(value)]
+            if id(value) in self.old_defs and self.old_defs[id(value)][2] is value:
+                module_name, attr, _ = self.old_defs[id(value)]
                 out.append({"name": name, "kind": "definition", "module": module_name, "attribute": attr,
                             "rebind": f"from {module_name} import {attr}" + (f" as {name}" if name != attr else "")})
-            elif id(type(value)) in old_defs:
-                module_name, attr = old_defs[id(type(value))]
+            elif id(type(value)) in self.old_defs and self.old_defs[id(type(value))][2] is type(value):
+                module_name, attr, _ = self.old_defs[id(type(value))]
                 out.append({"name": name, "kind": "instance", "module": module_name, "attribute": attr,
                             "rebind": f"recreate {name}: it is an instance of the old {module_name}.{attr}"})
         return out
@@ -670,6 +678,7 @@ class Worker:
             os.dup2(fd, 2)
             os.close(fd)
         rss_before, started = rss_bytes(), time.time()
+        self.reloader.record()  # modules imported by earlier messages (not by this job)
         reply = {"status": "ok", "execution_count": n, "user_expressions": {}, "payload": []}
         result = None
         try:
@@ -703,7 +712,7 @@ class Worker:
                 os.dup2(saved[1], 2)
                 os.close(saved[0])
                 os.close(saved[1])
-        self.reloader.record()
+        self.reloader.record(started)
         if reply["status"] == "error":
             self.send("error", {k: reply[k] for k in ("ename", "evalue", "traceback")}, msg)
         elif result is not None:
@@ -748,6 +757,49 @@ class Worker:
         conn = Snapshot(self, listener, path).serve()
         self.sock, self.rfile, self.wfile = conn, conn.makefile("rb"), conn.makefile("wb")
 
+    def show(self, content: dict) -> dict:
+        name, rows = content["name"], int(content.get("rows", 10))
+        try:
+            value = eval(compile(inspection_expr(name), "<talo-show>", "eval"), self.namespace)
+            return {"status": "ok", "summary": describe(name, value), "text": show(value, rows)}
+        except Exception as error:  # noqa: BLE001
+            return {"status": "error", "ename": type(error).__name__, "evalue": str(error)}
+
+    def in_fork(self, fn, timeout: float = SHOW_TIMEOUT) -> dict:
+        """Run ``fn()`` in a disposable fork and return its result: properties, ``__getitem__`` or ``__repr__`` that
+        change state while inspecting change only the copy."""
+        r, w = os.pipe()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # see "Fork safety" in docs/design.md
+            pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            try:
+                data = json.dumps(fn(), default=str).encode()
+            except BaseException as error:  # noqa: BLE001
+                data = json.dumps({"status": "error", "ename": type(error).__name__, "evalue": str(error)}).encode()
+            with os.fdopen(w, "wb") as f:
+                f.write(data)
+            os._exit(0)
+        os.close(w)
+        chunks, deadline = [], time.monotonic() + timeout
+        with os.fdopen(r, "rb") as f:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0 or not select.select([f], [], [], left)[0]:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+                    return {"status": "error", "ename": "Timeout", "evalue": f"inspection took over {timeout:.0f}s"}
+                chunk = os.read(f.fileno(), 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        os.waitpid(pid, 0)
+        try:
+            return json.loads(b"".join(chunks))
+        except ValueError:
+            return {"status": "error", "ename": "InspectionFailed", "evalue": "the inspection process died"}
+
     def handle(self, msg: dict) -> bool:
         """Handle one message; return False to exit."""
         kind = wire.msg_type(msg)
@@ -785,14 +837,7 @@ class Worker:
             self.send("talo_fingerprint_reply", {"status": "ok", "fingerprints": fingerprints(
                 self.namespace, msg["content"].get("names", []))}, msg)
         elif kind == "talo_show_request":
-            name, rows = msg["content"]["name"], int(msg["content"].get("rows", 10))
-            try:
-                value = eval(compile(inspection_expr(name), "<talo-show>", "eval"), self.namespace)
-                self.send("talo_show_reply", {"status": "ok", "summary": describe(name, value),
-                                              "text": show(value, rows)}, msg)
-            except Exception as error:  # noqa: BLE001
-                self.send("talo_show_reply", {"status": "error", "ename": type(error).__name__,
-                                              "evalue": str(error)}, msg)
+            self.send("talo_show_reply", self.in_fork(lambda: self.show(msg["content"])), msg)
         elif kind == "shutdown_request":
             self.send("shutdown_reply", {"status": "ok", "restart": False}, msg)
             return False

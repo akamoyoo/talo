@@ -72,7 +72,7 @@ def test_brief_and_notes(talo):
     rc, d = run_json(talo, "brief")
     assert rc == 0 and d["notes"]["last"][0]["text"] == "goal: test the brief"
     assert d["variables"]["largest"][0]["name"] == "big"
-    assert d["snapshots"][0]["message"] == "data loaded"
+    assert d["snapshots"]["last"][0]["message"] == "data loaded"
     assert d["recent_jobs"]["last"][-1]["error"].startswith("NameError")
     text = talo("brief").stdout
     assert "rev " in text and "goal: test the brief" in text and "NameError" in text
@@ -164,15 +164,19 @@ def test_memory_limit_kills_a_job_that_ignores_the_interrupt_and_atomic_restores
 
 
 def test_reload_changed_modules_and_report_stale_bindings(talo, tmp_path):
+    import os
+    import time
     (tmp_path / "factors.py").write_text("def f():\n    return 1\n\nclass Model:\n    pass\n")
+    os.utime(tmp_path / "factors.py", (time.time() - 60, time.time() - 60))  # written well before it is imported
+    (tmp_path / "fresh.py").write_text("x = 1\n")                          # written just now: baseline uncertain
     (tmp_path / ".venv").mkdir()
     talo("new", "r", "--cwd", str(tmp_path))
-    talo("run", "-s", "r", "import factors\nfrom factors import f\nm = factors.Model()")
+    talo("run", "-s", "r", "import factors, fresh\nfrom factors import f\nm = factors.Model()\nf1 = f")
     rc, d = run_json(talo, "reload", "-s", "r", "--changed", "--dry-run")
-    assert rc == 0 and d["selected"] == []
+    assert rc == 0 and d["selected"] == ["fresh"]
     (tmp_path / "factors.py").write_text("def f():\n    return 2\n\nclass Model:\n    pass\n")
     rc, d = run_json(talo, "reload", "-s", "r", "--changed", "--dry-run")
-    assert d["selected"] == ["factors"]
+    assert d["selected"] == ["factors", "fresh"]
     rc, d = run_json(talo, "brief", "-s", "r")
     rev = d["session"]["rev"]
     rc, d = run_json(talo, "reload", "-s", "r", "--changed")
@@ -183,7 +187,70 @@ def test_reload_changed_modules_and_report_stale_bindings(talo, tmp_path):
     assert stale["m"]["kind"] == "instance"
     rc, out = run_json(talo, "run", "-s", "r", "factors.f(), f()")
     assert out["job"]["result"]["data"]["text/plain"] == "(2, 1)"
+    # a third version: names bound to the first version are still reported
+    (tmp_path / "factors.py").write_text("def f():\n    return 3\n\nclass Model:\n    pass\n\n\n")
+    rc, d = run_json(talo, "reload", "-s", "r", "factors")
+    assert {"f", "f1", "m"} <= {s["name"] for s in d["job"]["result"]["stale_bindings"]}
+    # the reload is part of the lineage: checkout refuses to drop it silently, export mentions it
+    talo("snap", "-s", "r", "after")
+    (tmp_path / "factors.py").write_text("def f():\n    return 4\n")
+    talo("reload", "-s", "r", "factors")
+    rc, out = run_json(talo, "checkout", "-s", "r", "after")
+    assert rc == 2 and "--discard" in out["error"]["message"]
+    assert "# --- reload factors reloaded" in talo("export", "-s", "r").stdout
     (tmp_path / "factors.py").write_text("def f(:\n")
     rc, d = run_json(talo, "reload", "-s", "r", "factors")
     assert rc == 1 and d["job"]["result"]["modules"][0]["status"] == "failed"
-    assert run_json(talo, "run", "-s", "r", "factors.f()")[1]["job"]["result"]["data"]["text/plain"] == "2"
+    assert run_json(talo, "run", "-s", "r", "factors.f()")[1]["job"]["result"]["data"]["text/plain"] == "4"
+
+
+def test_show_runs_in_a_disposable_fork(talo):
+    talo("run", "class Sneaky:\n    @property\n    def x(self):\n        globals()['touched'] = True\n        return 1\n"
+                "s = Sneaky()")
+    rc, out = run_json(talo, "show", "s.x")
+    assert out["status"] == "ok" and "rev" in out
+    rc, out = run_json(talo, "run", "'touched' in globals()")
+    assert out["job"]["result"]["data"]["text/plain"] == "False"
+
+
+def test_brief_is_bounded(talo):
+    long = "x" * 3000
+    talo("run", "y = 1", "-n", "1")
+    for i in range(30):
+        talo("note", f"{i} {long}")
+    rc, d = run_json(talo, "brief", "--notes", "30")
+    assert rc == 0 and len(json.dumps(d)) <= 16_000 and d["notes"]["total"] == 30
+    assert all(len(n["text"]) <= 500 for n in d["notes"]["last"])
+
+
+def test_keys_and_revisions_do_not_cross_session_incarnations(talo):
+    talo("new", "w")
+    rc, a = run_json(talo, "run", "-s", "w", "--key", "k", "x = 1")
+    rev = run_json(talo, "brief", "-s", "w")[1]["session"]["rev"]
+    talo("kill", "w")
+    talo("new", "w")
+    rc, b = run_json(talo, "run", "-s", "w", "--key", "k", "x = 1")
+    assert not b["job"].get("deduplicated") and b["job"]["id"] != a["job"]["id"]
+    rc, out = run_json(talo, "run", "-s", "w", "--expect-rev", str(rev), "x = 2")
+    assert out["job"]["error"]["ename"] == "StaleRevision"  # revisions continue across the recreation
+
+
+def test_checkout_retry_after_its_target_was_dropped(talo):
+    talo("run", "x = 1")
+    talo("snap", "a")
+    rc, first = run_json(talo, "checkout", "a", "--key", "co")
+    talo("drop", "a")
+    rc, again = run_json(talo, "checkout", "a", "--key", "co")
+    assert rc == 0 and again["deduplicated"] and again["job_id"] == first["job_id"]
+
+
+def test_memory_limit_wins_over_a_caught_interrupt(talo):
+    talo("new", "lim", "--memory-limit", "300M")
+    talo("run", "-s", "lim", "x = 1")
+    swallow = "x = 2\ntry:\n" + "\n".join("    " + line for line in GROW.splitlines()) + \
+              "\nexcept KeyboardInterrupt:\n    blocks = None"
+    rc, out = run_json(talo, "run", "-s", "lim", "--atomic", swallow, "-t", "60")
+    job = out["job"]
+    assert job["status"] == "interrupted" and job["termination"] == "memory_limit"
+    assert job["atomic"]["outcome"] == "restored"
+    assert run_json(talo, "run", "-s", "lim", "x")[1]["job"]["result"]["data"]["text/plain"] == "1"

@@ -259,12 +259,14 @@ running      #43 running 12m, progress 61% (412/672 days), last output 3s ago
   `--expect-rev N` and are refused when they reach the front of the queue if the revision is no longer `N`; the
   error says the current revision and the jobs in between. Inspection (`vars`, `show`, `brief`) reports the revision
   it observed. `show` only evaluates names, attributes and constant subscripts (`df`, `df.x`, `d["k"]`); anything else
-  must go through `run`, so that it is recorded and counted. The guarantee covers operations made through Talo:
+  must go through `run`, so that it is recorded and counted. `show` runs in a disposable fork of the worker, so a
+  property or `__getitem__` that changes state changes only the copy. The guarantee covers operations made through Talo:
   background threads or writes to shared files can still change the state without a revision.
 - **Idempotency key.** `run --key K` returns the job already submitted under `K` in this session — whatever its
   outcome, even if it failed or was refused — with `deduplicated: true`. The key identifies the whole request (code
   and options that affect execution, such as `--atomic` and `--expect-rev`, but not `-t`): reusing it for a different
-  request is an error, so a new attempt needs a new key. Keys are looked up before anything else (a retry after the
+  request is an error, so a new attempt needs a new key. Keys belong to one incarnation of a session (a session recreated under the same name has a new id, and its
+  revisions continue from the old one's). Keys are looked up before anything else (a retry after the
   worker died still returns the original job) and are kept for the lifetime of the supervisor; the reply carries the
   supervisor's `epoch`, so a retry can detect that the supervisor restarted in between. `snap` and `checkout` accept
   `--key` as well.
