@@ -65,8 +65,10 @@ def show_job(args, job: dict) -> None:
         print("\n".join(job["error"].get("traceback") or [f"{job['error'].get('ename')}: {job['error'].get('evalue')}"]))
     for o in job.get("outputs") or []:
         print(f"[{o['mime']}: {o['path']}]")
-    if job.get("result"):
+    if job.get("result") and "data" in job["result"]:
         print(job["result"]["data"].get("text/plain", ""))
+    elif job.get("result"):  # a finished snap / checkout
+        print(json.dumps(job["result"], ensure_ascii=False, default=str)[:2000])
     sys.stdout.flush()  # output first, the status line (stderr) last
     print(status_line(job), file=sys.stderr)
 
@@ -105,6 +107,9 @@ def parse_size(text: str | None) -> int | None:
 
 
 def cmd_new(args):
+    if args.from_ and (args.python or args.cwd):
+        raise TaloError("BadArgument", "a session started --from a snapshot inherits its interpreter and working "
+                                       "directory; --python / --cwd cannot change them")
     s = call("new", name=args.name, python=args.python or (None if args.from_ else sys.executable),
              cwd=os.path.abspath(args.cwd or os.getcwd()), memory_budget=parse_size(args.memory_budget),
              **({"from": args.from_} if args.from_ else {}))
@@ -130,6 +135,8 @@ def cmd_kill(args):
 
 def ensure_session(name: str, python: str | None = None) -> None:
     sessions = {s["name"]: s for s in call("ls")["sessions"]}
+    if name not in sessions and name != DEFAULT_SESSION:  # a typo must not silently create a new empty session
+        raise TaloError("NoSession", f"no session {name!r}; `talo new {name}` creates it (`talo ls` lists sessions)")
     if name not in sessions:
         s = call("new", name=name, python=python or sys.executable, cwd=os.getcwd())
         print(f"(new session {name}: pid {s['pid']}, {s['python']})", file=sys.stderr)
@@ -162,6 +169,9 @@ def cmd_wait(args):
 
 
 def cmd_tail(args):
+    if args.follow and args.json:
+        raise TaloError("BadArgument", "tail -f has no --json mode; use `talo wait ID --json` or "
+                                       "`talo tail ID --json --offset N` to read output incrementally")
     if args.follow:
         offset = 0
         while True:
@@ -174,7 +184,11 @@ def cmd_tail(args):
             time.sleep(0.5)
         print(status_line(call("job", id=args.id)), file=sys.stderr)
         return
-    out = call("output", id=args.id, max_bytes=(1 << 30) if args.all else 256 << 10)
+    if args.offset is not None:  # incremental reads: pass back next_offset
+        out = call("output", id=args.id, offset=args.offset, max_bytes=256 << 10)
+        emit(args, out, lambda d: sys.stdout.write(d["text"]))
+        return
+    out = call("output", id=args.id, max_bytes=(1 << 40) if args.all else 256 << 10)
     text, cut = (out["text"], 0) if args.all else tail_lines(out["text"], args.lines)
     if args.json:
         print(json.dumps({**out, "text": text, "lines_cut": cut}, ensure_ascii=False))
@@ -186,9 +200,11 @@ def cmd_tail(args):
 
 def cmd_jobs(args):
     def human(d):
-        for j in d["jobs"][-args.last:]:
-            print(status_line(j))
-    emit(args, call("jobs", session=args.session), human)
+        for j in d["jobs"]:
+            preview = j.get("code_preview", "").strip().splitlines()
+            print(f"{status_line(j)}  {(preview[0] if preview else '')[:80]}")
+    session = None if args.all_sessions else session_name(args)
+    emit(args, call("jobs", session=session, last=args.last), human)
 
 
 def cmd_interrupt(args):
@@ -231,8 +247,19 @@ def cmd_history(args):
     emit(args, call("history", session=session_name(args), last=args.last), human)
 
 
+def pending(args, d: dict) -> int | None:
+    """Queued operations (snap, checkout) return ``{"job": ...}`` when they did not finish within the timeout."""
+    if "job" not in d:
+        return None
+    show_job(args, d["job"])
+    return exit_code(d["job"])
+
+
 def cmd_snap(args):
-    d = call("snap", session=session_name(args), name=args.name, message=args.message or "", strict=args.strict)
+    d = call("snap", session=session_name(args), name=args.name, message=args.message or "", strict=args.strict,
+             timeout=args.timeout)
+    if (code := pending(args, d)) is not None:
+        return code
     def human(x):
         threads = f"; {len(x['threads'])} other threads at fork time" if x.get("threads") else ""
         print(f"snapshot {x['name']} ({x['ref']}): pid {x['pid']}, after {len(x['jobs'])} jobs since "
@@ -256,7 +283,10 @@ def cmd_snaps(args):
 
 
 def cmd_checkout(args):
-    d = call("checkout", session=session_name(args), name=args.name, discard=args.discard, snap=args.snap)
+    d = call("checkout", session=session_name(args), name=args.name, discard=args.discard, snap=args.snap,
+             timeout=args.timeout)
+    if (code := pending(args, d)) is not None:
+        return code
     emit(args, d, lambda x: print(f"session {x['name']} now runs a fork of {x['base']} (pid {x['pid']})"))
 
 
@@ -265,6 +295,8 @@ def cmd_drop(args):
 
 
 def cmd_attach(args):
+    if args.json:
+        raise TaloError("BadArgument", "attach is interactive and has no --json mode; use run / wait / tail")
     from talo.attach import Attach
     return Attach(session_name(args)).loop()
 
@@ -277,7 +309,10 @@ def cmd_export(args):
     what = "every job" if args.all else (f"the path to snapshot {args.snap}" if args.snap else "lineage of the current state")
     text = (export.to_ipynb if to == "ipynb" else export.to_py)(d["jobs"], export.header(session, what))
     if not args.output:
-        sys.stdout.write(text)
+        if args.json:
+            print(json.dumps({"format": to, "jobs": len(d["jobs"]), "text": text}, ensure_ascii=False))
+        else:
+            sys.stdout.write(text)
         return
     with open(args.output, "w") as f:
         f.write(text)
@@ -363,9 +398,13 @@ def cmd_diff(args):
 def cmd_stop(args):
     try:
         call("shutdown", autostart=False)
-        print("supervisor stopped (all sessions closed)")
+        stopped = True
     except TaloError as error:
-        print(error)
+        if error.type != "NotRunning":
+            raise
+        stopped = False
+    emit(args, {"stopped": stopped}, lambda d: print("supervisor stopped (all sessions closed)" if d["stopped"]
+                                                     else "the supervisor is not running"))
 
 
 def cmd_daemon(args):
@@ -414,9 +453,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id")
     p.add_argument("-n", "--lines", type=int, default=LINES)
     p.add_argument("--all", action="store_true", help="the whole output")
+    p.add_argument("--offset", type=int, help="read from this byte offset (the reply's next_offset continues)")
     p.add_argument("-f", "--follow", action="store_true", help="follow the output until the job finishes")
     p = add("jobs", cmd_jobs, "list jobs")
     p.add_argument("--last", type=int, default=20)
+    p.add_argument("--all-sessions", action="store_true", help="jobs of every session")
     p = add("interrupt", cmd_interrupt, "interrupt a running job (a queued job is cancelled)", session=False)
     p.add_argument("id")
     p = add("vars", cmd_vars, "list the session's variables (name, type, shape, memory)")
@@ -430,11 +471,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", help="snapshot name (default s1, s2, ...)")
     p.add_argument("-m", "--message")
     p.add_argument("--strict", action="store_true", help="refuse when the worker has other threads (see docs)")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT, help="seconds to wait (it stays queued after)")
     add("snaps", cmd_snaps, "list the session's snapshots with their private memory")
     p = add("checkout", cmd_checkout, "replace the session's worker with a fork of a snapshot (roll back)")
     p.add_argument("name", help="[SESSION:]SNAPSHOT")
     p.add_argument("--discard", action="store_true", help="drop the state of jobs run since the current base")
     p.add_argument("--snap", metavar="NAME", help="snapshot the current state under NAME before checking out")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT, help="seconds to wait (it stays queued after)")
     p = add("drop", cmd_drop, "free a snapshot")
     p.add_argument("name")
     add("attach", cmd_attach, "an interactive prompt on the session (Ctrl-D detaches; the session keeps running)")
@@ -458,7 +501,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return args.fn(args) or 0
+        try:
+            return args.fn(args) or 0
+        except (ValueError, OSError) as error:  # bad sizes, unreadable files: before or instead of a request
+            raise TaloError("BadArgument", str(error)) from None
     except TaloError as error:
         if getattr(args, "json", False):
             print(json.dumps({"error": {"type": error.type, "message": str(error)}}, ensure_ascii=False))

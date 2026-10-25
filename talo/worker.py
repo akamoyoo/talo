@@ -48,6 +48,7 @@ wire = _load_wire()
 RESULT_LIMIT = 100_000  # characters of a result's text/plain kept; longer results are truncated and flagged
 TRACEBACK_LIMIT = 50_000
 CELL_FILENAME = "<talo-{n}>"
+OUT_KEEP = 3  # results kept in Out (as IPython's _, __, ___); `_` is the last one
 
 
 def rss_bytes() -> int:
@@ -516,7 +517,10 @@ class Worker:
                 result = value
                 if not silent:
                     self.namespace["_"] = value
-                    self.namespace["Out"][n] = value
+                    out = self.namespace["Out"]
+                    out[n] = value
+                    for k in sorted(out)[:-OUT_KEEP]:  # older results would pin large objects in memory
+                        del out[k]
             if not silent:
                 self.namespace["In"].append(code)
         except BaseException as error:  # noqa: BLE001 - report KeyboardInterrupt / SystemExit instead of exiting

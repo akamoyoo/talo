@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Agent-facing CLI contract (from a review): `snap` / `checkout` take `-t` and return the queued job with exit code 3;
+  `--json` for `stop`, `export` and errors in arguments; `jobs --last` is applied by the supervisor and shows a code
+  preview; `tail --offset` for incremental reads; named sessions are no longer created implicitly; branches report
+  the interpreter and directory they actually inherit; `Out` keeps the last three results.
+
 ### Added
 
 - `attach`: an interactive prompt on a session (multi-line blocks, tab completion via `complete_request`,

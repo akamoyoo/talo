@@ -148,7 +148,12 @@ kernel connection file so that Jupyter front ends can attach. See [protocol.md](
   the full output stays in the job's file and can be read by offset.
 - One session runs one execution at a time; further execution requests queue. Inspection requests (`vars`, `show`)
   are answered only while the session is idle, never by touching the heap of a running computation.
-- Exit codes: `0` ok, `1` the code failed, `2` Talo failed, `3` still running.
+- Exit codes: `0` ok, `1` the code failed, `2` Talo failed (with `--json`: `{"error": {"type", "message"}}`), `3`
+  still running or queued — also for queued operations (`snap`, `checkout`) that did not finish within `-t`.
+- Only the `default` session is created implicitly by `run`; any other name must exist (`talo new NAME`), so a typo
+  never silently starts an empty session. A branch (`new --from`) inherits its snapshot's interpreter and directory.
+- Results are kept in `_` and in `Out` for the last three executions only, so a large result that is no longer named
+  does not stay in memory.
 
 ## Execution history
 

@@ -518,8 +518,11 @@ class Supervisor:
         if name in self.sessions and self.sessions[name].state != "dead":
             raise ValueError(f"session {name!r} already exists")
         source = self._snapshot(req["from"], None) if req.get("from") else None
-        python = source and self.sessions[source.session].python or req.get("python") or sys.executable
-        session = Session(name, python, req.get("cwd") or os.getcwd(), req.get("env"), req.get("memory_budget"))
+        if source:  # a fork keeps the snapshot's interpreter and working directory
+            python, cwd = self.sessions[source.session].python, self.sessions[source.session].cwd
+        else:
+            python, cwd = req.get("python") or sys.executable, req.get("cwd") or os.getcwd()
+        session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"))
         self.sessions[name] = session
         try:
             await (session.start_from(source) if source else session.start())
@@ -550,8 +553,10 @@ class Supervisor:
         return await self._wait(self._job(req["id"]), req.get("wait", 0))
 
     async def op_jobs(self, req):
-        name = req.get("session")
-        return {"jobs": [j.to_dict() for j in self.jobs.values() if not name or j.session == name]}
+        name, last = req.get("session"), req.get("last")
+        jobs = [j for j in self.jobs.values() if not name or j.session == name]
+        return {"jobs": [{**j.to_dict(), "code_preview": j.code[:200]} for j in (jobs[-int(last):] if last else jobs)],
+                "total": len(jobs)}
 
     async def op_output(self, req):
         job = self._job(req["id"])

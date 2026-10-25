@@ -78,15 +78,15 @@ Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}
 | `kill` | `name` | `killed` |
 | `run` | `session`, `code`, `timeout` (seconds) | the job, possibly still `running` |
 | `job` | `id`, `wait` (seconds) | the job |
-| `jobs` | `session` (optional) | `jobs` |
+| `jobs` | `session` (optional), `last` | `jobs` (the last `last`, each with `code_preview`: the first 200 characters of its code), `total` |
 | `output` | `id`, `offset` (default: the end), `max_bytes` | `text`, `offset`, `next_offset`, `size`, `status` |
 | `interrupt` | `id` | `result`: `interrupting`, `cancelled` or the final status |
 | `vars` | `session`, `pattern` | as `talo_vars_reply` |
 | `show` | `session`, `name`, `rows` | as `talo_show_reply` |
 | `history` | `session`, `last` | `history` |
-| `snap` | `session`, `name`, `message`, `strict` | the snapshot (queued behind running jobs) |
+| `snap` | `session`, `name`, `message`, `strict`, `timeout` | the snapshot (queued behind running jobs), or `{"job": ...}` when it has not finished within `timeout` |
 | `snaps` | `session` | `snapshots`, `base`, `jobs_since_base` |
-| `checkout` | `session`, `name`, `discard`, `snap` (name to save the current state under first) | the session |
+| `checkout` | `session`, `name`, `discard`, `snap` (name to save the current state under first), `timeout` | the session, or `{"job": ...}` as for `snap` |
 | `drop` | `session`, `name` | `dropped` |
 | `complete` | `session`, `code`, `cursor_pos` | as `complete_reply` (answered only while idle) |
 | `export` | `session`, `snap` (export the path to this snapshot), `all` (every job) | `jobs`: job records in order, each with `code`, `status`, `outputs`, and markers for snapshots (`kind: "snap"`) |
