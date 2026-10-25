@@ -53,6 +53,7 @@ class Bridge:
         self.conn = connection
         self.session = session
         self.python, self.cwd = python, cwd
+        self.skip_bytes = 0  # bytes of a display's CLI text still to drop from the output stream
         self.key = connection.get("key", "").encode()
         scheme = connection.get("signature_scheme", "hmac-sha256")
         if not scheme.startswith("hmac-") or scheme[5:] not in hashlib.algorithms_available:
@@ -197,6 +198,7 @@ class Bridge:
             await self.talo("interrupt", id=job["id"])
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         offset, count_sent, buffered = 0, False, ""
+        self.skip_bytes = 0
         try:
             while True:
                 j = await self.talo("job", id=job["id"])
@@ -241,7 +243,9 @@ class Bridge:
 
     async def flush_until_mark(self, text: str, job_id: str, msg: dict, silent: bool) -> str:
         """Stream ``text`` up to each display marker, send that display (waiting for its message if needed) and
-        skip the text the worker printed for it; return what is left (a possibly incomplete marker)."""
+        skip the text the worker printed for it; return what is left (a possibly incomplete marker). That text may
+        arrive in a later read than its marker: ``skip_bytes`` carries what is still to skip."""
+        text = self.skip_text(text)
         while True:
             m = MARK.search(text)
             if m is None:
@@ -265,10 +269,18 @@ class Bridge:
                 if not silent:
                     await self.send_display(display, msg)
                 printed = (display.get("end") or 0) - (display.get("offset") or 0) - len(m.group(0).encode())
-                if printed > 0:  # the text the worker printed for the CLI: skip it (bytes → characters)
-                    skip = len(rest.encode()[:printed].decode(errors="ignore"))
-                    rest = rest[skip:]
+                self.skip_bytes = max(printed, 0)  # the text the worker printed for the CLI
+                rest = self.skip_text(rest)
             text = rest
+
+    def skip_text(self, text: str) -> str:
+        """Drop up to ``skip_bytes`` bytes from the start of ``text`` (bytes → characters)."""
+        if not self.skip_bytes or not text:
+            return text
+        raw = text.encode()
+        n = min(self.skip_bytes, len(raw))
+        self.skip_bytes -= n
+        return raw[n:].decode(errors="ignore")
 
     @staticmethod
     def file_value(mime: str, path: str) -> str | None:
