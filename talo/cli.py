@@ -824,6 +824,35 @@ def cmd_ledger(args):
     emit(args, d, human)
 
 
+def cmd_verify(args):
+    d = call("verify", session=session_name(args), cold=args.cold, **{"from": args.from_},
+             max_bytes=None if args.content else parse_size(args.max_bytes))
+
+    def human(x):
+        src = x["source"]["name"] if x.get("source") else ("a fresh interpreter" if x["mode"] == "cold" else "-")
+        print(f"{x['status'].upper()}: replayed {len(x['replayed'])} jobs from {src} ({x['mode']}) and compared with "
+              f"the current state (rev {x['target']['rev']})")
+        if x.get("failed"):
+            f = x["failed"]
+            print(f"job {f['job']} failed on replay: {f['ename']}: {f['evalue']}")
+        c = x.get("comparison")
+        if c:
+            for v in c["added"]:
+                print(f"  only in the replay: {v['name']}")
+            for v in c["removed"]:
+                print(f"  missing from the replay: {v['name']}")
+            for ch in c["changed"]:
+                print(f"  differs: {ch['name']} ({', '.join(ch['fields'])})")
+            print(f"  {c['unchanged']} variables match" + (f"; not compared: {', '.join(n['name'] for n in c['not_compared'])}"
+                                                            if c["not_compared"] else ""))
+        for h in x["hazards"]:
+            print(f"hazard: {h}")
+        for i in x["inconclusive"]:
+            print(f"inconclusive: {i}")
+    emit(args, d, human)
+    return {"match": 0}.get(d["status"], 1)
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -1126,6 +1155,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--type", help="only these event types (comma-separated), e.g. job.finished,map.finished")
     p.add_argument("--limit", type=int, default=100)
     add("resources", cmd_resources, "memory of every session's worker and snapshots, and of the machine")
+    p = add("verify", cmd_verify, "replay the lineage of the current state and check it gives the same variables")
+    p.add_argument("--cold", action="store_true", help="replay from the start in a fresh interpreter")
+    p.add_argument("--from", dest="from_", metavar="SNAPSHOT", help="hot: replay from this snapshot on the lineage")
+    p.add_argument("--max-bytes", default="256M", help="compare content only for variables up to this size")
+    p.add_argument("--content", action="store_true", help="compare the content of all variables")
     p = add("brief", cmd_brief, "what an agent needs to resume the session's work (state, notes, variables, jobs)")
     p.add_argument("--notes", type=int, default=10, help="most recent notes shown")
     p.add_argument("--jobs", type=int, default=8, help="most recent finished jobs shown")

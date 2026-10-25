@@ -1107,6 +1107,42 @@ class Session:
                 "limits": self.limits, "scope": self.scope, "max_output": self.max_output}
 
 
+async def compare_states(ask_a, ask_b, limit: int | None) -> dict:
+    """Variables added, removed and changed from state A to state B: first by summary, then, for variables up to
+    ``limit`` bytes, by content fingerprint. ``ask_x(op, **params)`` answers ``vars`` and ``fingerprint``."""
+    va, vb = await asyncio.gather(ask_a("vars"), ask_b("vars"))
+    va = {v["name"]: v for v in va["variables"]}
+    vb = {v["name"]: v for v in vb["variables"]}
+    changed, same, not_compared = [], [], []
+    for name in sorted(va.keys() & vb.keys()):
+        x, y = va[name], vb[name]
+        fields = [k for k in sorted(x.keys() | y.keys()) if k not in ("name", "nbytes", "nbytes_partial")
+                  and x.get(k) != y.get(k)]
+        if fields:
+            changed.append({"name": name, "a": x, "b": y, "fields": fields})
+        elif limit is not None and max(x.get("nbytes") or 0, y.get("nbytes") or 0) > limit:
+            not_compared.append({"name": name, "reason": "size", "nbytes": max(x.get("nbytes") or 0,
+                                                                              y.get("nbytes") or 0)})
+        else:
+            same.append(name)
+    unchanged = 0
+    if same:
+        fa, fb = await asyncio.gather(ask_a("fingerprint", names=same), ask_b("fingerprint", names=same))
+        fa, fb = fa["fingerprints"], fb["fingerprints"]
+        for name in same:
+            x, y = fa.get(name, {}), fb.get(name, {})
+            if "hash" not in x or "hash" not in y:
+                not_compared.append({"name": name, "reason": x.get("error") or y.get("error") or "missing"})
+            elif x["hash"] != y["hash"]:
+                changed.append({"name": name, "a": va[name], "b": vb[name], "fields": ["content"]})
+            else:
+                unchanged += 1
+    return {"added": [vb[n] for n in sorted(vb.keys() - va.keys())],
+            "removed": [va[n] for n in sorted(va.keys() - vb.keys())],
+            "changed": sorted(changed, key=lambda c: c["name"]), "unchanged": unchanged,
+            "not_compared": not_compared, "max_bytes": limit}
+
+
 class Supervisor:
     def __init__(self):
         self.sessions: dict[str, Session] = {}
@@ -2303,43 +2339,92 @@ class Supervisor:
             raise RuntimeError(f"snapshot {state.ref}: {reply.get('error')}")
         return reply
 
+    # ---------------------------------------------------------------- verify
+
+    async def op_verify(self, req):
+        """Replay the lineage of the current state and compare (see "talo verify" in docs/design.md)."""
+        session = self._session(req["session"])
+        cold, limit = bool(req.get("cold")), req.get("max_bytes", DIFF_MAX_BYTES)
+        job = await self._submit(session, "fork", owner=req.get("owner"))  # the target, after running jobs
+        await job.done.wait()
+        if job.status != "ok":
+            raise RuntimeError(f"could not snapshot the current state: {(job.error or {}).get('evalue')}")
+        target = job.handle
+        target.pins.add(f"verify {job.id}")
+        session.internal_snaps.append(target)
+        out_dir = session.dir / "verify" / job.id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report = {"mode": "cold" if cold else "hot", "target": {"rev": session.rev, "base": target.parent,
+                                                                "jobs_since_base": list(target.jobs)},
+                  "source": None, "replayed": [], "hazards": [], "inconclusive": []}
+        channel = None
+        try:
+            try:
+                lineage = self._lineage(self._records(), target.parent, list(target.jobs))
+            except KeyError as error:
+                report.update(status="inconclusive", inconclusive=[f"incomplete lineage: {error.args[0]}"])
+                return report
+            alive = {s.ref: s for x in self.sessions.values() for s in x.snapshots.values()}
+            start = 0
+            if not cold:
+                marks = [i for i, r in enumerate(lineage) if r["kind"] == "snap" and r["result"]["ref"] in alive]
+                if req.get("from"):
+                    ref = self._snapshot(req["from"], session.name).ref
+                    marks = [i for i in marks if lineage[i]["result"]["ref"] == ref]
+                    if not marks:
+                        raise RuntimeError(f"{req['from']} is not on the lineage of the current state")
+                if not marks:
+                    report.update(status="inconclusive",
+                                  inconclusive=["no snapshot of the lineage is kept; `talo verify --cold` replays from the start"])
+                    return report
+                start = marks[0] + 1
+                source = alive[lineage[marks[0]]["result"]["ref"]]
+                report["source"] = {"snapshot": source.ref, "name": source.name}
+                channel = await ephemeral.Channel.from_snapshot(source.socket)
+            else:
+                env = {"MPLBACKEND": "Agg", **os.environ, **session.env, "PYTHONUNBUFFERED": "1"}
+                channel = await ephemeral.Channel.fresh(session.python, str(WORKER), session.cwd, env)
+            for rec in lineage[start:]:
+                if rec["kind"] == "reload":
+                    report["inconclusive"].append(f"job {rec['id']} reloaded modules; their sources may have changed")
+                    continue
+                if rec["kind"] != "execute":
+                    continue
+                if rec["status"] != "ok":
+                    report["hazards"].append(f"job {rec['id']} failed ({rec['status']}) and may have changed the "
+                                             "state partly; it is replayed too")
+                got = await channel.execute(rec["code"], str(out_dir / f"{rec['id']}.out"))
+                report["replayed"].append({"job": rec["id"], "original": rec["status"], "replay": got["status"]})
+                if rec["status"] == "ok" and got["status"] != "ok":
+                    error = got["error"] or {}
+                    report.update(status="replay_failed", failed={"job": rec["id"], "ename": error.get("ename"),
+                                                                    "evalue": str(error.get("evalue"))[:500]})
+                    return report
+
+            async def ask_replay(op, **params):
+                reply, _ = await channel.request(f"talo_{op}_request", params, timeout=3600)
+                return reply["content"]
+            diff = await compare_states(ask_replay, lambda op, **kw: self._ask_state(target, op, **kw), limit)
+            report["comparison"] = diff
+            differs = diff["added"] or diff["removed"] or diff["changed"]
+            report["status"] = ("mismatch" if differs else "inconclusive" if report["inconclusive"] or
+                                diff["not_compared"] else "match")
+            return report
+        finally:
+            if channel is not None:
+                await channel.close()
+            target.pins.discard(f"verify {job.id}")
+            if target in session.internal_snaps:
+                session.internal_snaps.remove(target)
+            session._release(target)
+
     async def op_diff(self, req):
         session = req.get("session") or "default"
         (ref_a, a), (ref_b, b) = self._state(req["a"], session), self._state(req.get("b") or "@", session)
         limit = req.get("max_bytes", DIFF_MAX_BYTES)
-        va, vb = await asyncio.gather(self._ask_state(a, "vars"), self._ask_state(b, "vars"))
-        va = {v["name"]: v for v in va["variables"]}
-        vb = {v["name"]: v for v in vb["variables"]}
-        changed, same, not_compared = [], [], []
-        for name in sorted(va.keys() & vb.keys()):
-            x, y = va[name], vb[name]
-            fields = [k for k in sorted(x.keys() | y.keys()) if k not in ("name", "nbytes", "nbytes_partial")
-                      and x.get(k) != y.get(k)]
-            if fields:
-                changed.append({"name": name, "a": x, "b": y, "fields": fields})
-            elif limit is not None and max(x.get("nbytes") or 0, y.get("nbytes") or 0) > limit:
-                not_compared.append({"name": name, "reason": "size", "nbytes": max(x.get("nbytes") or 0,
-                                                                                  y.get("nbytes") or 0)})
-            else:
-                same.append(name)
-        if same:
-            fa, fb = await asyncio.gather(self._ask_state(a, "fingerprint", names=same),
-                                          self._ask_state(b, "fingerprint", names=same))
-            fa, fb, unchanged = fa["fingerprints"], fb["fingerprints"], 0
-            for name in same:
-                x, y = fa.get(name, {}), fb.get(name, {})
-                if "hash" not in x or "hash" not in y:
-                    not_compared.append({"name": name, "reason": x.get("error") or y.get("error") or "missing"})
-                elif x["hash"] != y["hash"]:
-                    changed.append({"name": name, "a": va[name], "b": vb[name], "fields": ["content"]})
-                else:
-                    unchanged += 1
-        else:
-            unchanged = 0
-        return {"a": ref_a, "b": ref_b, "added": [vb[n] for n in sorted(vb.keys() - va.keys())],
-                "removed": [va[n] for n in sorted(va.keys() - vb.keys())],
-                "changed": sorted(changed, key=lambda c: c["name"]), "unchanged": unchanged,
-                "not_compared": not_compared, "max_bytes": limit}
+        out = await compare_states(lambda op, **kw: self._ask_state(a, op, **kw),
+                                   lambda op, **kw: self._ask_state(b, op, **kw), limit)
+        return {"a": ref_a, "b": ref_b, **out}
 
     async def op_shutdown(self, req):
         self.stopping.set()
