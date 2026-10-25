@@ -1,5 +1,5 @@
 [project]
-name = "talo"
+name = "pytalo"
 dynamic = ["version"]
 description = "A resident in-memory Python session you drive from the terminal: load data once, snapshot, roll back, branch. Built for coding agents and humans."
 readme = "README.md"

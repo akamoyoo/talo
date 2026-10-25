@@ -3,7 +3,7 @@ docs/design.md).
 
 Jupyter starts this process with a connection file. It speaks the Jupyter messaging protocol over ZMQ to the front
 end and Talo's control requests to the supervisor; the session, with its data, keeps running when the front end
-restarts or shuts the kernel down. Needs ``pyzmq`` (``pip install talo[jupyter]``).
+restarts or shuts the kernel down. Needs ``pyzmq`` (``pip install 'pytalo[jupyter]'``).
 """
 
 from __future__ import annotations
@@ -509,7 +509,7 @@ def main(connection_file: str, session: str, python: str | None = None) -> int:
     try:
         import zmq  # noqa: F401
     except ImportError:
-        print("talo kernel needs pyzmq: pip install 'talo[jupyter]'", file=sys.stderr)
+        print("talo kernel needs pyzmq: pip install 'pytalo[jupyter]'", file=sys.stderr)
         return 2
     connection = json.loads(Path(connection_file).read_text())
     asyncio.run(Bridge(connection, session, python, os.getcwd()).run())

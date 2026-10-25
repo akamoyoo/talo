@@ -90,11 +90,11 @@ and it only consumes extra memory for the pages that change afterwards
 
 ## Install
 
-Talo needs Python ≥ 3.10 on Linux and has no runtime dependencies (`pip install "talo[jupyter]"` adds what the
-Jupyter kernel bridge needs).
+Talo needs Python ≥ 3.10 on Linux and has no runtime dependencies (`pip install "pytalo[jupyter]"` adds what the
+Jupyter kernel bridge needs). The package is `pytalo` on PyPI; the command and the module are `talo`.
 
 ```console
-$ pip install talo
+$ pip install pytalo
 $ talo --version
 ```
 

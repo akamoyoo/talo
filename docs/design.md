@@ -508,7 +508,7 @@ $ jupyter lab                              # open any .ipynb, pick the kernel "T
   `talo kernel --session SESSION -f {connection_file}`. Jupyter starts that process as "the kernel"; it is a bridge:
   it speaks the Jupyter messaging protocol (5.3) over ZMQ to the front end (shell, iopub, stdin and control channels,
   messages signed and verified as the connection file says, and the raw heartbeat echo) and Talo's control requests to the supervisor. The session
-  itself, with its data, runs as always; the bridge holds nothing. It needs `pyzmq` (`pip install talo[jupyter]`);
+  itself, with its data, runs as always; the bridge holds nothing. It needs `pyzmq` (`pip install "pytalo[jupyter]"`);
   the worker stays standard-library only.
 - Standard `.py` and `.ipynb` files: notebooks, VS Code's `# %%` cells in `.py` files and its Interactive Window all
   work through the same kernelspec. Several front ends can attach to one session, and agents keep using the CLI.
