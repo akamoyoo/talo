@@ -293,3 +293,13 @@ def test_hard_limits_through_a_systemd_scope(talo):
     assert "memory limit of its scope" in death
     rc, out = run_json(talo, "new", "nocpu", "--limit", "cpu=2")
     assert rc == 2 or out.get("scope")                 # refused where the cpu controller is not delegated
+
+
+def test_killing_a_job_tree_spares_the_snapshots(talo):
+    talo("run", "import time\nx = 1")
+    talo("snap", "keep")
+    rc, out = run_json(talo, "run", "x = 2\nwhile True:\n    try:\n        time.sleep(60)\n    except KeyboardInterrupt:\n        pass",
+                       "--deadline", "1", "-t", "30")
+    assert out["job"]["status"] == "lost"
+    rc, out = run_json(talo, "checkout", "keep")             # the snapshot (a child of the worker) survived
+    assert rc == 0 and run_json(talo, "show", "x")[1]["text"] == "1"

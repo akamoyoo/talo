@@ -99,8 +99,9 @@ def case_seed(map_id: str, index: int) -> int:
     return int.from_bytes(hashlib.blake2b(f"{map_id}:{index}".encode(), digest_size=4).digest(), "little")
 
 
-def descendants(pid: int) -> list[int]:
-    """Processes started (directly or not) by ``pid``, from /proc."""
+def descendants(pid: int, keep: set | frozenset = frozenset()) -> list[int]:
+    """Processes started (directly or not) by ``pid``, from /proc, leaving out the processes in ``keep`` and
+    everything below them."""
     children: dict[int, list[int]] = {}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -114,14 +115,17 @@ def descendants(pid: int) -> list[int]:
     out, todo = [], [pid]
     while todo:
         for child in children.get(todo.pop(), []):
+            if child in keep:
+                continue
             out.append(child)
             todo.append(child)
     return out
 
 
-def kill_tree(pid: int, sig: int = signal.SIGKILL) -> None:
-    """Signal a process and everything it started (children first, so none is re-parented and missed)."""
-    for p in [*reversed(descendants(pid)), pid]:
+def kill_tree(pid: int, keep: set | frozenset = frozenset(), sig: int = signal.SIGKILL) -> None:
+    """Signal a process and everything it started (children first, so none is re-parented and missed), except the
+    processes in ``keep`` and their subtrees: snapshots are forked by the worker, so they are its children too."""
+    for p in [*reversed(descendants(pid, keep)), pid]:
         try:
             os.kill(p, sig)
         except (ProcessLookupError, PermissionError):
@@ -747,7 +751,7 @@ class Session:
             await asyncio.sleep(GUARD_GRACE)
             if job.phase == "executing" and job.exec_pid == pid and pid:
                 log.warning("session %s: job %s ignored the interrupt (%s); killing it", self.name, job.id, reason)
-                kill_tree(pid)
+                kill_tree(pid, self.snapshot_pids())
             return
 
     async def _execute_atomic(self, job: Job) -> str:
@@ -829,6 +833,10 @@ class Session:
                   rev=job.rev)
 
     # ---------------------------------------------------------------- snapshots
+
+    def snapshot_pids(self) -> set:
+        """Snapshot processes of this session: never killed with a job's process tree."""
+        return {s.pid for s in self.held() if s.pid}
 
     def held(self) -> list:
         return [*self.snapshots.values(), *self.internal_snaps, *([self.checkpoint] if self.checkpoint else [])]
@@ -938,7 +946,7 @@ class Session:
             if not job.done.is_set() and self.generation == generation and job.phase == "executing" \
                     and job.exec_pid == pid:
                 log.warning("session %s: job %s still over the memory limit; killing the worker", self.name, job.id)
-                kill_tree(pid)
+                kill_tree(pid, self.snapshot_pids())
                 await job.done.wait()
 
     async def _snap(self, name: str | None = None, message: str = "", strict: bool = False,
@@ -1563,10 +1571,13 @@ class Supervisor:
                     stop["reason"] = "memory_limit"
                     sig = signal.SIGINT if killed_at is None else signal.SIGKILL
                     if killed_at is None or time.monotonic() - killed_at > MEMORY_LIMIT_GRACE:
-                        try:
-                            os.kill(pid, sig)
-                        except ProcessLookupError:
-                            pass
+                        if sig == signal.SIGKILL:
+                            kill_tree(pid)
+                        else:
+                            try:
+                                os.kill(pid, sig)
+                            except ProcessLookupError:
+                                pass
                         killed_at = killed_at or time.monotonic()
 
         watcher = asyncio.create_task(watch())
