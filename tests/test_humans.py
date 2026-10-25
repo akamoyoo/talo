@@ -76,3 +76,11 @@ def test_attach_runs_blocks_and_magics_as_its_own_jobs(talo):
     assert "from another client" not in text
     rc, snaps = run_json(talo, "snaps")
     assert [s["name"] for s in snaps["snapshots"]] == ["one"]
+
+
+def test_export_works_with_autosnap(talo):
+    talo("run", "x = 1")
+    talo("autosnap", "on")
+    talo("run", "y = x + 1")
+    script = talo("export").stdout
+    assert "x = 1" in script and "y = x + 1" in script and "# --- snapshot @2 " in script

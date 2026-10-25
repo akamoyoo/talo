@@ -884,6 +884,7 @@ class Session:
             self.drop(old)
             snap.name = name
         job.autosnap = {"snapshot": snap.ref, "name": snap.name}
+        self._record_snapshot(snap)  # again, with its final name (the later record of a ref wins)
         autos = [s for s in self.snapshots.values() if s.auto]
         for s in autos[:-config["keep"]]:
             if not s.pins and s.ref != self.base:
@@ -985,8 +986,17 @@ class Session:
         self.next_snapshot += 1
         self.snapshots[sid] = snap
         self.base, self.jobs_since_base = snap.ref, []
+        self._record_snapshot(snap)
         self.emit("snapshot.created", session=self.name, snapshot=snap.ref, name=snap.name, owner=owner)
         return snap
+
+    def _record_snapshot(self, snap: Snapshot) -> None:
+        """A history line for every snapshot on a lineage (autosnaps, handoffs, trials, as well as `snap` jobs), so
+        export and verify can rebuild the path to any state."""
+        record = {"id": f"S{snap.ref}", "kind": "snap", "status": "ok", "session": self.name, "code": "",
+                  "finished": time.time(), "result": snap.to_dict()}
+        with open(self.dir / "history.jsonl", "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
     async def _fork(self, sid: str, strict: bool, *, name: str | None = None, message: str = "",
                     owner: str = "user") -> Snapshot:
@@ -2121,19 +2131,10 @@ class Supervisor:
                 records[rec["id"]] = rec
         return records
 
-    async def op_export(self, req):
-        """The job records that produced a state, oldest first (see "export" in docs/design.md)."""
-        session = self._session(req["session"])
-        records = self._records()
-        if req.get("all"):
-            path = session.dir / "history.jsonl"
-            return {"jobs": [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else [],
-                    "notes": self._notes(session)}
+    def _lineage(self, records: dict, base: str | None, tail: list) -> list:
+        """Job and snapshot records from the session's start to the state whose base is ``base`` with ``tail`` run
+        since, oldest first. Raises KeyError if a snapshot on the way has no record (the lineage is incomplete)."""
         snaps = {r["result"]["ref"]: r for r in records.values() if r["kind"] == "snap" and r["status"] == "ok"}
-        if req.get("snap"):
-            base, tail = self._snapshot(req["snap"], session.name).ref, []
-        else:
-            base, tail = session.base, list(session.jobs_since_base)
         chain = []
         while base:
             snap = snaps.get(base)
@@ -2147,6 +2148,21 @@ class Supervisor:
                 out.append(part)
             else:
                 out += [records[j] for j in part if j in records]
+        return out
+
+    async def op_export(self, req):
+        """The job records that produced a state, oldest first (see "export" in docs/design.md)."""
+        session = self._session(req["session"])
+        records = self._records()
+        if req.get("all"):
+            path = session.dir / "history.jsonl"
+            return {"jobs": [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else [],
+                    "notes": self._notes(session)}
+        if req.get("snap"):
+            base, tail = self._snapshot(req["snap"], session.name).ref, []
+        else:
+            base, tail = session.base, list(session.jobs_since_base)
+        out = self._lineage(records, base, tail)
         return {"jobs": out, "notes": self._notes(session)}
 
     # ---------------------------------------------------------------- notes and brief
