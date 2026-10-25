@@ -59,7 +59,7 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
 
 ## Status
 
-**Pre-alpha.** Milestone M1 (resident execution) works; snapshots (M2) are next. Interfaces will change.
+**Pre-alpha.** Milestone M1 (resident execution) works; snapshots (M2) are in progress. Interfaces will change.
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install

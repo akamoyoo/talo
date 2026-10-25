@@ -40,12 +40,41 @@ talo CLI (humans, agents)       JupyterLab / VS Code (M4)     MCP (M4)
   Rolling back means asking a snapshot to fork a new worker; the snapshot itself stays unchanged, so it can be checked
   out many times and branched. Snapshots form a tree.
 
-### Snapshot mechanics (M2)
+### Snapshots, checkout and branches (M2)
 
-Before forking, the worker creates a socket pair, keeps one end in the child and hands the other end to the
-supervisor (`SCM_RIGHTS`). The child is the snapshot: it closes its connection to the supervisor and waits on its own
-end. To check it out, the supervisor sends it a fresh socket end; the snapshot forks again, and the grandchild becomes
-the session's new worker using that socket. The snapshot reaps its children itself.
+**User model.** A session's state is a tree, like git commits:
+
+```console
+$ talo run -f load.py              # 30 GB in memory
+$ talo snap loaded                 # snapshot "loaded" (milliseconds)
+$ talo run 'df = df[df.price > 0]' # experiment ...
+$ talo checkout loaded             # ... and go back: the worker is replaced by a fork of "loaded"
+$ talo new idea2 --from loaded     # or explore in parallel: a second session forked from the same snapshot
+$ talo snaps                       # the tree, with each snapshot's private memory
+$ talo drop loaded                 # free it
+```
+
+- `snap [NAME] [-m MESSAGE]` is queued like an execution, so `run …; snap …` happens in order. Names are unique per
+  session; unnamed snapshots get `s1`, `s2`, …
+- `checkout NAME` replaces the session's worker with a fresh fork of the snapshot. If jobs ran since the worker's base
+  snapshot, checkout refuses and lists them, unless `--discard` (drop that state) or `--snap NAME` (save it first).
+- `new SESSION --from [SESSION:]NAME` starts an independent session from a snapshot (branching).
+- Each session records its **base** (the snapshot its worker descends from, or none) and the jobs run since; snapshots
+  record their parent snapshot, so the tree and "what happened since" are always known.
+- Snapshots survive the death of the worker: after an out-of-memory kill, `checkout` brings back the last snapshot.
+  They do not survive the supervisor (they exit when it goes away) or a reboot (that is M5).
+
+**Mechanics.** On `talo_snapshot_request` the worker, at an idle point, forks. The child is the snapshot: it closes the
+worker's connection, listens on its own Unix socket (`sessions/NAME/snapshots/ID.sock`) and serves a few requests:
+`vars` (read-only, for listing and diffing), `spawn`, `exit`. To check out, the supervisor connects to that socket and
+sends `spawn`; the snapshot forks again, and the grandchild closes the listening socket and keeps the accepted
+connection as its channel to the supervisor — it is the new worker, with the snapshot's exact memory state. No file
+descriptors need to be passed. The snapshot reaps its children and records their exit status in
+`snapshots/ID.children`, so the supervisor can report how a forked worker died.
+
+**Accounting.** The supervisor reads each snapshot's private memory from `/proc/PID/smaps_rollup` (`Private_Dirty`:
+pages that only this process holds). With `new --memory-budget SIZE`, `snap` is refused when the worker's resident
+memory plus all snapshots' private memory would exceed the budget, with a list of snapshots that could be dropped.
 
 Costs measured in [spikes/README.md](../spikes/README.md):
 
@@ -60,9 +89,10 @@ new snapshots that would exceed it and says which snapshots to drop.
 ### Fork safety
 
 `fork()` in a multi-threaded process leaves only the calling thread in the child; locks held by other threads may stay
-locked forever (Python 3.12 warns about this). Snapshots are taken only at idle points, and before forking the worker
-inspects its threads (`/proc/self/task/*/comm`): known-safe thread pools (OpenBLAS) are allowed, unknown threads produce
-a warning or a refusal with an explanation. Libraries with their own thread pools may hang or refuse to run in a forked child
+locked forever (Python 3.12 warns about this). Snapshots are taken only at idle points (between jobs). Before forking,
+the worker lists its threads (`/proc/self/task/*/comm`) and reports them with the snapshot; with `snap --strict` it
+refuses to fork while other threads exist. Thread pools that tolerate `fork()` (OpenBLAS registers handlers for it) are
+common, so the default is to warn, not refuse. Libraries with their own thread pools may hang or refuse to run in a forked child
 unless they rebuild the pool after `fork()`; GPU contexts, network connections and writable mappings are not restored
 by a rollback.
 

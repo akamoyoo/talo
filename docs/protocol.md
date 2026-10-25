@@ -44,7 +44,19 @@ provides `_repr_html_` / `_repr_markdown_`.
 | `talo_vars_request` (`pattern`) | `variables`: list of `{name, type, nbytes, shape | len, dtype, columns, value}`; `rss` |
 | `talo_show_request` (`name`: variable or expression, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
 
-M2 adds `talo_snapshot_request`, `talo_checkout_request` and `talo_snapshot_info_request`.
+| `talo_snapshot_request` (`id`, `socket`: path to listen on, `strict`) | `pid` of the snapshot process, `threads`: names of the other threads present at fork time — or `status: error` (`strict` and other threads exist) |
+
+### Snapshot sockets
+
+A snapshot process listens on the path given in `talo_snapshot_request` and answers newline-delimited JSON requests,
+one per connection:
+
+| Request | Effect |
+|---|---|
+| `{"op": "info"}` | `{"ok": true, "pid": …, "execution_count": …}` |
+| `{"op": "vars"}` | `{"ok": true, "variables": [...]}` (as `talo_vars_reply`; the snapshot's state is never modified) |
+| `{"op": "spawn"}` | the snapshot forks; the child replies `{"ok": true, "pid": …}` and from then on speaks the kernel protocol on this connection as the session's new worker |
+| `{"op": "exit"}` | the snapshot exits |
 
 ## Control requests
 
@@ -54,7 +66,7 @@ Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}
 | `op` | Parameters | Result |
 |---|---|---|
 | `ping` | – | `pid`, `home`, `sessions` |
-| `new` | `name`, `python`, `cwd`, `env` | the session |
+| `new` | `name`, `python`, `cwd`, `env`, `from` (`[session:]snapshot`), `memory_budget` (bytes) | the session |
 | `ls` | – | `sessions` |
 | `kill` | `name` | `killed` |
 | `run` | `session`, `code`, `timeout` (seconds) | the job, possibly still `running` |
@@ -65,10 +77,15 @@ Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}
 | `vars` | `session`, `pattern` | as `talo_vars_reply` |
 | `show` | `session`, `name`, `rows` | as `talo_show_reply` |
 | `history` | `session`, `last` | `history` |
+| `snap` | `session`, `name`, `message`, `strict` | the snapshot (queued behind running jobs) |
+| `snaps` | `session` | `snapshots`, `base`, `jobs_since_base` |
+| `checkout` | `session`, `name`, `discard`, `snap` (name to save the current state under first) | the session |
+| `drop` | `session`, `name` | `dropped` |
 | `shutdown` | – | `stopping` |
 
 A **session** is `{name, state (starting | idle | busy | dead), python, cwd, pid, rss, created, queued, current_job,
-death}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
+death, base, memory_budget}`. A **snapshot** is `{id, name, session, parent, pid, created, message, execution_count,
+jobs (ids run between its parent and itself), private_bytes, threads}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
 started, finished, elapsed_s, execution_count, result, error, metrics, output}`.
 
 The control protocol is versioned together with talo while it is pre-alpha; it will be frozen and versioned
