@@ -204,3 +204,28 @@ def test_utf8_options_and_stop_on_error(kernel, talo):
     out = subprocess.run([sys.executable, "-m", "talo.cli", "tail", jobs[-1]["id"], "--all"], capture_output=True,
                          text=True).stdout
     assert "\x1b]" not in out and "<__main__.H object" in out  # the CLI never shows the display markers
+
+
+def test_a_directory_named_talo_does_not_shadow_the_package(talo_home, tmp_path):
+    """Started from a directory containing a checkout named talo (e.g. ~), the kernel and the supervisor still import
+    the installed package."""
+    shadow = tmp_path / "home"
+    (shadow / "talo").mkdir(parents=True)
+    (shadow / "talo" / "README.md").write_text("a checkout")
+    env = {**os.environ, "JUPYTER_DATA_DIR": str(tmp_path / "jd")}
+    subprocess.run([sys.executable, "-m", "talo.cli", "kernelspec", "install", "-s", "nb"], env=env, check=True,
+                   timeout=30)
+    spec = json.loads((tmp_path / "jd" / "kernels" / "talo-nb" / "kernel.json").read_text())
+    cf, _ = write_connection_file(str(tmp_path / "k.json"))
+    argv = [a.replace("{connection_file}", cf) for a in spec["argv"]]
+    proc = subprocess.Popen(argv, cwd=shadow, env=env)              # the supervisor is started from there too
+    try:
+        kc = BlockingKernelClient(connection_file=cf)
+        kc.load_connection_file()
+        kc.start_channels()
+        kc.wait_for_ready(timeout=60)
+        reply, outs = run(kc, "1 + 1")
+        assert reply["status"] == "ok"
+        kc.stop_channels()
+    finally:
+        proc.kill()

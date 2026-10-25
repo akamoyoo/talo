@@ -33,3 +33,13 @@ def shared_socket_path() -> Path:
     (``/tmp/talo-shared-UID``, mode 0711), one per ``TALO_HOME``. Access is checked per connection (``SO_PEERCRED``)."""
     digest = hashlib.sha256(str(home().resolve()).encode()).hexdigest()[:12]
     return Path("/tmp") / f"talo-shared-{os.getuid()}" / f"{digest}.sock"
+
+
+def entry(module: str) -> list[str]:
+    """``[python, "-c", ...]`` running ``module.main()`` with the current directory left out of ``sys.path``: run as
+    ``python -m``, a directory named ``talo`` in the current directory (a checkout, say) would shadow the installed
+    package. (``-P`` does the same from Python 3.11.)"""
+    import sys
+    code = ("import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; "
+            f"from {module} import main; sys.exit(main())")
+    return [sys.executable, "-c", code]

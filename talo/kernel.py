@@ -515,7 +515,8 @@ def install_kernelspec(session: str, name: str | None = None, python: str | None
         base = Path(data) / "kernels"
     path = base / name
     path.mkdir(parents=True, exist_ok=True)
-    argv = [sys.executable, "-m", "talo.cli", "kernel", "--session", session, "-f", "{connection_file}"]
+    from talo.paths import entry
+    argv = [*entry("talo.cli"), "kernel", "--session", session, "-f", "{connection_file}"]
     if python:
         argv[-2:-2] = ["--python", python]
     spec = {"argv": argv, "display_name": f"Talo: {session} (persistent)", "language": "python",

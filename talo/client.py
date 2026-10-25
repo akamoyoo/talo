@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from talo.paths import home, socket_path
+from talo.paths import entry, home, socket_path
 
 
 class TaloError(RuntimeError):
@@ -32,7 +32,7 @@ def start_supervisor(timeout: float = 15.0) -> None:
     """Start the supervisor in the background (detached from the terminal) and wait until its socket accepts."""
     home().mkdir(parents=True, exist_ok=True)
     with open(home() / "supervisor.log", "ab") as out:
-        subprocess.Popen([sys.executable, "-m", "talo.supervisor"], stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+        subprocess.Popen(entry("talo.supervisor"), cwd=str(home()), stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                          start_new_session=True, env={**os.environ})
     deadline = time.time() + timeout
     while time.time() < deadline:
