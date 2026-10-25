@@ -552,6 +552,20 @@ def cmd_checkout(args):
     emit(args, d, lambda x: print(f"session {x['name']} now runs a fork of {x['base']} (pid {x['pid']})"))
 
 
+def cmd_autosnap(args):
+    on = {"on": True, "off": False}.get(args.state) if args.state else None
+    d = call("autosnap", session=session_name(args), on=on, keep=args.keep)
+    emit(args, d, lambda x: print(f"autosnap {'on, keeping the last ' + str(x['autosnap']['keep']) if x['autosnap'] else 'off'}"
+                                  f" for session {x['session']}"))
+
+
+def cmd_undo(args):
+    d = call("undo", session=session_name(args), timeout=args.timeout, key=args.key)
+    if (code := pending(args, d)) is not None:
+        return code
+    emit(args, d, lambda x: print(f"session {x['name']} is back at {x['base']} (the state before the last execution)"))
+
+
 def cmd_drop(args):
     emit(args, call("drop", session=session_name(args), name=args.name), lambda d: print(f"dropped {d['dropped']}"))
 
@@ -930,6 +944,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect-rev", type=int, metavar="N", help="refuse unless the session is at revision N")
     p.add_argument("--key", help="idempotency key: retrying with the same key returns the job already submitted")
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT, help="seconds to wait (it stays queued after)")
+    p = add("autosnap", cmd_autosnap, "snapshot after every successful execution (named @N), keeping the last N")
+    p.add_argument("state", nargs="?", choices=("on", "off"))
+    p.add_argument("--keep", type=int, default=10)
+    p = add("undo", cmd_undo, "go back to the state before the last execution")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
+    p.add_argument("--key", help="idempotency key")
     p = add("drop", cmd_drop, "free a snapshot")
     p.add_argument("name")
     add("attach", cmd_attach, "an interactive prompt on the session (Ctrl-D detaches; the session keeps running)")

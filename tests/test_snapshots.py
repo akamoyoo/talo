@@ -158,3 +158,23 @@ def test_unnamed_snapshots_are_numbered(talo):
     _, first = run_json(talo, "snap")
     _, second = run_json(talo, "snap")
     assert (first["name"], second["name"]) == ("s1", "s2")
+
+
+def test_autosnap_and_undo(talo):
+    def x():  # show does not run a job, so it takes no autosnap
+        return run_json(talo, "show", "x")[1]["text"]
+
+    talo("run", "x = 0")
+    talo("autosnap", "on", "--keep", "3")
+    for i in range(1, 6):
+        talo("run", f"x = {i}")
+    rc, snaps = run_json(talo, "snaps")
+    assert [s["name"] for s in snaps["snapshots"]] == ["@4", "@5", "@6"] and all(s["auto"] for s in snaps["snapshots"])
+    rc, out = run_json(talo, "undo")
+    assert rc == 0 and x() == "4"
+    talo("run", "x = 'oops'")        # @6 again on another branch: the abandoned @6 is replaced
+    talo("run", "y = undefined")     # a failed execution: undo goes back to before it
+    rc, out = run_json(talo, "undo")
+    assert x() == "'oops'"
+    talo("checkout", "@4", "--discard")
+    assert x() == "3"

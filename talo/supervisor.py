@@ -148,6 +148,7 @@ class Job:
     handle: object = field(default=None, repr=False)  # a "fork" job's internal snapshot
     staged: list = field(default_factory=list)  # services staged with talo.expose, published if the job succeeds
     published: dict | None = None              # {"versions": [...]} or {"error": ...} after publication
+    autosnap: dict | None = None               # the snapshot taken after it by talo autosnap
     progress: dict | None = None               # the last talo.progress() of a running job
     progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
@@ -157,7 +158,7 @@ class Job:
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "owner", "key",
-                                            "rev", "atomic", "termination", "phase", "published")}
+                                            "rev", "atomic", "termination", "phase", "published", "autosnap")}
         out["progress"] = self.progress
         if self.status == "running":
             out["last_progress_age_s"] = round(time.monotonic() - self.progress_at, 1) if self.progress_at else None
@@ -186,6 +187,7 @@ class Snapshot:
     owner: str = "user"
     created: float = field(default_factory=time.time)
     pins: set = field(default_factory=set)  # holders that need this snapshot alive (maps, service versions, handoffs)
+    auto: bool = False                      # taken by talo autosnap (dropped when older than the last N)
     hold: socket.socket | None = field(default=None, repr=False)
 
     @property
@@ -195,7 +197,7 @@ class Snapshot:
     def to_dict(self) -> dict:
         return {"id": self.id, "name": self.name, "session": self.session, "ref": self.ref, "parent": self.parent,
                 "pid": self.pid, "created": self.created, "message": self.message, "owner": self.owner,
-                "pins": sorted(self.pins),
+                "pins": sorted(self.pins), "auto": self.auto,
                 "execution_count": self.execution_count, "jobs": self.jobs, "threads": self.threads,
                 "private_bytes": private_dirty(self.pid), "alive": private_dirty(self.pid) is not None}
 
@@ -326,6 +328,7 @@ class Session:
         self.call_slots = asyncio.Semaphore(CALL_PARALLEL)
         self.on_handoff = None                       # set by the supervisor: run a queued handoff
         self.on_finish = lambda job: None            # set by the supervisor: fill in the outcome of the job's records  # set by the supervisor: append to the event journal
+        self.autosnap: dict | None = None  # {"keep": N} while talo autosnap is on
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
         self.tasks: list[asyncio.Task] = []
@@ -500,6 +503,8 @@ class Session:
                     status = await (self._execute_atomic(job) if job.params.get("atomic") else self._execute(job))
                     if status == "ok" and job.staged:
                         await self._publish(job)
+                    if status == "ok" and self.autosnap and job.execution_count:
+                        await self._autosnap(job)
                     self._finish(job, status)
                 elif job.kind == "snap":
                     self._finish(job, "ok", result=(await self._snap(**job.params, owner=job.owner)).to_dict())
@@ -666,6 +671,28 @@ class Session:
 
     def held(self) -> list:
         return [*self.snapshots.values(), *self.internal_snaps, *([self.checkpoint] if self.checkpoint else [])]
+
+    async def _autosnap(self, job: Job) -> None:
+        """talo autosnap: a snapshot after each successful execution, named @N, the last `keep` kept."""
+        name = f"@{job.execution_count}"
+        old = self.find(name, missing_ok=True)
+        if old is not None:  # the same count on an abandoned branch (after a checkout)
+            if old.pins or old.ref == self.base:
+                name = f"@{job.execution_count}.{job.id}"
+            else:
+                self.drop(old)
+        try:
+            snap = await self._snap(name, message=f"after execution {job.execution_count} (job {job.id})",
+                                    owner=job.owner)
+        except Exception as error:  # noqa: BLE001 - the code ran; only the snapshot failed
+            job.autosnap = {"error": f"{type(error).__name__}: {error}"}
+            return
+        snap.auto = True
+        job.autosnap = {"snapshot": snap.ref, "name": snap.name}
+        autos = [s for s in self.snapshots.values() if s.auto]
+        for s in autos[:-self.autosnap["keep"]]:
+            if not s.pins and s.ref != self.base:
+                self.drop(s)
 
     async def _publish(self, job: Job) -> None:
         """Publish the services a successful job staged, as new versions on one snapshot of the state it left."""
@@ -1161,6 +1188,27 @@ class Supervisor:
             return await self._ask_idle(session, "talo_reload_request", {**params, "dry_run": True})
         job = await self._submit_control(session, "reload", req.get("timeout", 300), req, **params)
         return job
+
+    async def op_autosnap(self, req):
+        session = self._session(req["session"])
+        if req.get("on") is not None:
+            session.autosnap = {"keep": max(1, int(req.get("keep") or 10))} if req["on"] else None
+        return {"session": session.name, "autosnap": session.autosnap}
+
+    async def op_undo(self, req):
+        """Check out the state before the last execution: the base if jobs ran since it, else the base's parent."""
+        session = self._session(req["session"])
+        if session.jobs_since_base:
+            target = session.base
+        else:
+            base = session.find(session.base.partition(":")[2], missing_ok=True) if session.base else None
+            target = base.parent if base else None
+        if not target:
+            raise RuntimeError("nothing to undo: no snapshot before the last execution (`talo autosnap on` takes one "
+                               "after every execution)")
+        snap = self._snapshot(target, session.name)
+        return await self._control(session, "checkout", req.get("timeout", 300), req, snap=snap, discard=True,
+                                   save_as=None)
 
     async def op_drop(self, req):
         session = self._session(req["session"])
