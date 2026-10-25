@@ -34,11 +34,34 @@ def test_key_makes_retries_idempotent(talo):
     talo("run", "n = 0")
     rc, a = run_json(talo, "run", "--key", "step-1", "n += 1")
     rc, b = run_json(talo, "run", "--key", "step-1", "n += 1")
-    assert a["job"]["id"] == b["job"]["id"]
+    assert a["job"]["id"] == b["job"]["id"] and b["job"]["deduplicated"] and not a["job"].get("deduplicated")
     rc, out = run_json(talo, "run", "n")
     assert out["job"]["result"]["data"]["text/plain"] == "1"
     rc, out = run_json(talo, "run", "--key", "step-1", "n += 2")
-    assert rc == 2 and "different code" in out["error"]["message"]
+    assert rc == 2 and "different request" in out["error"]["message"]
+    rc, out = run_json(talo, "run", "--key", "step-1", "--expect-rev", "1", "n += 1")  # same code, other options
+    assert rc == 2 and "different request" in out["error"]["message"]
+    rc, a = run_json(talo, "snap", "s", "--key", "snap-1")
+    rc, b = run_json(talo, "snap", "s", "--key", "snap-1")
+    assert rc == 0 and a["ref"] == b["ref"]  # the retry did not try to take a second snapshot named s
+
+
+def test_show_only_inspects(talo):
+    talo("run", "items = [1, 2, 3]\nd = {'k': [4, 5]}")
+    assert talo("show", "d['k'][0]").returncode == 0
+    rc, out = run_json(talo, "show", "items.pop()")
+    assert out["status"] == "error" and "talo run" in out["evalue"]
+    rc, out = run_json(talo, "run", "len(items)")
+    assert out["job"]["result"]["data"]["text/plain"] == "3"
+
+
+def test_brief_while_busy_shows_the_last_variables_as_stale(talo):
+    talo("run", "import time\nx = 1")
+    talo("brief")
+    talo("run", "y = 2; time.sleep(3)", "-t", "0")
+    rc, d = run_json(talo, "brief")
+    assert rc == 0 and d["variables"]["stale"] and [v["name"] for v in d["variables"]["largest"]] == ["x"]
+    assert d["active_jobs"][0]["status"] == "running"
 
 
 def test_brief_and_notes(talo):

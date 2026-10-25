@@ -36,6 +36,7 @@ from talo.paths import home, socket_for, socket_path
 
 log = logging.getLogger("talo")
 WORKER = Path(__file__).with_name("worker.py")
+NOTE_PREVIEW = 500  # characters of each note shown by brief (talo notes shows them in full)
 DIFF_MAX_BYTES = 256 << 20  # variables larger than this are compared by summary only, unless the request says otherwise
 
 
@@ -164,6 +165,7 @@ class Session:
         self.jobs_since_base: list[str] = []
         self.rev = 0                        # increases whenever the state may change (execution, checkout)
         self.owners: dict[str, str] = {}    # job id -> owner, for refusals that name whose work would be lost
+        self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
         self.tasks: list[asyncio.Task] = []
 
     # ---------------------------------------------------------------- workers
@@ -480,7 +482,8 @@ class Supervisor:
     def __init__(self):
         self.sessions: dict[str, Session] = {}
         self.jobs: dict[str, Job] = {}
-        self.keys: dict[tuple[str, str], str] = {}  # (session, idempotency key) -> job id
+        self.keys: dict[tuple[str, str], tuple] = {}  # (session, idempotency key) -> (job id, request fingerprint)
+        self.epoch = wire.new_id()[:12]               # changes when the supervisor restarts (keys do not survive it)
         self.state_file = home() / "state.json"
         state = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
         self.next_job = int(state.get("next_job", 1))
@@ -523,14 +526,15 @@ class Supervisor:
                 await asyncio.wait_for(job.done.wait(), timeout)
             except asyncio.TimeoutError:
                 pass
-        return job.to_dict()
+        return {**job.to_dict(), "epoch": self.epoch}
 
     async def _submit(self, session: Session, kind: str, code: str = "", *, owner: str | None = None,
-                      key: str | None = None, expect_rev: int | None = None, **params) -> Job:
+                      key: str | None = None, fingerprint: dict | None = None, expect_rev: int | None = None,
+                      **params) -> Job:
         job = Job(self._new_job_id(), session.name, code, "", kind=kind, params=params, owner=owner or "user",
                   key=key, expect_rev=expect_rev)
         if key is not None:
-            self.keys[(session.name, key)] = job.id
+            self.keys[(session.name, key)] = (job.id, fingerprint)
         job.output = str(session.dir / "jobs" / f"{job.id}.out")
         Path(job.output).touch()
         self.jobs[job.id] = job
@@ -540,7 +544,7 @@ class Supervisor:
     # ---------------------------------------------------------------- requests
 
     async def op_ping(self, req):
-        return {"pid": os.getpid(), "home": str(home()), "sessions": len(self.sessions)}
+        return {"pid": os.getpid(), "home": str(home()), "sessions": len(self.sessions), "epoch": self.epoch}
 
     async def op_new(self, req):
         name = req["name"]
@@ -570,19 +574,27 @@ class Supervisor:
         del self.sessions[req["name"]]
         return {"killed": req["name"]}
 
+    def _deduplicated(self, session: Session, req: dict, fingerprint: dict) -> Job | None:
+        """The job already submitted under ``req["key"]``, or None; an error if the key was used for another request."""
+        key = req.get("key")
+        if key is None or (session.name, key) not in self.keys:
+            return None
+        job_id, known = self.keys[(session.name, key)]
+        if known != fingerprint:
+            raise ValueError(f"key {key!r} was used for job {job_id} with a different request; use a new key")
+        return self.jobs[job_id]
+
     async def op_run(self, req):
         session = self._session(req["session"])
+        fingerprint = {"op": "run", "code": req["code"], "expect_rev": req.get("expect_rev"),
+                       "atomic": bool(req.get("atomic"))}
+        if job := self._deduplicated(session, req, fingerprint):
+            return {**await self._wait(job, req.get("timeout", 30)), "deduplicated": True}
         if session.state == "dead":
             raise SessionDead(f"session {session.name} is dead: {session.death} (`talo checkout SNAPSHOT` to roll "
                               f"back, or `talo kill {session.name}` and create it again)")
-        key = req.get("key")
-        if key is not None and (session.name, key) in self.keys:  # a retry: the job that was already submitted
-            job = self.jobs[self.keys[(session.name, key)]]
-            if job.code != req["code"]:
-                raise ValueError(f"key {key!r} was used for job {job.id} with different code")
-        else:
-            job = await self._submit(session, "execute", req["code"], owner=req.get("owner"), key=key,
-                                     expect_rev=req.get("expect_rev"))
+        job = await self._submit(session, "execute", req["code"], owner=req.get("owner"), key=req.get("key"),
+                                 fingerprint=fingerprint, expect_rev=req.get("expect_rev"))
         return await self._wait(job, req.get("timeout", 30))
 
     async def op_job(self, req):
@@ -619,8 +631,15 @@ class Supervisor:
         reply = await session.request(msg_type, content, timeout=timeout)
         return reply["content"]
 
+    async def _vars(self, session: Session, pattern: str | None = None) -> dict:
+        rev = session.rev
+        reply = await self._ask_idle(session, "talo_vars_request", {"pattern": pattern})
+        if not pattern:
+            session.vars_seen = {"rev": rev, "time": time.time(), "variables": reply["variables"]}
+        return {**reply, "rev": rev}
+
     async def op_vars(self, req):
-        return await self._ask_idle(self._session(req["session"]), "talo_vars_request", {"pattern": req.get("pattern")})
+        return await self._vars(self._session(req["session"]), req.get("pattern"))
 
     async def op_show(self, req):
         return await self._ask_idle(self._session(req["session"]), "talo_show_request",
@@ -632,8 +651,14 @@ class Supervisor:
         return {"history": [json.loads(x) for x in lines[-int(req.get("last", 20)):]]}
 
     async def _control(self, session: Session, kind: str, timeout: float, req: dict, **params) -> dict:
-        job = await self._submit(session, kind, owner=req.get("owner"), expect_rev=req.get("expect_rev"), **params)
-        out = await self._wait(job, timeout)
+        fingerprint = {"op": kind, "expect_rev": req.get("expect_rev"),
+                       **{k: (v.ref if isinstance(v, Snapshot) else v) for k, v in params.items()}}
+        if job := self._deduplicated(session, req, fingerprint):
+            out = {**await self._wait(job, timeout), "deduplicated": True}
+        else:
+            job = await self._submit(session, kind, owner=req.get("owner"), key=req.get("key"), fingerprint=fingerprint,
+                                     expect_rev=req.get("expect_rev"), **params)
+            out = await self._wait(job, timeout)
         if out["status"] == "error":
             raise RuntimeError(out["error"]["evalue"])
         if out["status"] != "ok":
@@ -711,7 +736,7 @@ class Supervisor:
         session = self._session(req["session"])
         if req.get("job"):
             self._job(req["job"])  # must exist
-        note = {"time": time.time(), "owner": req.get("owner") or "user", "rev": session.rev, "base": session.base,
+        note = {"id": f"n{len(self._notes(session)) + 1}", "time": time.time(), "owner": req.get("owner") or "user", "rev": session.rev, "base": session.base,
                 "job": req.get("job"), "text": req["text"]}
         with open(session.dir / "notes.jsonl", "a") as f:
             f.write(json.dumps(note, ensure_ascii=False) + "\n")
@@ -741,15 +766,24 @@ class Supervisor:
                 d["error"] = f"{j.error.get('ename')}: {str(j.error.get('evalue'))[:200]}"
             return d
 
-        variables = {"skipped": f"session is {session.state}"}
+        seen = session.vars_seen
         if session.state == "idle":
-            rows = (await self._ask_idle(session, "talo_vars_request", {"pattern": None}))["variables"]
-            rows.sort(key=lambda v: -(v.get("nbytes") or 0))
-            variables = {"largest": rows[:n_vars], "total": len(rows)}
+            await self._vars(session)
+            seen = session.vars_seen
+        if seen:
+            rows = sorted(seen["variables"], key=lambda v: -(v.get("nbytes") or 0))
+            variables = {"largest": [{k: v for k, v in r.items() if k != "value"} for r in rows[:n_vars]],
+                         "total": len(rows), "observed_rev": seen["rev"], "observed_at": seen["time"],
+                         "stale": seen["rev"] != session.rev}
+        else:
+            variables = {"unavailable": f"session is {session.state} and no summary was taken yet"}
+
+        def cut(note: dict) -> dict:
+            return {**note, "text": note["text"][:NOTE_PREVIEW]} if len(note["text"]) > NOTE_PREVIEW else note
         return {
             "session": session.to_dict(),
             "private_bytes": private_dirty(session.worker_pid),
-            "notes": {"last": notes[-n_notes:], "total": len(notes)},
+            "notes": {"last": [cut(n) for n in notes[-n_notes:]], "total": len(notes), "more": "talo notes"},
             "snapshots": [{k: s.to_dict()[k] for k in ("name", "ref", "parent", "message", "owner", "private_bytes")}
                           for s in session.snapshots.values()],
             "variables": variables,

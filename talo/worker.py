@@ -112,6 +112,32 @@ def mime_bundle(value, save=None) -> tuple[dict, dict]:
     return data, meta
 
 
+def inspection_expr(text: str) -> ast.Expression:
+    """Parse an expression for ``show``: names, attributes and constant subscripts only (``df``, ``df.x``,
+    ``d["k"]``, ``a[0]``), so that inspecting never calls user code that could change the state unrecorded (properties
+    and ``__getitem__`` still run). Anything else raises ValueError, pointing to ``talo run``."""
+    tree = ast.parse(text.strip(), mode="eval")
+
+    def ok(node) -> bool:
+        if isinstance(node, ast.Name):
+            return True
+        if isinstance(node, ast.Attribute):
+            return ok(node.value)
+        if isinstance(node, ast.Subscript):
+            index = node.slice
+            parts = index.elts if isinstance(index, ast.Tuple) else [index]
+            simple = all(isinstance(x, ast.Constant) or isinstance(x, ast.UnaryOp) and isinstance(x.operand, ast.Constant)
+                         or isinstance(x, ast.Slice) and all(v is None or isinstance(v, ast.Constant)
+                                                              for v in (x.lower, x.upper, x.step)) for x in parts)
+            return simple and ok(node.value)
+        return False
+
+    if not ok(tree.body):
+        raise ValueError(f"show only evaluates names, attributes and constant subscripts; use `talo run {text!r}` "
+                         "for other expressions (it is recorded in the history)")
+    return tree
+
+
 # ---------------------------------------------------------------- completion
 
 _KEY = re.compile(r"([A-Za-z_][\w.]*)\[(['\"])([^'\"]*)$")   # d["pre  -> complete the keys of d
@@ -615,7 +641,7 @@ class Worker:
         elif kind == "talo_show_request":
             name, rows = msg["content"]["name"], int(msg["content"].get("rows", 10))
             try:
-                value = eval(compile(name, "<talo-show>", "eval"), self.namespace)  # expressions such as df.x, d["k"]
+                value = eval(compile(inspection_expr(name), "<talo-show>", "eval"), self.namespace)
                 self.send("talo_show_reply", {"status": "ok", "summary": describe(name, value),
                                               "text": show(value, rows)}, msg)
             except Exception as error:  # noqa: BLE001

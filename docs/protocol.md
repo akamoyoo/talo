@@ -47,7 +47,7 @@ writes each one to a file next to the job's output file (`ID-N.png`, ...) and li
 | Request | Reply content |
 |---|---|
 | `talo_vars_request` (`pattern`) | `variables`: list of `{name, type, nbytes, shape | len, dtype, columns, value}`; `rss` |
-| `talo_show_request` (`name`: variable or expression, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
+| `talo_show_request` (`name`: a name, attribute or constant subscript such as `df.x` or `d["k"]`, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
 | `talo_fingerprint_request` (`names`) | `fingerprints`: `{name: {"hash": hex} \| {"error": text}}` (BLAKE2b of the pickled object; see "Diff" in [design.md](design.md)) |
 | `talo_snapshot_request` (`id`, `socket`: path to listen on, `strict`) | `pid` of the snapshot process, `threads`: names of the other threads present at fork time — or `status: error` (`strict` and other threads exist) |
 
@@ -72,21 +72,21 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 
 | `op` | Parameters | Result |
 |---|---|---|
-| `ping` | – | `pid`, `home`, `sessions` |
+| `ping` | – | `pid`, `home`, `sessions`, `epoch` (changes when the supervisor restarts) |
 | `new` | `name`, `python`, `cwd`, `env`, `from` (`[session:]snapshot`), `memory_budget` (bytes) | the session |
 | `ls` | – | `sessions` |
 | `kill` | `name` | `killed` |
-| `run` | `session`, `code`, `timeout` (seconds), `key` (idempotency), `expect_rev` | the job, possibly still `running`; for a known `key`, the job already submitted |
+| `run` | `session`, `code`, `timeout` (seconds), `key` (idempotency), `expect_rev` | the job (with the supervisor's `epoch`), possibly still `running`; for a known `key`, the job already submitted, with `deduplicated: true` |
 | `job` | `id`, `wait` (seconds) | the job |
 | `jobs` | `session` (optional), `last` | `jobs` (the last `last`, each with `code_preview`: the first 200 characters of its code), `total` |
 | `output` | `id`, `offset` (default: the end), `max_bytes` | `text`, `offset`, `next_offset`, `size`, `status` |
 | `interrupt` | `id` | `result`: `interrupting`, `cancelled` or the final status |
-| `vars` | `session`, `pattern` | as `talo_vars_reply` |
+| `vars` | `session`, `pattern` | as `talo_vars_reply`, plus the `rev` observed |
 | `show` | `session`, `name`, `rows` | as `talo_show_reply` |
 | `history` | `session`, `last` | `history` |
-| `snap` | `session`, `name`, `message`, `strict`, `timeout` | the snapshot (queued behind running jobs), or `{"job": ...}` when it has not finished within `timeout` |
+| `snap` | `session`, `name`, `message`, `strict`, `timeout`, `key` | the snapshot (queued behind running jobs), or `{"job": ...}` when it has not finished within `timeout` |
 | `snaps` | `session` | `snapshots`, `base`, `jobs_since_base` |
-| `checkout` | `session`, `name`, `discard`, `snap` (name to save the current state under first), `timeout` | the session, or `{"job": ...}` as for `snap` |
+| `checkout` | `session`, `name`, `discard`, `snap` (name to save the current state under first), `timeout`, `expect_rev`, `key` | the session, or `{"job": ...}` as for `snap` |
 | `drop` | `session`, `name` | `dropped` |
 | `complete` | `session`, `code`, `cursor_pos` | as `complete_reply` (answered only while idle) |
 | `export` | `session`, `snap` (export the path to this snapshot), `all` (every job) | `jobs`: job records in order, each with `code`, `status`, `outputs`, and markers for snapshots (`kind: "snap"`) |

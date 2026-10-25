@@ -257,7 +257,7 @@ def pending(args, d: dict) -> int | None:
 
 def cmd_snap(args):
     d = call("snap", session=session_name(args), name=args.name, message=args.message or "", strict=args.strict,
-             timeout=args.timeout)
+             timeout=args.timeout, key=args.key)
     if (code := pending(args, d)) is not None:
         return code
     def human(x):
@@ -284,7 +284,7 @@ def cmd_snaps(args):
 
 def cmd_checkout(args):
     d = call("checkout", session=session_name(args), name=args.name, discard=args.discard, snap=args.snap,
-             timeout=args.timeout, expect_rev=args.expect_rev)
+             timeout=args.timeout, expect_rev=args.expect_rev, key=args.key)
     if (code := pending(args, d)) is not None:
         return code
     emit(args, d, lambda x: print(f"session {x['name']} now runs a fork of {x['base']} (pid {x['pid']})"))
@@ -362,9 +362,10 @@ def cmd_brief(args):
         if "largest" in v:
             items = [f"{x['name']} {x['type']}" + (f" {tuple(x['shape'])}" if "shape" in x else "")
                      + f" {human_bytes(x.get('nbytes'))}" for x in v["largest"]]
-            print(f"variables (largest {len(items)} of {v['total']})  " + " · ".join(items))
+            stale = f", as of rev {v['observed_rev']}" if v["stale"] else ""
+            print(f"variables (largest {len(items)} of {v['total']}{stale})  " + " · ".join(items))
         else:
-            print(f"variables  ({v['skipped']})")
+            print(f"variables  ({v['unavailable']})")
 
         def line(j):
             preview = (j["code_preview"].strip().splitlines() or [""])[0][:70]
@@ -536,6 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", help="snapshot name (default s1, s2, ...)")
     p.add_argument("-m", "--message")
     p.add_argument("--strict", action="store_true", help="refuse when the worker has other threads (see docs)")
+    p.add_argument("--key", help="idempotency key: retrying with the same key returns the job already submitted")
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT, help="seconds to wait (it stays queued after)")
     add("snaps", cmd_snaps, "list the session's snapshots with their private memory")
     p = add("checkout", cmd_checkout, "replace the session's worker with a fork of a snapshot (roll back)")
@@ -543,6 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--discard", action="store_true", help="drop the state of jobs run since the current base")
     p.add_argument("--snap", metavar="NAME", help="snapshot the current state under NAME before checking out")
     p.add_argument("--expect-rev", type=int, metavar="N", help="refuse unless the session is at revision N")
+    p.add_argument("--key", help="idempotency key: retrying with the same key returns the job already submitted")
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT, help="seconds to wait (it stays queued after)")
     p = add("drop", cmd_drop, "free a snapshot")
     p.add_argument("name")
