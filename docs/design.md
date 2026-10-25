@@ -419,7 +419,7 @@ $ talo call default.evaluate '{"expr": "ret_5 - ret_30", "horizon": 60}'
 talo.record(ic=0.012, rank_ic=0.015, factor="gap_mom")
 ```
 ```console
-$ talo ledger --has ic --sort -ic --last 5
+$ talo ledger --has ic --sort ic --desc --last 5
 r41  ic=0.0150 rank_ic=0.0180  map m3 case 7 · from loaded (default:s1) · succeeded · agent-a
 r38  ic=0.0120 rank_ic=0.0110  job 211 · base default:s4 (dropped) · rolled back · agent-b
 ```
@@ -432,8 +432,8 @@ r38  ic=0.0120 rank_ic=0.0110  job 211 · base default:s4 (dropped) · rolled ba
   `failed`, `interrupted` or `rolled_back`; records of failed work are kept but labelled. The ledger says whether
   the source snapshot still exists; the exact state of a map case or call is never kept, only the snapshot it came
   from.
-- `talo ledger` filters (`--session`, `--owner`, `--where KEY=VALUE`, `--has KEY`, `--outcome`), sorts on one field
-  and bounds its output. Records hold facts reported by code; interpretations belong in notes, which can cite them.
+- `talo ledger` filters (`--session`, `--owner`, `--where KEY=VALUE`, `--has KEY`, `--outcome`), sorts on one numeric
+  field (`--sort KEY [--desc]`) and bounds its output. Records hold facts reported by code; interpretations belong in notes, which can cite them.
 
 ### Events: `talo events`
 

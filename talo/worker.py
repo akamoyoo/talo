@@ -597,8 +597,30 @@ class Helper:
         self._worker.send("talo_progress", {"done": done, "total": total, "note": str(note)[:200]},
                           self._worker.parent)
 
+    def record(self, key: str | None = None, **fields) -> str:
+        """Add a record to the experiment ledger: ``talo.record(ic=0.012, factor="gap_mom")``. Values are JSON scalars
+        or strings (cut to 200 characters). The supervisor adds where the record came from (job or map case,
+        revision, snapshot, code hashes) and later the outcome of the job. Returns the record id."""
+        if self._worker.parent is None:
+            raise RuntimeError("talo.record can only be used while code runs in a Talo session")
+        clean = {}
+        for name, value in fields.items():
+            value = _plain(value) if hasattr(value, "item") else value
+            if isinstance(value, str):
+                value = value[:200]
+            elif not (value is None or isinstance(value, (bool, int, float))):
+                raise TypeError(f"talo.record: {name} must be a number, bool, None or string, not {type(value).__name__}")
+            clean[name] = value
+        record_id = "r" + wire.new_id()[:10]
+        modules = {name: h for name, h in self._worker.reloader.hashes.items()
+                   if (m := sys.modules.get(name)) is not None and getattr(m, "__file__", None)
+                   and not _excluded(m.__file__) and os.path.realpath(m.__file__).startswith(os.getcwd() + os.sep)}
+        self._worker.send("talo_record", {"id": record_id, "key": key, "fields": clean, "modules": dict(list(modules.items())[:50])},
+                          self._worker.parent)
+        return record_id
+
     def __repr__(self) -> str:
-        return "<talo helper: talo.progress(done, total=None, note='')>"
+        return "<talo helper: talo.progress(done, total, note), talo.record(**fields)>"
 
 
 class Worker:

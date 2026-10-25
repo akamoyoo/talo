@@ -578,6 +578,46 @@ def cmd_events(args):
     emit(args, d, human)
 
 
+def parse_value(text: str):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def cmd_record(args):
+    fields = {}
+    for item in args.fields:
+        k, sep, v = item.partition("=")
+        if not sep:
+            raise TaloError("BadArgument", f"expected KEY=VALUE, got {item!r}")
+        fields[k] = parse_value(v)
+    d = call("record", session=session_name(args), fields=fields, key=args.key)
+    emit(args, d, lambda x: print(f"recorded {x['record']['id']}"))
+
+
+def record_line(r: dict) -> str:
+    fields = " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in r["fields"].items())
+    p = r["producer"]
+    where = {"job": f"job {p.get('job')}", "case": f"map {p.get('map')} case {p.get('index')}"}.get(p["kind"], p["kind"])
+    src = f" · from {r['source_snapshot']} ({r['source_state']})" if r.get("source_snapshot") else ""
+    return f"{r['id']}  {fields[:160]}  {where}{src} · {r['outcome']} · {r['owner']}"
+
+
+def cmd_ledger(args):
+    d = call("ledger", session=args.session, owner=args.owner_filter, outcome=args.outcome, has=args.has,
+             where=args.where, sort=("-" if args.desc else "") + args.sort if args.sort else None, last=args.last)
+
+    def human(x):
+        if not x["records"]:
+            print("(no records; `talo.record(name=value)` in code adds one)")
+        for r in x["records"]:
+            print(record_line(r))
+        if x["total"] > len(x["records"]):
+            print(f"({len(x['records'])} of {x['total']} records)", file=sys.stderr)
+    emit(args, d, human)
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -783,6 +823,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key", help="idempotency key")
     p.add_argument("--expect-rev", type=int, metavar="N", help="without --from: refuse unless the session is at revision N")
     add("maps", cmd_maps, "fan-outs and their progress")
+    p = add("record", cmd_record, "add a record to the experiment ledger from the shell")
+    p.add_argument("fields", nargs="+", metavar="KEY=VALUE", help="values are parsed as JSON when possible")
+    p.add_argument("--key", help="idempotency key")
+    p = add("ledger", cmd_ledger, "the experiment ledger of all sessions, with where each record came from",
+            session=False)
+    p.add_argument("-s", "--session", help="only this session")
+    p.add_argument("--owner-of", dest="owner_filter", metavar="OWNER", help="only records by this owner")
+    p.add_argument("--outcome", help="running, succeeded, failed, interrupted, rolled_back or reported")
+    p.add_argument("--has", action="append", metavar="KEY", help="only records with this field (repeatable)")
+    p.add_argument("--where", action="append", metavar="KEY=VALUE", help="only records where KEY equals VALUE")
+    p.add_argument("--sort", metavar="KEY", help="sort on a numeric field")
+    p.add_argument("--desc", action="store_true", help="with --sort: largest first")
+    p.add_argument("--last", type=int, default=50)
     p = add("events", cmd_events, "the event journal: wait for jobs, maps, snapshots, notes ... without polling",
             session=False)
     p.add_argument("--after", metavar="CURSOR", help="events after this cursor (default: only new events)")

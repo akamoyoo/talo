@@ -78,6 +78,11 @@ def memory(pid: int | None) -> dict | None:
     return out or None
 
 
+def blake(text: str) -> str:
+    import hashlib
+    return hashlib.blake2b(text.encode(errors="replace"), digest_size=12).hexdigest()
+
+
 def case_seed(map_id: str, index: int) -> int:
     """A seed per map case: forks inherit identical random generator states, so cases should seed from this."""
     import hashlib
@@ -270,7 +275,9 @@ class Session:
         self.id = wire.new_id()[:12]        # unique per incarnation: a recreated session with the same name is another
         self.rev = 0                        # increases whenever the state may change (execution, checkout, reload)
         self.owners: dict[str, str] = {}    # job id -> owner, for refusals that name whose work would be lost
-        self.emit = lambda event_type, /, **fields: None  # set by the supervisor: append to the event journal
+        self.emit = lambda event_type, /, **fields: None
+        self.on_record = lambda job, content: None   # set by the supervisor: talo.record() from a job
+        self.on_finish = lambda job: None            # set by the supervisor: fill in the outcome of the job's records  # set by the supervisor: append to the event journal
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
         self.tasks: list[asyncio.Task] = []
@@ -505,6 +512,8 @@ class Session:
                     job.error = dict(got["content"])
                 elif kind == "talo_progress":
                     job.progress, job.progress_at = dict(got["content"]), time.monotonic()
+                elif kind == "talo_record":
+                    self.on_record(job, got["content"])
                 elif kind == "execute_reply":
                     status = got["content"]["status"]
                     job.metrics = dict(got.get("metadata", {}))
@@ -594,6 +603,7 @@ class Session:
         with open(self.dir / "history.jsonl", "a") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         job.done.set()  # the record is written first: whoever wakes up can read it
+        self.on_finish(job)
         self.emit("job.finished", session=self.name, job=job.id, kind=job.kind, status=status, owner=job.owner,
                   rev=job.rev)
 
@@ -787,6 +797,7 @@ class Supervisor:
         self.event_added = asyncio.Event()
         self.maps: dict[str, MapRun] = {}
         self.next_map = 1
+        self.ledger: dict[str, dict] = self._load_ledger()   # record id -> record (shared by all sessions)
         self.last_rev: dict[str, int] = {}             # session name -> its revision when it was closed
         self.epoch = wire.new_id()[:12]               # changes when the supervisor restarts (keys do not survive it)
         self.state_file = home() / "state.json"
@@ -865,6 +876,8 @@ class Supervisor:
         session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"), req.get("memory_limit"))
         session.rev = self.last_rev.get(name, 0)  # revisions never repeat for a name, so a stale --expect-rev fails
         session.emit = self.emit
+        session.on_record = lambda job, content: self._add_record(content, session, job=job)
+        session.on_finish = self._job_outcome
         self.sessions[name] = session
         try:
             await (session.start_from(source) if source else session.start())
@@ -1173,9 +1186,15 @@ class Supervisor:
 
         watcher = asyncio.create_task(watch())
         try:
+            session = self.sessions.get(m.session)
+
+            def on_message(kind: str, content: dict) -> None:
+                if kind == "talo_record" and session is not None:
+                    self._add_record(content, session, m=m, index=index)
+
             out = await ephemeral.run(m.snap.socket, m.code, output, bind={"case": case},
                                       case={"map": m.id, "index": index, "seed": case_seed(m.id, index)},
-                                      json_limit=m.json_limit, started=started)
+                                      json_limit=m.json_limit, started=started, on_message=on_message)
         except Exception as error:  # noqa: BLE001
             out = {"status": "error", "error": {"ename": type(error).__name__, "evalue": str(error), "traceback": []}}
         finally:
@@ -1185,6 +1204,8 @@ class Supervisor:
         if status == "error" and (out.get("error") or {}).get("ename") == "KeyboardInterrupt" \
                 and (m.interrupt_requested or stop["reason"]):
             status = "interrupted"
+        outcome = {"ok": "succeeded", "error": "failed"}.get(status, status)
+        self._set_outcome(lambda r: r["producer"].get("map") == m.id and r["producer"].get("index") == index, outcome)
         error = out.get("error")
         if error:
             error = {"ename": error.get("ename"), "evalue": str(error.get("evalue"))[:500],
@@ -1193,6 +1214,93 @@ class Supervisor:
                 "result_error": out.get("result_error"), "text": out.get("text"), "error": error,
                 "termination": stop["reason"], "elapsed_s": out.get("elapsed_s"), "sampled_peak_pss": peak["pss"] or None,
                 "output": output, "outputs": out.get("outputs", [])}
+
+    # ---------------------------------------------------------------- ledger
+
+    def _load_ledger(self) -> dict:
+        records, path = {}, home() / "ledger.jsonl"
+        if path.exists():
+            for line in path.read_text().splitlines():
+                rec = json.loads(line)
+                if "outcome_of" in rec:  # an outcome filled in later
+                    if rec["outcome_of"] in records:
+                        records[rec["outcome_of"]]["outcome"] = rec["outcome"]
+                else:
+                    records[rec["id"]] = rec
+        return records
+
+    def _ledger_write(self, entry: dict) -> None:
+        with open(home() / "ledger.jsonl", "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+    def _add_record(self, content: dict, session: Session, *, job: Job | None = None, m: "MapRun | None" = None,
+                    index: int | None = None, owner: str | None = None) -> dict:
+        key = content.get("key")
+        if key is not None:
+            for rec in self.ledger.values():
+                if rec.get("key") == key and rec["session_id"] == session.id:
+                    return rec  # an idempotent retry
+        if m is not None:
+            producer = {"kind": "case", "map": m.id, "index": index}
+            source, rev, code = m.snap.ref, None, m.code
+        elif job is not None:
+            producer = {"kind": "job", "job": job.id}
+            source, rev, code = session.base, job.rev, job.code
+        else:
+            producer = {"kind": "shell"}
+            source, rev, code = session.base, session.rev, ""
+        rec = {"id": content.get("id") or "r" + wire.new_id()[:10], "key": key, "time": time.time(),
+               "owner": owner or (job.owner if job else m.owner if m else "user"), "session": session.name,
+               "session_id": session.id, "producer": producer, "rev": rev, "source_snapshot": source,
+               "code_hash": blake(code) if code else None, "modules": content.get("modules") or {},
+               "fields": content.get("fields") or {}, "outcome": "running" if (job or m) else "reported"}
+        self.ledger[rec["id"]] = rec
+        self._ledger_write(rec)
+        self.emit("record.added", session=session.name, record=rec["id"], owner=rec["owner"])
+        return rec
+
+    def _set_outcome(self, match, outcome: str) -> None:
+        for rec in self.ledger.values():
+            if rec["outcome"] == "running" and match(rec):
+                rec["outcome"] = outcome
+                self._ledger_write({"outcome_of": rec["id"], "outcome": outcome})
+
+    def _job_outcome(self, job: Job) -> None:
+        restored = (job.atomic or {}).get("outcome") == "restored"
+        outcome = "rolled_back" if restored else {"ok": "succeeded", "error": "failed"}.get(job.status, job.status)
+        self._set_outcome(lambda r: r["producer"].get("job") == job.id and r["producer"]["kind"] == "job", outcome)
+
+    async def op_record(self, req):
+        session = self._session(req["session"])
+        fields = {}
+        for k, v in (req.get("fields") or {}).items():
+            fields[k] = v[:200] if isinstance(v, str) else v
+        return {"record": self._add_record({"fields": fields, "key": req.get("key")}, session, owner=req.get("owner"))}
+
+    async def op_ledger(self, req):
+        recs = list(self.ledger.values())
+        if req.get("session"):
+            recs = [r for r in recs if r["session"] == req["session"]]
+        if req.get("owner"):
+            recs = [r for r in recs if r["owner"] == req["owner"]]
+        if req.get("outcome"):
+            recs = [r for r in recs if r["outcome"] == req["outcome"]]
+        for key in req.get("has") or []:
+            recs = [r for r in recs if key in r["fields"]]
+        for cond in req.get("where") or []:
+            k, _, v = cond.partition("=")
+            recs = [r for r in recs if str(r["fields"].get(k)) == v]
+        if req.get("sort"):
+            k = req["sort"].lstrip("-")
+            recs = [r for r in recs if isinstance(r["fields"].get(k), (int, float))]
+            recs.sort(key=lambda r: r["fields"][k], reverse=req["sort"].startswith("-"))
+        total = len(recs)
+        last = int(req.get("last") or 50)
+        recs = recs[:last] if req.get("sort") else recs[-last:]
+        alive = {s.ref for sess in self.sessions.values() for s in sess.snapshots.values()}
+        out = [{**r, "source_state": "none" if not r["source_snapshot"] else
+                ("kept" if r["source_snapshot"] in alive else "gone")} for r in recs]
+        return {"records": out, "total": total}
 
     # ---------------------------------------------------------------- events
 

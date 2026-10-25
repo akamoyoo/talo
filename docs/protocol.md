@@ -48,6 +48,7 @@ writes each one to a file next to the job's output file (`ID-N.png`, ...) and li
 |---|---|
 | `talo_vars_request` (`pattern`) | `variables`: list of `{name, type, nbytes, shape | len, dtype, columns, value}`; `rss` |
 | `talo_show_request` (`name`: a name, attribute or constant subscript such as `df.x` or `d["k"]`, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
+| `talo_record` (worker → supervisor, child of the running `execute_request`): `id`, `key`, `fields`, `modules` (source hashes) | – (added to the ledger) |
 | `talo_progress` (worker → supervisor, child of the running `execute_request`): `done`, `total`, `note` | – (stored as the job's `progress`) |
 | `talo_reload_request` (`modules`, `changed`, `root`, `dry_run`) | `selected`; unless `dry_run`: `modules` (`module`, `status`: reloaded / unchanged / failed / unsupported, `old_hash`, `new_hash`, `error`), `stale_bindings` (`name`, `kind`: definition / instance, `module`, `attribute`, `rebind`), `scan_scope` |
 | `talo_fingerprint_request` (`names`) | `fingerprints`: `{name: {"hash": hex} \| {"error": text}}` (BLAKE2b of the pickled object; see "Diff" in [design.md](design.md)) |
@@ -101,6 +102,8 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `brief` | `session`, `notes`, `jobs`, `vars` (how many of each) | `session`, `private_bytes`, `notes`, `snapshots`, `variables` (`largest`, `total`, or `skipped` while busy), `recent_jobs`, `active_jobs` |
 | `map` | `session`, `code`, `cases` or `range`, `from`, `parallel`, `timeout`, `memory_limit`, `case_memory_limit`, `max_result`, `key`, `expect_rev` | `map`: `{id, status (running / finished / interrupted / error), blocked, from, cases, finished_cases, running, counts, rows (first 50), rows_total, results (path of results.jsonl)}` |
 | `maps` | `session` | `maps` (summaries without rows) |
+| `record` | `session`, `fields`, `key` | `record` |
+| `ledger` | `session`, `owner`, `outcome`, `has` (list), `where` (list of `KEY=VALUE`), `sort` (`KEY` or `-KEY`), `last` | `records`: `{id, key, time, owner, session, session_id, producer ({kind: job / case / shell, ...}), rev, source_snapshot, source_state (kept / gone / none), code_hash, modules, fields, outcome}`, `total` |
 | `events` | `after` (cursor `EPOCH:SEQ`; default: now), `all`, `wait` (seconds), `session`, `type` (comma-separated), `limit` | `events`, `next` (cursor), `has_more`, `oldest`; `CursorExpired` for a cursor of another epoch or older than the journal |
 | `shutdown` | – | `stopping` |
 

@@ -89,3 +89,25 @@ def test_events_cursor_wait_and_filters(talo):
     talo("note", "hello")
     kinds = [e["type"] for e in run_json(talo, "events", "--after", cursor, "--limit", "50")[1]["events"]]
     assert "snapshot.created" in kinds and "note.added" in kinds
+
+
+def test_ledger_records_provenance_and_outcomes(talo):
+    talo("run", "x = 1")
+    talo("snap", "base")
+    talo("run", "talo.record(ic=0.012, factor='gap')")
+    talo("run", "--atomic", "talo.record(ic=0.5, factor='bad')\nraise ValueError('oops')")
+    talo("map", "--from", "base", "--range", "3", "talo.record(ic=case / 100, factor='m')\n1 / (case - 2)")
+    talo("record", "note=manual", "score=3")
+    rc, d = run_json(talo, "ledger", "--has", "ic", "--sort", "ic", "--desc")
+    recs = d["records"]
+    assert rc == 0 and [r["fields"]["ic"] for r in recs] == [0.5, 0.02, 0.012, 0.01, 0.0]
+    by_factor = {}
+    for r in recs:
+        by_factor.setdefault(r["fields"]["factor"], []).append(r)
+    assert by_factor["bad"][0]["outcome"] == "rolled_back"
+    assert by_factor["gap"][0]["outcome"] == "succeeded" and by_factor["gap"][0]["producer"]["kind"] == "job"
+    cases = {r["producer"]["index"]: r for r in by_factor["m"]}
+    assert cases[2]["outcome"] == "failed" and cases[0]["outcome"] == "succeeded"
+    assert cases[0]["source_snapshot"] == "default:s1" and cases[0]["source_state"] == "kept"
+    rc, d = run_json(talo, "ledger", "--where", "note=manual")
+    assert d["records"][0]["fields"]["score"] == 3 and d["records"][0]["outcome"] == "reported"

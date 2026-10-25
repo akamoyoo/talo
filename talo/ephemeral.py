@@ -17,7 +17,7 @@ class EphemeralFailed(RuntimeError):
 
 
 async def run(socket_path: str, code: str, output: str, *, bind: dict | None = None, case: dict | None = None,
-              json_limit: int = 65536, started=None) -> dict:
+              json_limit: int = 65536, started=None, on_message=None) -> dict:
     """Fork a worker from the snapshot listening on ``socket_path``, run ``code`` in it and return
     ``{status, pid, result (JSON or None), text (repr preview), error, elapsed_s}``. ``started(pid)`` is called once
     the worker exists (for accounting and interrupts). Cancelling the task kills the worker."""
@@ -52,7 +52,9 @@ async def run(socket_path: str, code: str, output: str, *, bind: dict | None = N
                 continue
             kind = wire.msg_type(got)
             content = got["content"]
-            if kind == "execute_result":
+            if kind in ("talo_record", "talo_progress") and on_message is not None:
+                on_message(kind, content)
+            elif kind == "execute_result":
                 meta = content.get("metadata", {})
                 out["text"] = content["data"].get("text/plain", "")[:2000]
                 j = meta.get("talo_json") or {}
