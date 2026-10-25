@@ -18,8 +18,48 @@ from talo import __version__
 from talo.client import TaloError, call
 
 SUPPORTED = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
-TEXT_LIMIT = 32_000   # characters of the JSON text copy of a result
+TEXT_LIMIT = 32_000   # characters of a result (structured content and its JSON text copy alike)
 OUTPUT_LINES = 40
+FAILED = {"error", "interrupted", "lost", "cancelled"}
+
+
+def bound(value, budget: list):
+    """A copy of ``value`` that stays valid JSON within roughly ``budget[0]`` characters: long strings and lists are
+    cut, with a note of how much was left out."""
+    if isinstance(value, str):
+        keep = max(200, min(len(value), budget[0] // 4))
+        budget[0] -= min(len(value), keep)
+        return value if len(value) <= keep else value[:keep] + f" ... [{len(value) - keep} characters cut]"
+    if isinstance(value, list):
+        out = []
+        for i, item in enumerate(value):
+            if budget[0] <= 0:
+                out.append(f"[{len(value) - i} more items cut]")
+                break
+            out.append(bound(item, budget))
+        return out
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            budget[0] -= len(str(k)) + 4
+            out[k] = bound(v, budget) if budget[0] > 0 else "[cut]"
+        return out
+    budget[0] -= 8
+    return value
+
+
+def failed(data: dict) -> bool:
+    """Whether a tool result reports failed work (a job, call or map still running is not a failure)."""
+    for key in ("job", "call"):
+        if isinstance(data.get(key), dict) and data[key].get("status") in FAILED:
+            return True
+    m = data.get("map")
+    if isinstance(m, dict):
+        if m.get("status") == "error":
+            return True
+        if m.get("status") in ("finished", "interrupted") and set(m.get("counts") or {}) - {"ok"}:
+            return True
+    return data.get("status") == "error"
 
 
 def _obj(props: dict, required: list[str] = ()) -> dict:
@@ -76,7 +116,7 @@ class Server:
     def __init__(self, session: str):
         self.session = session
         self.lock = threading.Lock()
-        self.initialized = False
+        self.version: str | None = None  # negotiated by initialize
 
     def write(self, msg: dict) -> None:
         line = json.dumps(msg, ensure_ascii=False, default=str)
@@ -101,20 +141,16 @@ class Server:
         if name == "run":
             job = call("run", session=s, code=a["code"], timeout=a.get("timeout", 30), atomic=a.get("atomic"),
                        key=a.get("key"), expect_rev=a.get("expect_rev"))
-            r = self._job_with_output(job)
-            return r, job["status"] in ("error", "interrupted", "lost", "cancelled")
+            return self._job_with_output(job), False
         if name == "wait":
             j = call("job", id=a["id"], wait=a.get("timeout", 30))
-            r = self._job_with_output(j)
-            status = (j.get("map") or j.get("call") or j).get("status")
-            return r, status in ("error", "interrupted", "lost", "cancelled")
+            return self._job_with_output(j), False
         if name == "interrupt":
             return call("interrupt", id=a["id"]), False
         if name in ("brief", "vars", "undo"):
             return call(name, session=s, **{k: v for k, v in a.items() if k != "session"}), False
         if name == "show":
-            r = call("show", session=s, name=a["name"], rows=a.get("rows", 10))
-            return r, r.get("status") == "error"
+            return call("show", session=s, name=a["name"], rows=a.get("rows", 10)), False
         if name == "snap":
             return call("snap", session=s, name=a.get("name"), message=a.get("message", ""), key=a.get("key")), False
         if name == "checkout":
@@ -126,11 +162,11 @@ class Server:
             r = call("map", session=s, code=a["code"], cases=a.get("cases"), range=a.get("range"),
                      parallel=a.get("parallel", 4), timeout=a.get("timeout", 30), key=a.get("key"),
                      **{"from": a.get("from")})
-            return r, r["map"]["status"] == "error"
+            return r, False
         if name == "call":
             r = call("call", service=a["service"], args=a.get("args") or {}, version=a.get("version"),
                      timeout=a.get("timeout", 30), key=a.get("key"))
-            return r, r["call"]["status"] in ("error", "lost")
+            return r, False
         if name == "record":
             return call("record", session=s, fields=a["fields"], key=a.get("key")), False
         if name == "ledger":
@@ -146,41 +182,66 @@ class Server:
 
     # ---------------------------------------------------------------- protocol
 
+    def lifecycle(self, msg) -> bool:
+        """Envelope checks and lifecycle messages, in order on the reading thread; True if ``msg`` is a request to
+        handle concurrently."""
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            self.write({"jsonrpc": "2.0", "id": mid, "error": {"code": -32600, "message": "invalid request"}})
+            return False
+        method, mid, params = msg["method"], msg.get("id"), msg.get("params") or {}
+        if mid is None:  # a notification (notifications/initialized, cancelled ...): never answered
+            return False
+        if method == "initialize":
+            if self.version is not None:
+                self.write({"jsonrpc": "2.0", "id": mid, "error": {"code": -32600, "message": "already initialized"}})
+                return False
+            asked = params.get("protocolVersion") if isinstance(params, dict) else None
+            self.version = asked if asked in SUPPORTED else SUPPORTED[0]
+            self.write({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": self.version, "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "talo", "version": __version__},
+                "instructions": (f"Tools act on resident Talo sessions (default: {self.session!r}). Data stays in "
+                                 "memory between calls; snapshot before risky changes.")}})
+            return False
+        if self.version is None and method != "ping":
+            self.write({"jsonrpc": "2.0", "id": mid, "error": {"code": -32002, "message": "not initialized"}})
+            return False
+        return True
+
     def handle(self, msg: dict) -> None:
         method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
-        if mid is None:  # a notification: never answered
-            if method == "notifications/initialized":
-                self.initialized = True
-            return
         try:
-            if method == "initialize":
-                asked = params.get("protocolVersion")
-                version = asked if asked in SUPPORTED else SUPPORTED[0]
-                result = {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}},
-                          "serverInfo": {"name": "talo", "version": __version__},
-                          "instructions": (f"Tools act on resident Talo sessions (default: {self.session!r}). Data "
-                                           "stays in memory between calls; snapshot before risky changes.")}
-            elif method == "ping":
+            if method == "ping":
                 result = {}
             elif method == "tools/list":
                 result = {"tools": [{"name": n, "description": d, "inputSchema": schema}
                                     for n, (d, schema) in TOOLS.items()]}
             elif method == "tools/call":
                 name, args = params.get("name"), params.get("arguments") or {}
+                if not isinstance(args, dict):
+                    return self.write({"jsonrpc": "2.0", "id": mid,
+                                       "error": {"code": -32602, "message": "arguments must be an object"}})
+                unknown = set(args) - set(TOOLS.get(name, ("", {"properties": {}}))[1]["properties"])
+                if name in TOOLS and unknown:
+                    return self.write({"jsonrpc": "2.0", "id": mid, "error": {
+                        "code": -32602, "message": f"unknown arguments for {name}: {', '.join(sorted(unknown))}"}})
                 if name not in TOOLS:
                     return self.write({"jsonrpc": "2.0", "id": mid,
                                        "error": {"code": -32602, "message": f"unknown tool {name!r}"}})
                 try:
                     data, is_error = self.tool(name, args)
+                    is_error = is_error or failed(data)
                 except TaloError as error:
                     data, is_error = {"error": {"type": error.type, "message": str(error)}}, True
                 except (KeyError, TypeError, ValueError) as error:
                     data, is_error = {"error": {"type": "BadArgument", "message": str(error)}}, True
-                text = json.dumps(data, ensure_ascii=False, default=str)
-                if len(text) > TEXT_LIMIT:
-                    text = text[:TEXT_LIMIT] + f" ... [{len(text) - TEXT_LIMIT} characters cut]"
-                result = {"content": [{"type": "text", "text": text}],
-                          "structuredContent": json.loads(json.dumps(data, default=str)), "isError": is_error}
+                data = json.loads(json.dumps(data, default=str))
+                if len(json.dumps(data)) > TEXT_LIMIT:
+                    data = bound(data, [TEXT_LIMIT])
+                    data["talo_truncated"] = True
+                result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
+                          "structuredContent": data, "isError": is_error}
             else:
                 return self.write({"jsonrpc": "2.0", "id": mid,
                                    "error": {"code": -32601, "message": f"method {method!r} not supported"}})
@@ -197,7 +258,8 @@ class Server:
             except ValueError:
                 self.write({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
                 continue
-            threading.Thread(target=self.handle, args=(msg,), daemon=True).start()
+            if self.lifecycle(msg):
+                threading.Thread(target=self.handle, args=(msg,), daemon=True).start()
         return 0  # end of input: detach; sessions and jobs keep running
 
 

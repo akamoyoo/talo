@@ -79,6 +79,14 @@ def memory(pid: int | None) -> dict | None:
     return out or None
 
 
+DISPLAY_MARK_RE = __import__("re").compile("\x1b\\]5379;talo-display=\\d+\x07")
+
+
+def strip_marks(text: str) -> str:
+    """Output text without the display markers the worker writes (see Worker.display_bundle)."""
+    return DISPLAY_MARK_RE.sub("", text)
+
+
 def blake(text: str) -> str:
     import hashlib
     return hashlib.blake2b(text.encode(errors="replace"), digest_size=12).hexdigest()
@@ -150,6 +158,7 @@ class Job:
     staged: list = field(default_factory=list)  # services staged with talo.expose, published if the job succeeds
     published: dict | None = None              # {"versions": [...]} or {"error": ...} after publication
     autosnap: dict | None = None               # the snapshot taken after it by talo autosnap
+    user_expressions: dict | None = None       # Jupyter user_expressions evaluated after the code
     progress: dict | None = None               # the last talo.progress() of a running job
     progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
@@ -159,7 +168,8 @@ class Job:
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "displays", "owner", "key",
-                                            "rev", "atomic", "termination", "phase", "published", "autosnap")}
+                                            "rev", "atomic", "termination", "phase", "published", "autosnap",
+                                            "user_expressions")}
         out["progress"] = self.progress
         if self.status == "running":
             out["last_progress_age_s"] = round(time.monotonic() - self.progress_at, 1) if self.progress_at else None
@@ -330,6 +340,8 @@ class Session:
         self.on_handoff = None                       # set by the supervisor: run a queued handoff
         self.on_finish = lambda job: None            # set by the supervisor: fill in the outcome of the job's records  # set by the supervisor: append to the event journal
         self.autosnap: dict | None = None  # {"keep": N} while talo autosnap is on
+        self.counts: list = []             # execution counts of finished executions, latest last
+        self.resolve = None                # set by the supervisor: "session:id" -> Snapshot (any session)
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
         self.tasks: list[asyncio.Task] = []
@@ -501,16 +513,21 @@ class Session:
                 job.rev = self.rev
                 self.owners[job.id] = job.owner
                 if job.kind == "execute":
+                    autosnap = self.autosnap  # the setting when the job started, whatever changes meanwhile
                     status = await (self._execute_atomic(job) if job.params.get("atomic") else self._execute(job))
                     if status == "ok" and job.staged:
                         await self._publish(job)
-                    if status == "ok" and self.autosnap and job.execution_count and not job.params.get("silent"):
-                        await self._autosnap(job)
+                    if status == "ok" and autosnap and job.execution_count and not job.params.get("silent"):
+                        await self._autosnap(job, autosnap)
                     self._finish(job, status)
                 elif job.kind == "snap":
                     self._finish(job, "ok", result=(await self._snap(**job.params, owner=job.owner)).to_dict())
                 elif job.kind == "checkout":
                     self._finish(job, "ok", result=await self._checkout(**job.params, owner=job.owner))
+                elif job.kind == "autosnap":
+                    self._finish(job, "ok", result=await self._set_autosnap(**job.params))
+                elif job.kind == "undo":
+                    self._finish(job, "ok", result=await self._undo(job))
                 elif job.kind == "handoff":
                     self._finish(job, "ok", result=await self.on_handoff(job))
                 elif job.kind == "fork":  # an internal snapshot of the current state, for map
@@ -547,8 +564,10 @@ class Session:
             job.error = {"ename": "SessionDead", "evalue": self.death, "traceback": []}
             return "lost"
         silent = bool(job.params.get("silent"))
-        msg = wire.message("execute_request", {"code": job.code, "silent": silent, "store_history": not silent,
-                                               "user_expressions": {}, "allow_stdin": False, "stop_on_error": True},
+        msg = wire.message("execute_request", {"code": job.code, "silent": silent,
+                                               "store_history": job.params.get("store_history", True) and not silent,
+                                               "user_expressions": job.params.get("user_expressions") or {},
+                                               "allow_stdin": False, "stop_on_error": True},
                            session=self.name, metadata={"talo_output": job.output, "talo_job": job.id})
         job.phase, job.exec_pid = "executing", self.worker_pid
         q = self._send(msg)
@@ -567,7 +586,8 @@ class Session:
                 elif kind == "display_data":
                     meta = got["content"].get("metadata", {})
                     job.outputs += [{"mime": m, "path": p} for m, p in meta.get("talo_files", {}).items()]
-                    job.displays.append({"offset": meta.get("talo_offset"), "end": meta.get("talo_end"),
+                    job.displays.append({"n": meta.get("talo_display"), "offset": meta.get("talo_offset"),
+                                         "end": meta.get("talo_end"),
                                          "data": {k: v for k, v in got["content"]["data"].items()},
                                          "files": meta.get("talo_files", {})})
                 elif kind == "error":
@@ -581,6 +601,7 @@ class Session:
                         job.staged.append(got["content"]["name"])
                 elif kind == "execute_reply":
                     status = got["content"]["status"]
+                    job.user_expressions = got["content"].get("user_expressions") or None
                     job.metrics = dict(got.get("metadata", {}))
                     if status == "error" and job.interrupt_requested and (job.error or {}).get("ename") == "KeyboardInterrupt":
                         status = "interrupted"
@@ -589,6 +610,7 @@ class Session:
                         job.error = {"ename": "MemoryLimit", "traceback": [],
                                      "evalue": "the session went over its memory limit; the job caught the interrupt"}
                     self.jobs_since_base.append(job.id)
+                    self.counts.append(job.execution_count)
                     return status
         finally:
             job.exec_pid = None
@@ -677,27 +699,53 @@ class Session:
     def held(self) -> list:
         return [*self.snapshots.values(), *self.internal_snaps, *([self.checkpoint] if self.checkpoint else [])]
 
-    async def _autosnap(self, job: Job) -> None:
-        """talo autosnap: a snapshot after each successful execution, named @N, the last `keep` kept."""
+    async def _autosnap(self, job: Job, config: dict) -> None:
+        """talo autosnap: a snapshot after each successful execution, named @N, the last `keep` kept. Manual
+        snapshots are never replaced; an automatic @N of an abandoned branch is replaced only once the new one
+        exists."""
         name = f"@{job.execution_count}"
-        old = self.find(name, missing_ok=True)
-        if old is not None:  # the same count on an abandoned branch (after a checkout)
-            if old.pins or old.ref == self.base:
-                name = f"@{job.execution_count}.{job.id}"
-            else:
-                self.drop(old)
         try:
-            snap = await self._snap(name, message=f"after execution {job.execution_count} (job {job.id})",
-                                    owner=job.owner)
+            snap = await self._snap(f"@{job.execution_count}.{job.id}",
+                                    message=f"after execution {job.execution_count} (job {job.id})", owner=job.owner)
         except Exception as error:  # noqa: BLE001 - the code ran; only the snapshot failed
             job.autosnap = {"error": f"{type(error).__name__}: {error}"}
             return
         snap.auto = True
+        old = self.find(name, missing_ok=True)
+        if old is None:
+            snap.name = name
+        elif old.auto and not old.pins:
+            self.drop(old)
+            snap.name = name
         job.autosnap = {"snapshot": snap.ref, "name": snap.name}
         autos = [s for s in self.snapshots.values() if s.auto]
-        for s in autos[:-self.autosnap["keep"]]:
+        for s in autos[:-config["keep"]]:
             if not s.pins and s.ref != self.base:
                 self.drop(s)
+
+    async def _set_autosnap(self, on: bool, keep: int) -> dict:
+        """In the queue: the setting and its baseline describe the same state."""
+        baseline = None
+        was_on = self.autosnap is not None
+        self.autosnap = {"keep": max(1, int(keep or 10))} if on else None
+        if on and not was_on and (self.base is None or self.jobs_since_base):
+            counts = [n for n in self.counts if n]
+            name = f"@{counts[-1] if counts else 0}"
+            if self.find(name, missing_ok=True) is not None:
+                name = f"{name}.base"
+            snap = await self._snap(name, message="autosnap baseline")
+            snap.auto = True
+            baseline = snap.ref
+        return {"session": self.name, "autosnap": self.autosnap, "baseline": baseline}
+
+    async def _undo(self, job: Job) -> dict:
+        """In the queue, so the target is decided after the jobs before it: the base if jobs ran since it, else the
+        base's parent (possibly in another session, for a branch)."""
+        target = self.base if self.jobs_since_base else (self.resolve(self.base).parent if self.base else None)
+        if not target:
+            raise RuntimeError("nothing to undo: no snapshot before the last execution (`talo autosnap on` takes one "
+                               "after every execution)")
+        return await self._checkout(self.resolve(target), discard=True, owner=job.owner)
 
     async def _publish(self, job: Job) -> None:
         """Publish the services a successful job staged, as new versions on one snapshot of the state it left."""
@@ -985,6 +1033,7 @@ class Supervisor:
         session.on_record = lambda job, content: self._add_record(content, session, job=job)
         session.on_finish = self._job_outcome
         session.on_handoff = lambda job: self._do_handoff(session, job)
+        session.resolve = lambda ref: self._snapshot(ref, session.name)
         session.on_publish = lambda job, snap: self._register_versions(session, job, snap)
         self.sessions[name] = session
         try:
@@ -1041,7 +1090,8 @@ class Supervisor:
     async def op_run(self, req):
         session = self._session(req["session"])
         fingerprint = {"op": "run", "code": req["code"], "expect_rev": req.get("expect_rev"),
-                       "atomic": bool(req.get("atomic"))}
+                       "atomic": bool(req.get("atomic")), "silent": bool(req.get("silent")),
+                       "store_history": req.get("store_history", True)}
         if job := self._deduplicated(session, req, fingerprint):
             return {**await self._wait(job, req.get("timeout", 30)), "deduplicated": True}
         if session.state == "dead":
@@ -1050,7 +1100,9 @@ class Supervisor:
         job = await self._submit(session, "execute", req["code"], owner=req.get("owner"), key=req.get("key"),
                                  fingerprint=fingerprint, expect_rev=req.get("expect_rev"),
                                  **({"atomic": True} if req.get("atomic") else {}),
-                                 **({"silent": True} if req.get("silent") else {}))
+                                 **({"silent": True} if req.get("silent") else {}),
+                                 **({"store_history": False} if req.get("store_history") is False else {}),
+                                 **({"user_expressions": req["user_expressions"]} if req.get("user_expressions") else {}))
         return await self._wait(job, req.get("timeout", 30))
 
     async def op_job(self, req):
@@ -1078,8 +1130,11 @@ class Supervisor:
         with open(path, "rb") as f:
             f.seek(offset)
             data = f.read(max(0, min(limit, size - offset)))  # read(n) allocates n bytes up front
-        return {"id": job.id, "offset": offset, "next_offset": offset + len(data), "size": size,
-                "text": data.decode(errors="replace"), "status": job.status}
+        out = {"id": job.id, "offset": offset, "next_offset": offset + len(data), "size": size, "status": job.status}
+        if req.get("raw"):  # bytes as base64: the reader decodes incrementally (UTF-8 split across reads)
+            import base64
+            return {**out, "data": base64.b64encode(data).decode()}
+        return {**out, "text": strip_marks(data.decode(errors="replace"))}
 
     async def op_interrupt(self, req):
         if str(req["id"]) in self.calls:
@@ -1197,35 +1252,14 @@ class Supervisor:
 
     async def op_autosnap(self, req):
         session = self._session(req["session"])
-        baseline = None
-        if req.get("on") is not None:
-            was_on = session.autosnap is not None
-            session.autosnap = {"keep": max(1, int(req.get("keep") or 10))} if req["on"] else None
-            if req["on"] and not was_on and (session.base is None or session.jobs_since_base):
-                # a baseline, so that the first undo has a state to return to
-                counts = [j.execution_count for j in self.jobs.values()
-                          if j.session_id == session.id and j.kind == "execute" and j.execution_count]
-                out = await self._control(session, "snap", req.get("timeout", 300), {}, name=f"@{counts[-1] if counts else 0}",
-                                          message="autosnap baseline", strict=False)
-                if "job" not in out:
-                    session.find(out["name"]).auto = True
-                    baseline = out["ref"]
-        return {"session": session.name, "autosnap": session.autosnap, "baseline": baseline}
+        if req.get("on") is None:
+            return {"session": session.name, "autosnap": session.autosnap, "baseline": None}
+        return await self._control(session, "autosnap", req.get("timeout", 300), req, on=bool(req["on"]),
+                                   keep=req.get("keep") or 10)
 
     async def op_undo(self, req):
-        """Check out the state before the last execution: the base if jobs ran since it, else the base's parent."""
         session = self._session(req["session"])
-        if session.jobs_since_base:
-            target = session.base
-        else:
-            base = session.find(session.base.partition(":")[2], missing_ok=True) if session.base else None
-            target = base.parent if base else None
-        if not target:
-            raise RuntimeError("nothing to undo: no snapshot before the last execution (`talo autosnap on` takes one "
-                               "after every execution)")
-        snap = self._snapshot(target, session.name)
-        return await self._control(session, "checkout", req.get("timeout", 300), req, snap=snap, discard=True,
-                                   save_as=None)
+        return await self._control(session, "undo", req.get("timeout", 300), req)
 
     async def op_drop(self, req):
         session = self._session(req["session"])

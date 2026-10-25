@@ -157,3 +157,50 @@ def test_a_notebook_runs_through_jupyters_kernel_manager(talo, tmp_path, monkeyp
     assert "snapshot from_notebook" in nb.cells[-1].outputs[0]["text"]
     rc = subprocess.run([sys.executable, "-m", "talo.cli", "snaps", "--json"], capture_output=True, text=True)
     assert "from_notebook" in rc.stdout                            # the session itself, seen from the CLI
+
+
+def test_wire_robustness_replays_and_control(kernel):
+    kc = kernel()
+    sock = kc.shell_channel.socket
+    sock.send_multipart([b"garbage"])                                         # no delimiter
+    sock.send_multipart([b"<IDS|MSG>", b"sig", b"{", b"{}", b"{}", b"{}"])    # bad signature / JSON
+    reply, outs = run(kc, "1 + 1")
+    assert reply["status"] == "ok"                                            # the channel survived
+    msg = kc.session.msg("execute_request", {"code": "n = globals().get('n', 0) + 1", "silent": False,
+                                             "store_history": True, "user_expressions": {}, "allow_stdin": False})
+    kc.shell_channel.send(msg)
+    kc.get_shell_msg(timeout=30)
+    kc.session.send(kc.shell_channel.socket, msg)                             # the same signed message again
+    reply, outs = run(kc, "n", timeout=30)
+    assert [c for t, c in outs if t == "execute_result"][0]["data"]["text/plain"] == "1"   # the replay was dropped
+    kc.control_channel.send(kc.session.msg("execute_request", {"code": "n = 100"}))       # not on control
+    reply, outs = run(kc, "n")
+    assert [c for t, c in outs if t == "execute_result"][0]["data"]["text/plain"] == "1"
+
+
+def test_utf8_options_and_stop_on_error(kernel, talo):
+    kc = kernel()
+    reply, outs = run(kc, "import sys\nfor ch in 'héllo wörld ✓':\n    sys.stdout.write(ch)\n    sys.stdout.flush()\nprint()")
+    assert text(outs) == "héllo wörld ✓\n"
+    msg_id = kc.execute("y = 7", user_expressions={"double": "y * 2"})
+    while True:
+        m = kc.get_shell_msg(timeout=30)
+        if m["parent_header"].get("msg_id") == msg_id:
+            break
+    assert m["content"]["user_expressions"]["double"]["data"]["text/plain"] == "14"
+    first = kc.execute("raise ValueError('stop')")
+    second = kc.execute("z = 1")                       # queued behind a failing cell: aborted
+    replies = {}
+    while len(replies) < 2:
+        m = kc.get_shell_msg(timeout=30)
+        replies[m["parent_header"]["msg_id"]] = m["content"]["status"]
+    assert replies == {first: "error", second: "aborted"}
+    rc = subprocess.run([sys.executable, "-m", "talo.cli", "run", "-s", "nb", "'z' in globals()", "--json"],
+                        capture_output=True, text=True)
+    assert json.loads(rc.stdout)["job"]["result"]["data"]["text/plain"] == "False"
+    run(kc, "class H:\n    def _repr_html_(self):\n        return '<i>x</i>'\ndisplay(H())")
+    jobs = json.loads(subprocess.run([sys.executable, "-m", "talo.cli", "jobs", "-s", "nb", "--last", "1", "--json"],
+                                     capture_output=True, text=True).stdout)["jobs"]
+    out = subprocess.run([sys.executable, "-m", "talo.cli", "tail", jobs[-1]["id"], "--all"], capture_output=True,
+                         text=True).stdout
+    assert "\x1b]" not in out and "<__main__.H object" in out  # the CLI never shows the display markers

@@ -51,6 +51,7 @@ RESULT_LIMIT = 100_000  # characters of a result's text/plain kept; longer resul
 TRACEBACK_LIMIT = 50_000
 CELL_FILENAME = "<talo-{n}>"
 SHOW_TIMEOUT = 60.0  # seconds an inspection may take before its fork is killed
+DISPLAY_MARK = "\x1b]5379;talo-display={n}\x07"  # OSC sequence marking a display in the output (ignored by terminals)
 OUT_KEEP = 3  # results kept in Out (as IPython's _, __, ___); `_` is the last one
 
 
@@ -728,6 +729,7 @@ class Worker:
         self.parent: dict | None = None    # the execute_request being run, for display_data
         self.out_path: str | None = None   # its output file; images are written next to it
         self.files = 0
+        self.displays = 0
         self.pyplot_patched = False
         self.services: dict = {}  # name -> function exposed with talo.expose
         self.reloader = Reloader()
@@ -747,12 +749,33 @@ class Worker:
         its images to files."""
         for obj in objs:
             data, meta = mime_bundle(obj, self.save if self.out_path else None)
-            start = self.output_offset()
-            if "talo_files" not in meta:
+            self.display_bundle(data, meta, print_text="talo_files" not in meta)
+
+    def display_bundle(self, data: dict, meta: dict, print_text: bool) -> None:
+        """Send a display_data. Its place among the printed output is a marker written into the output file
+        (``DISPLAY_MARK``, an escape sequence terminals ignore), so a front end can put it exactly where it happened;
+        its text representation follows the marker, for the CLI, and ``talo_end`` says where that text ends."""
+        self.displays += 1
+        meta["talo_display"] = self.displays
+        start = self.output_offset()
+        if start is not None:
+            sys.stdout.write(DISPLAY_MARK.format(n=self.displays))
+            if print_text:
                 print(data["text/plain"])  # the CLI shows the text in place; Jupyter front ends show the bundle
             meta["talo_offset"], meta["talo_end"] = start, self.output_offset()
-            if self.parent is not None:
-                self.send("display_data", {"data": data, "metadata": meta, "transient": {}}, self.parent)
+        if self.parent is not None:
+            self.send("display_data", {"data": data, "metadata": meta, "transient": {}}, self.parent)
+
+    def user_expressions(self, expressions: dict) -> dict:
+        """Jupyter's user_expressions: each evaluated after the code, as a mime bundle or an error."""
+        out = {}
+        for name, expr in expressions.items():
+            try:
+                data, meta = mime_bundle(eval(compile(str(expr), "<user-expression>", "eval"), self.namespace))
+                out[name] = {"status": "ok", "data": data, "metadata": meta}
+            except Exception as error:  # noqa: BLE001
+                out[name] = {"status": "error", "ename": type(error).__name__, "evalue": str(error), "traceback": []}
+        return out
 
     def output_offset(self) -> int | None:
         """Bytes written to the job's output so far: where a display sits among the printed text."""
@@ -784,10 +807,7 @@ class Worker:
                 print(f"[talo: figure {num} could not be saved: {type(error).__name__}: {error}]", file=sys.stderr)
                 continue
             path = self.save(buf.getvalue(), ".png")
-            at = self.output_offset()
-            self.send("display_data", {"data": {"text/plain": repr(fig)},
-                                       "metadata": {"talo_files": {"image/png": path}, "talo_offset": at, "talo_end": at},
-                                       "transient": {}}, self.parent)
+            self.display_bundle({"text/plain": repr(fig)}, {"talo_files": {"image/png": path}}, print_text=False)
         plt.close("all")
 
     def send(self, msg_type: str, content: dict, parent: dict, metadata: dict | None = None) -> None:
@@ -815,13 +835,14 @@ class Worker:
         content, meta = msg["content"], msg["metadata"]
         code = content.get("code", "")
         silent = bool(content.get("silent", False))
-        if not silent:
+        store = content.get("store_history", True) and not silent
+        if store:
             self.execution_count += 1
         n = self.execution_count
         self.status("busy", msg)
         self.send("execute_input", {"code": code, "execution_count": n}, msg)
         out_path = meta.get("talo_output")
-        self.parent, self.out_path, self.files = msg, out_path, 0
+        self.parent, self.out_path, self.files, self.displays = msg, out_path, 0, 0
         if "talo_bind" in meta:  # an ephemeral worker: names the code expects (map's `case`)
             self.namespace.update(meta["talo_bind"])
             self.namespace["talo"].case = meta.get("talo_case")
@@ -842,13 +863,13 @@ class Worker:
             has_value, value = self.run_code(code, n)
             if has_value and value is not None:
                 result = value
-                if not silent:
+                if store:
                     self.namespace["_"] = value
                     out = self.namespace["Out"]
                     out[n] = value
                     for k in sorted(out)[:-OUT_KEEP]:  # older results would pin large objects in memory
                         del out[k]
-            if not silent:
+            if store:
                 self.namespace["In"].append(code)
         except BaseException as error:  # noqa: BLE001 - report KeyboardInterrupt / SystemExit instead of exiting
             frames = traceback.TracebackException.from_exception(error)
@@ -879,6 +900,8 @@ class Worker:
             self.send("execute_result", {"execution_count": n, "data": data, "metadata": data_meta}, msg)
         metrics = {"talo_duration_s": round(time.time() - started, 6), "talo_rss_before": rss_before,
                    "talo_rss_after": rss_bytes()}
+        if reply["status"] == "ok" and content.get("user_expressions"):
+            reply["user_expressions"] = self.user_expressions(content["user_expressions"])
         self.send("execute_reply", reply, msg, metadata=metrics)
         self.status("idle", msg)
 

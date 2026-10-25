@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 from pathlib import Path
 
@@ -78,7 +79,7 @@ def _stream(path: str | None) -> list:
     if len(data) > STREAM_LIMIT:
         note = f"[talo: {len(data) - STREAM_LIMIT} earlier bytes cut]\n"
         data = data[-STREAM_LIMIT:]
-    text = note + data.decode(errors="replace")
+    text = note + re.sub("\x1b\\]5379;talo-display=\\d+\x07", "", data.decode(errors="replace"))  # display markers
     return [{"output_type": "stream", "name": "stdout", "text": text.splitlines(keepends=True)}] if text else []
 
 

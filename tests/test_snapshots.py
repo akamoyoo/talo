@@ -188,3 +188,17 @@ def test_autosnap_baseline_makes_the_first_undo_work(talo):
     talo("run", "x = 'after'")
     talo("undo")
     assert run_json(talo, "show", "x")[1]["text"] == "'before'"
+
+
+def test_autosnap_never_replaces_manual_snapshots_and_undo_waits_its_turn(talo):
+    talo("run", "import time\nx = 0")
+    talo("snap", "@3")                                   # a manual snapshot with an autosnap-like name
+    talo("autosnap", "on")
+    talo("run", "x = 1")                                 # execution 2
+    talo("run", "x = 2")                                 # execution 3: must not replace the manual @3
+    rc, snaps = run_json(talo, "snaps")
+    by = {s["name"]: s for s in snaps["snapshots"]}
+    assert not by["@3"]["auto"] and any(n.startswith("@3.") for n in by)
+    talo("run", "time.sleep(2)\nx = 3", "-t", "0")     # running when undo is submitted
+    rc, out = run_json(talo, "undo", "-t", "60")
+    assert rc == 0 and run_json(talo, "show", "x")[1]["text"] == "2"   # only the last execution was undone

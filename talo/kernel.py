@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import codeop
 import contextlib
 import hashlib
@@ -29,6 +30,8 @@ from talo import wire
 from talo.client import TaloError, call
 
 DELIM = b"<IDS|MSG>"
+MARK = re.compile("\x1b\\]5379;talo-display=(\\d+)\x07")  # display markers in a job's output (worker.DISPLAY_MARK)
+CONTROL_TYPES = {"interrupt_request", "shutdown_request", "kernel_info_request"}
 POLL_S = 0.1
 IMAGE_MIMES = ("image/png", "image/jpeg", "image/svg+xml")
 MAGIC_HELP = """Talo commands (a cell of lines that all start with %):
@@ -51,12 +54,20 @@ class Bridge:
         self.session = session
         self.python, self.cwd = python, cwd
         self.key = connection.get("key", "").encode()
+        scheme = connection.get("signature_scheme", "hmac-sha256")
+        if not scheme.startswith("hmac-") or scheme[5:] not in hashlib.algorithms_available:
+            raise SystemExit(f"talo kernel: unsupported signature scheme {scheme!r}")
+        self.digest = scheme[5:]
+        self.seen_ids: dict[str, None] = {}  # msg_ids of recent messages, to refuse replays
+        self.pending_interrupt = False
         self.ctx = zmq.asyncio.Context()
         self.id = uuid.uuid4().hex
         self.mine: set[str] = set()
         self.seen = 0
         self.notice: str | None = None
         self.running: str | None = None  # the job id of the execution in progress
+        self.submitting = False          # between receiving an execute_request and knowing its job id
+        self.abort_queued = False
 
     # ---------------------------------------------------------------- wire
 
@@ -68,7 +79,7 @@ class Bridge:
     def _sign(self, parts: list[bytes]) -> bytes:
         if not self.key:
             return b""
-        h = hmac.new(self.key, digestmod=hashlib.sha256)
+        h = hmac.new(self.key, digestmod=self.digest)
         for p in parts:
             h.update(p)
         return h.hexdigest().encode()
@@ -83,11 +94,29 @@ class Bridge:
         await sock.send_multipart([*(idents or []), DELIM, self._sign(parts), *parts])
 
     def recv_parse(self, frames: list[bytes]) -> tuple[list[bytes], dict | None]:
-        i = frames.index(DELIM)
-        idents, sig, parts = frames[:i], frames[i + 1], frames[i + 2:i + 6]
-        if self.key and not hmac.compare_digest(sig, self._sign(parts)):
-            return idents, None  # bad signature: ignored, as the spec requires
-        header, parent, metadata, content = (json.loads(p) for p in parts)
+        """(routing identities, message), or (…, None) for a frame set that is malformed, wrongly signed or a
+        replay: those are dropped, as the specification requires."""
+        try:
+            i = frames.index(DELIM)
+        except ValueError:
+            return [], None
+        idents, sig, parts = frames[:i], frames[i + 1:i + 2], frames[i + 2:i + 6]
+        if len(parts) < 4 or not sig:
+            return idents, None
+        if self.key and not hmac.compare_digest(sig[0], self._sign(parts)):
+            return idents, None
+        try:
+            header, parent, metadata, content = (json.loads(p) for p in parts)
+        except ValueError:
+            return idents, None
+        if not all(isinstance(x, dict) for x in (header, parent, metadata, content)) or "msg_type" not in header:
+            return idents, None
+        msg_id = str(header.get("msg_id"))
+        if msg_id in self.seen_ids:  # an authenticated message seen before: a replay
+            return idents, None
+        self.seen_ids[msg_id] = None
+        if len(self.seen_ids) > 10_000:
+            self.seen_ids.pop(next(iter(self.seen_ids)))
         return idents, {"header": header, "parent_header": parent, "metadata": metadata, "content": content}
 
     async def iopub(self, msg_type: str, content: dict, parent: dict | None) -> None:
@@ -144,45 +173,45 @@ class Bridge:
         self.notice = None
         if prefix and not silent:
             await self.stream(prefix, msg)
-        lines = [ln for ln in code.splitlines() if ln.strip()]
+        lines = [ln for ln in code.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
         if lines and all(ln.lstrip().startswith("%") for ln in lines):
-            return await self.magics(lines, msg)
-        job = await self.talo("run", session=self.session, code=code, timeout=0, silent=silent)
+            reply = await self.magics(lines, msg, silent)
+        else:
+            reply = await self.execute_code(msg, code, silent, content)
+        if reply[0]["status"] == "error" and content.get("stop_on_error", True):
+            self.abort_queued = True
+        return reply
+
+    async def execute_code(self, msg: dict, code: str, silent: bool, content: dict) -> tuple[dict, dict]:
+        self.submitting = True
+        try:
+            job = await self.talo("run", session=self.session, code=code, timeout=0, silent=silent,
+                                  store_history=content.get("store_history", True),
+                                  user_expressions=content.get("user_expressions") or None)
+        finally:
+            self.submitting = False
         self.mine.add(job["id"])
         self.running = job["id"]
-        offset, count_sent, shown = 0, False, 0
+        if self.pending_interrupt:  # an interrupt arrived while the job was being submitted
+            self.pending_interrupt = False
+            await self.talo("interrupt", id=job["id"])
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        offset, count_sent, buffered = 0, False, ""
         try:
             while True:
                 j = await self.talo("job", id=job["id"])
                 if not count_sent and j.get("execution_count") and not silent:
                     await self.iopub("execute_input", {"code": code, "execution_count": j["execution_count"]}, msg)
                     count_sent = True
-                displays = [d for d in j.get("displays") or [] if d.get("offset") is not None]
-                # stream the text up to the next display, then the display, then the text after it
-                while True:
-                    nxt = displays[shown] if shown < len(displays) else None
-                    limit = (nxt["offset"] - offset) if nxt else 1 << 20
-                    if limit > 0:
-                        out = await self.talo("output", id=job["id"], offset=offset, max_bytes=limit)
-                        if out["text"] and not silent:
-                            await self.stream(out["text"], msg)
-                        offset = out["next_offset"]
-                    if nxt and offset >= nxt["offset"]:
-                        if not silent:
-                            await self.send_display(nxt, msg)
-                        offset, shown = max(offset, nxt.get("end") or offset), shown + 1
-                        continue
-                    break
                 done = j["status"] not in ("running", "queued")
-                if done:
-                    out = await self.talo("output", id=job["id"], offset=offset, max_bytes=1 << 20)
-                    if out["text"] and not silent:
-                        await self.stream(out["text"], msg)
-                    if out["next_offset"] >= out["size"]:
-                        break
-                    offset = out["next_offset"]
-                    continue
-                await asyncio.sleep(POLL_S)
+                out = await self.talo("output", id=job["id"], offset=offset, max_bytes=1 << 20, raw=True)
+                offset = out["next_offset"]
+                buffered += decoder.decode(base64.b64decode(out["data"]), final=done and offset >= out["size"])
+                buffered = await self.flush_until_mark(buffered, job["id"], msg, silent)
+                if done and offset >= out["size"]:
+                    break
+                if out["next_offset"] >= out["size"]:
+                    await asyncio.sleep(POLL_S)
         finally:
             self.running = None
         job = await self.talo("job", id=job["id"])
@@ -190,8 +219,9 @@ class Bridge:
         if not count_sent and not silent:
             await self.iopub("execute_input", {"code": code, "execution_count": n}, msg)
         if not silent:
-            for d in (job.get("displays") or [])[shown:]:  # displays without a position, if any
-                await self.send_display(d, msg)
+            for d in job.get("displays") or []:  # displays without a marker (no output file), if any
+                if d.get("offset") is None:
+                    await self.send_display(d, msg)
             result = job.get("result")
             if job["status"] == "ok" and result and "data" in result:
                 data = dict(result["data"])
@@ -200,13 +230,45 @@ class Bridge:
                         data[mime] = value
                 await self.iopub("execute_result", {"execution_count": n, "data": data, "metadata": {}}, msg)
         if job["status"] == "ok":
-            return {"status": "ok", "execution_count": n, "user_expressions": {}, "payload": []}, {}
+            return {"status": "ok", "execution_count": n, "user_expressions": job.get("user_expressions") or {},
+                    "payload": []}, {}
         error = job.get("error") or {"ename": job["status"], "evalue": "", "traceback": []}
         err = {"ename": error.get("ename") or job["status"], "evalue": str(error.get("evalue") or ""),
                "traceback": error.get("traceback") or [f"{error.get('ename')}: {error.get('evalue')}"]}
         if not silent:
             await self.iopub("error", err, msg)
         return {"status": "error", "execution_count": n, **err}, {}
+
+    async def flush_until_mark(self, text: str, job_id: str, msg: dict, silent: bool) -> str:
+        """Stream ``text`` up to each display marker, send that display (waiting for its message if needed) and
+        skip the text the worker printed for it; return what is left (a possibly incomplete marker)."""
+        while True:
+            m = MARK.search(text)
+            if m is None:
+                cut = text.rfind("\x1b")  # keep a marker that may be split across reads
+                head, rest = (text[:cut], text[cut:]) if cut >= 0 and "\x07" not in text[cut:] else (text, "")
+                if head and not silent:
+                    await self.stream(head, msg)
+                return rest
+            if m.start() and not silent:
+                await self.stream(text[:m.start()], msg)
+            number = int(m.group(1))
+            display = None
+            for _ in range(200):  # the display message follows its marker closely
+                j = await self.talo("job", id=job_id)
+                display = next((d for d in j.get("displays") or [] if d.get("n") == number), None)
+                if display is not None or j["status"] not in ("running", "queued"):
+                    break
+                await asyncio.sleep(0.02)
+            rest = text[m.end():]
+            if display is not None:
+                if not silent:
+                    await self.send_display(display, msg)
+                printed = (display.get("end") or 0) - (display.get("offset") or 0) - len(m.group(0).encode())
+                if printed > 0:  # the text the worker printed for the CLI: skip it (bytes → characters)
+                    skip = len(rest.encode()[:printed].decode(errors="ignore"))
+                    rest = rest[skip:]
+            text = rest
 
     @staticmethod
     def file_value(mime: str, path: str) -> str | None:
@@ -223,13 +285,20 @@ class Bridge:
                 data[mime] = value
         await self.iopub("display_data", {"data": data, "metadata": {}, "transient": {}}, msg)
 
-    async def magics(self, lines: list[str], msg: dict) -> tuple[dict, dict]:
+    async def magics(self, lines: list[str], msg: dict, silent: bool = False) -> tuple[dict, dict]:
         from talo.cli import main
         status = "ok"
         for line in lines:
-            words = shlex.split(line.lstrip()[1:])
+            try:
+                words = shlex.split(line.lstrip()[1:])
+            except ValueError as error:  # an unmatched quote
+                if not silent:
+                    await self.stream(f"{line.strip()}: {error}\n", msg, "stderr")
+                status = "error"
+                continue
             if not words or words[0] == "help":
-                await self.stream(MAGIC_HELP + "\n", msg)
+                if not silent:
+                    await self.stream(MAGIC_HELP + "\n", msg)
                 continue
             argv = [words[0], *words[1:]]
             if words[0] not in ("tree", "ls"):
@@ -248,14 +317,16 @@ class Bridge:
                 s = next((x for x in (await self.talo("ls"))["sessions"] if x["name"] == self.session), {})
                 text += (f"[state restored to {s.get('base')}; cells run after it are no longer in memory, "
                          "although the notebook still shows them]\n")
-            await self.stream(text, msg, "stdout" if code == 0 else "stderr")
+            if not silent:
+                await self.stream(text, msg, "stdout" if code == 0 else "stderr")
             if code not in (0, 3):
                 status = "error"
         jobs = (await self.talo("jobs", session=self.session, last=50))["jobs"]
         self.seen = max([self.seen, *(int(j["id"]) for j in jobs if str(j["id"]).isdigit())])
         if status == "error":
             err = {"ename": "TaloCommandFailed", "evalue": "a Talo command failed (see its output)", "traceback": []}
-            await self.iopub("error", err, msg)
+            if not silent:
+                await self.iopub("error", err, msg)
             return {"status": "error", "execution_count": 0, **err}, {}
         return {"status": "ok", "execution_count": 0, "user_expressions": {}, "payload": []}, {}
 
@@ -314,6 +385,8 @@ class Bridge:
         if msg is None:
             return
         kind = msg["header"]["msg_type"]
+        if control and kind not in CONTROL_TYPES:
+            return  # executions and inspections come on the shell channel only
         await self.status("busy", msg)
         try:
             if kind == "execute_request":
@@ -333,6 +406,8 @@ class Bridge:
             elif kind == "interrupt_request":
                 if self.running:
                     await self.talo("interrupt", id=self.running)
+                else:
+                    self.pending_interrupt = self.submitting  # applied as soon as the job id is known
                 content, meta = {"status": "ok"}, {}
             elif kind == "shutdown_request":
                 content, meta = {"status": "ok", "restart": msg["content"].get("restart", False)}, {}
@@ -341,9 +416,11 @@ class Bridge:
                 self.stop.set()  # the session keeps running: only the bridge exits
                 return
             else:
+                await self.status("idle", msg)  # unknown requests get no reply, but busy is always closed
                 return
-        except TaloError as error:
-            content, meta = {"status": "error", "ename": "TaloError", "evalue": str(error), "traceback": [str(error)]}, {}
+        except Exception as error:  # noqa: BLE001 - one bad request must not stop the channel
+            content, meta = {"status": "error", "ename": type(error).__name__, "evalue": str(error),
+                             "traceback": [f"{type(error).__name__}: {error}"]}, {}
         reply_type = kind.replace("_request", "_reply")
         await self.send(sock, self._msg(reply_type, content, msg, meta), idents)
         await self.status("idle", msg)
@@ -351,12 +428,35 @@ class Bridge:
     async def serve_shell(self) -> None:
         while not self.stop.is_set():
             frames = await self.shell.recv_multipart()
-            await self.handle(self.shell, frames)  # one request at a time, as a kernel's shell channel does
+            try:
+                await self.handle(self.shell, frames)  # one request at a time, as a kernel's shell channel does
+            except Exception as error:  # noqa: BLE001 - never let the channel die while heartbeat says we live
+                print(f"talo kernel: shell request failed: {error!r}", file=sys.stderr)
+            if self.abort_queued:
+                await self.abort_queue()
+
+    async def abort_queue(self) -> None:
+        """stop_on_error: execute requests already waiting when a cell failed are answered `aborted`."""
+        self.abort_queued = False
+        while await self.shell.poll(0):
+            frames = await self.shell.recv_multipart()
+            idents, msg = self.recv_parse(frames)
+            if msg is None:
+                continue
+            if msg["header"]["msg_type"] != "execute_request":
+                await self.handle(self.shell, frames)
+                continue
+            await self.status("busy", msg)
+            await self.send(self.shell, self._msg("execute_reply", {"status": "aborted", "execution_count": 0}, msg),
+                            idents)
+            await self.status("idle", msg)
 
     async def serve_control(self) -> None:
         while not self.stop.is_set():
             frames = await self.control.recv_multipart()
-            asyncio.create_task(self.handle(self.control, frames, control=True))
+            task = asyncio.create_task(self.handle(self.control, frames, control=True))
+            task.add_done_callback(lambda t: t.cancelled() or t.exception() and print(
+                f"talo kernel: control request failed: {t.exception()!r}", file=sys.stderr))
 
     async def serve_stdin(self) -> None:
         while not self.stop.is_set():
