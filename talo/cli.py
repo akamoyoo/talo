@@ -47,14 +47,59 @@ def emit(args, data: dict, human) -> None:
 
 # ---------------------------------------------------------------- jobs
 
+MAX_RESULT = 10_000
+
+
+def condense(text: str) -> str:
+    """Output as an agent should see it: lines rewritten with carriage returns (progress bars) keep their final
+    state, and runs of identical lines are folded into one with a count. The output file is never changed."""
+    rows = []
+    for line in text.split("\n"):
+        if "\r" in line:
+            parts = [x for x in line.split("\r") if x]
+            line = parts[-1] if parts else ""
+        rows.append(line)
+    out, i = [], 0
+    while i < len(rows):
+        j = i
+        while j + 1 < len(rows) and rows[j + 1] == rows[i]:
+            j += 1
+        out.append(rows[i])
+        if j - i >= 2:
+            out.append(f"[... repeated {j - i} more times]")
+        elif j - i == 1:
+            out.append(rows[i])
+        i = j + 1
+    return "\n".join(out)
+
+
+def bound_result(job: dict, limit: int) -> dict:
+    """The job with its result cut to ``limit`` characters of text/plain; rich representations other than text are
+    replaced by their size (the full text, when long, is in the file named by ``talo_text_path``)."""
+    result = job.get("result")
+    if not result or "data" not in result:
+        return job
+    data, meta = dict(result["data"]), dict(result.get("metadata") or {})
+    text = data.get("text/plain", "")
+    if len(text) > limit:
+        data["text/plain"] = text[:limit]
+        meta["talo_shown_chars"] = limit
+    for mime in [m for m in data if m != "text/plain"]:
+        meta.setdefault("talo_omitted", {})[mime] = len(data.pop(mime))
+    return {**job, "result": {"data": data, "metadata": meta}}
+
+
 def show_job(args, job: dict) -> None:
     """A job: the last lines of its output, its result or error, and a status line."""
     lines = getattr(args, "lines", LINES)
+    raw = getattr(args, "raw", False)
     out = call("output", id=job["id"], max_bytes=256 << 10)
-    text, cut = tail_lines(out["text"], lines)
+    text, cut = tail_lines(out["text"] if raw else condense(out["text"]), lines)
+    job = bound_result(job, getattr(args, "max_result", MAX_RESULT))
     if args.json:
         print(json.dumps({"job": job, "output": {"text": text, "lines_cut": cut, "bytes_cut": out["offset"],
-                                                 "size": out["size"]}}, ensure_ascii=False, default=str))
+                                                 "size": out["size"], "condensed": not raw}},
+                         ensure_ascii=False, default=str))
         return
     if out["offset"] or cut:
         earlier = f"{cut} lines" + (f" / {human_bytes(out['offset'])}" if out["offset"] else "")
@@ -67,6 +112,10 @@ def show_job(args, job: dict) -> None:
         print(f"[{o['mime']}: {o['path']}]")
     if job.get("result") and "data" in job["result"]:
         print(job["result"]["data"].get("text/plain", ""))
+        meta = job["result"].get("metadata") or {}
+        if meta.get("talo_shown_chars"):
+            where = f"; all of it in {meta['talo_text_path']}" if meta.get("talo_text_path") else ""
+            print(f"[result cut to {meta['talo_shown_chars']} of {meta.get('talo_text_chars', '?')} characters{where}]")
     elif job.get("result"):  # a finished snap / checkout
         print(json.dumps(job["result"], ensure_ascii=False, default=str)[:2000])
     sys.stdout.flush()  # output first, the status line (stderr) last
@@ -78,7 +127,14 @@ def status_line(job: dict) -> str:
     elapsed = f" {job['elapsed_s']:.2f}s" if job.get("elapsed_s") is not None else ""
     count = f" [{job['execution_count']}]" if job.get("execution_count") else ""
     if status in ("running", "queued"):
-        return (f"[job {jid} {status}{elapsed}] `talo wait {jid}` for the result, `talo tail {jid}` for output, "
+        live = ""
+        if (p := job.get("progress")) is not None:
+            pct = f" {100 * p['done'] / p['total']:.0f}%" if p.get("total") else ""
+            live += f", progress{pct} ({p['done']}{'/' + str(p['total']) if p.get('total') else ''})"
+            live += f" {p['note']}" if p.get("note") else ""
+        if job.get("last_activity_age_s") is not None:
+            live += f", active {job['last_activity_age_s']:.0f}s ago"
+        return (f"[job {jid} {status}{elapsed}{live}] `talo wait {jid}` for the result, `talo tail {jid}` for output, "
                 f"`talo interrupt {jid}` to stop it")
     atomic = job.get("atomic") or {}
     if atomic.get("outcome") == "restored":
@@ -195,7 +251,8 @@ def cmd_tail(args):
         emit(args, out, lambda d: sys.stdout.write(d["text"]))
         return
     out = call("output", id=args.id, max_bytes=(1 << 40) if args.all else 256 << 10)
-    text, cut = (out["text"], 0) if args.all else tail_lines(out["text"], args.lines)
+    shown = out["text"] if args.raw else condense(out["text"])
+    text, cut = (shown, 0) if args.all else tail_lines(shown, args.lines)
     if args.json:
         print(json.dumps({**out, "text": text, "lines_cut": cut}, ensure_ascii=False))
         return
@@ -517,17 +574,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--python", help="interpreter for the session if it has to be created")
     p.add_argument("--key", help="idempotency key: retrying with the same key returns the job already submitted")
     p.add_argument("--expect-rev", type=int, metavar="N", help="refuse to run unless the session is at revision N")
+    p.add_argument("--raw", action="store_true", help="show the output as written (no condensing)")
+    p.add_argument("--max-result", type=int, default=MAX_RESULT, help="characters of the result shown")
     p.add_argument("--atomic", action="store_true",
                    help="run inside a checkpoint: if the code fails, the session is restored to its state before it")
     p = add("wait", cmd_wait, "wait for a job to finish", session=False)
     p.add_argument("id")
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
     p.add_argument("-n", "--lines", type=int, default=LINES)
+    p.add_argument("--raw", action="store_true", help="show the output as written (no condensing)")
+    p.add_argument("--max-result", type=int, default=MAX_RESULT, help="characters of the result shown")
     p = add("tail", cmd_tail, "show a job's output", session=False)
     p.add_argument("id")
     p.add_argument("-n", "--lines", type=int, default=LINES)
     p.add_argument("--all", action="store_true", help="the whole output")
     p.add_argument("--offset", type=int, help="read from this byte offset (the reply's next_offset continues)")
+    p.add_argument("--raw", action="store_true", help="show the output as written (no condensing)")
     p.add_argument("-f", "--follow", action="store_true", help="follow the output until the job finishes")
     p = add("jobs", cmd_jobs, "list jobs")
     p.add_argument("--last", type=int, default=20)

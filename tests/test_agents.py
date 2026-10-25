@@ -110,3 +110,29 @@ def test_atomic_interrupt_restores(talo):
     rc, out = run_json(talo, "wait", jid, "-t", "30")
     assert out["job"]["status"] == "interrupted" and out["job"]["atomic"]["outcome"] == "restored"
     assert run_json(talo, "run", "x")[1]["job"]["result"]["data"]["text/plain"] == "1"
+
+
+def test_progress_and_activity_of_a_running_job(talo):
+    rc, out = run_json(talo, "run", "import time\nfor i in range(30):\n    talo.progress(i + 1, 30, 'step')\n"
+                                    "    time.sleep(0.1)", "-t", "1")
+    assert rc == 3
+    job = out["job"]
+    assert 0 < job["progress"]["done"] < 30 and job["progress"]["total"] == 30 and job["last_activity_age_s"] < 1
+    rc, out = run_json(talo, "wait", job["id"], "-t", "30")
+    assert out["job"]["progress"]["done"] == 30  # the final update is never dropped
+    rc, out = run_json(talo, "vars")
+    assert "talo" not in {v["name"] for v in out["variables"]}
+
+
+def test_output_is_condensed_and_results_bounded(talo):
+    code = ("import sys\nfor i in range(100):\n    sys.stdout.write(f'\\rprogress {i}%')\nprint()\n"
+            "for _ in range(50):\n    print('same warning')\nprint('end')\n'x' * 50_000")
+    rc, out = run_json(talo, "run", code)
+    text = out["output"]["text"]
+    assert "progress 99%" in text and "progress 98%" not in text
+    assert text.count("same warning") == 1 and "repeated 49 more times" in text
+    result = out["job"]["result"]
+    assert len(result["data"]["text/plain"]) == 10_000 and result["metadata"]["talo_text_chars"] == 50_002
+    assert open(result["metadata"]["talo_text_path"]).read() == repr("x" * 50_000)
+    raw = talo("tail", out["job"]["id"], "--raw", "--all").stdout
+    assert raw.count("same warning") == 50

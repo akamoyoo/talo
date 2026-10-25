@@ -94,6 +94,8 @@ class Job:
     key: str | None = None                     # idempotency key (run --key)
     expect_rev: int | None = None              # refuse to start unless the session is at this revision
     rev: int | None = None                     # the session's revision when the job started
+    progress: dict | None = None               # the last talo.progress() of a running job
+    progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
     interrupt_requested: bool = False
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
@@ -102,6 +104,15 @@ class Job:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "owner", "key",
                                             "rev", "atomic")}
+        out["progress"] = self.progress
+        if self.status == "running":
+            out["last_progress_age_s"] = round(time.monotonic() - self.progress_at, 1) if self.progress_at else None
+            try:
+                out["last_output_age_s"] = round(max(0.0, time.time() - os.stat(self.output).st_mtime), 1)
+            except OSError:
+                out["last_output_age_s"] = None
+            ages = [a for a in (out["last_progress_age_s"], out["last_output_age_s"]) if a is not None]
+            out["last_activity_age_s"] = min(ages) if ages else None
         out["elapsed_s"] = round((self.finished or time.time()) - (self.started or time.time()), 3) if self.started else None
         return out
 
@@ -349,6 +360,8 @@ class Session:
                                     for m, p in got["content"].get("metadata", {}).get("talo_files", {}).items()]
                 elif kind == "error":
                     job.error = dict(got["content"])
+                elif kind == "talo_progress":
+                    job.progress, job.progress_at = dict(got["content"]), time.monotonic()
                 elif kind == "execute_reply":
                     status = got["content"]["status"]
                     job.metrics = dict(got.get("metadata", {}))
@@ -677,7 +690,7 @@ class Supervisor:
             offset = max(0, size - limit)
         with open(path, "rb") as f:
             f.seek(offset)
-            data = f.read(limit)
+            data = f.read(max(0, min(limit, size - offset)))  # read(n) allocates n bytes up front
         return {"id": job.id, "offset": offset, "next_offset": offset + len(data), "size": size,
                 "text": data.decode(errors="replace"), "status": job.status}
 

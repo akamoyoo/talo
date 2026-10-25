@@ -48,6 +48,7 @@ writes each one to a file next to the job's output file (`ID-N.png`, ...) and li
 |---|---|
 | `talo_vars_request` (`pattern`) | `variables`: list of `{name, type, nbytes, shape | len, dtype, columns, value}`; `rss` |
 | `talo_show_request` (`name`: a name, attribute or constant subscript such as `df.x` or `d["k"]`, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
+| `talo_progress` (worker → supervisor, child of the running `execute_request`): `done`, `total`, `note` | – (stored as the job's `progress`) |
 | `talo_fingerprint_request` (`names`) | `fingerprints`: `{name: {"hash": hex} \| {"error": text}}` (BLAKE2b of the pickled object; see "Diff" in [design.md](design.md)) |
 | `talo_snapshot_request` (`id`, `socket`: path to listen on, `strict`) | `pid` of the snapshot process, `threads`: names of the other threads present at fork time — or `status: error` (`strict` and other threads exist) |
 
@@ -100,7 +101,8 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 A **session** is `{name, state (starting | idle | busy | dead), python, cwd, pid, rss, created, queued, current_job,
 death, base, jobs_since_base, snapshots, rev, memory_budget}`. A **snapshot** is `{id, name, session, parent, pid, created, message, execution_count,
 jobs (ids run between its parent and itself), private_bytes, threads, owner}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
-started, finished, elapsed_s, execution_count, result, error, metrics, output, outputs, owner, key, rev, atomic}`.
+started, finished, elapsed_s, execution_count, result, error, metrics, output, outputs, owner, key, rev, atomic, progress}`; a running job also has `last_output_age_s`,
+`last_progress_age_s` and `last_activity_age_s`.
 
 The control protocol is versioned together with Talo while it is pre-alpha; it will be frozen and versioned
 separately at 1.0.

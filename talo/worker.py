@@ -45,6 +45,7 @@ def _load_wire():
 
 wire = _load_wire()
 
+RESULT_FILE_MIN = 10_000  # results longer than this are also saved in full next to the job's output
 RESULT_LIMIT = 100_000  # characters of a result's text/plain kept; longer results are truncated and flagged
 TRACEBACK_LIMIT = 50_000
 CELL_FILENAME = "<talo-{n}>"
@@ -84,6 +85,8 @@ def mime_bundle(value, save=None) -> tuple[dict, dict]:
     data["text/plain"], cut = truncate(text, RESULT_LIMIT)
     if cut:
         meta["talo_truncated"] = cut
+    if save is not None and len(text) > RESULT_FILE_MIN:  # clients show a prefix; the whole text stays readable
+        meta["talo_text_path"], meta["talo_text_chars"] = save(text.encode(errors="replace"), ".txt"), len(text)
     for method, mime in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown")):
         fn = getattr(type(value), method, None)
         if fn is None:
@@ -270,7 +273,7 @@ def describe(name: str, value) -> dict:
 
 def is_user_variable(name: str, value) -> bool:
     """Names the user created: not private names, modules, or classes / functions imported from other modules."""
-    if name.startswith("_") or name in ("In", "Out", "exit", "quit", "get_ipython", "display"):
+    if name.startswith("_") or name in ("In", "Out", "exit", "quit", "get_ipython", "display", "talo"):
         return False
     if isinstance(value, type(sys)):
         return False
@@ -437,6 +440,30 @@ class Snapshot:
 
 # ---------------------------------------------------------------- execution
 
+class Helper:
+    """The ``talo`` object in the user's namespace."""
+
+    PROGRESS_INTERVAL = 0.2  # seconds between progress messages (the last update of a job is always sent)
+
+    def __init__(self, worker: "Worker"):
+        self._worker = worker
+        self._last = 0.0
+
+    def progress(self, done, total=None, note: str = "") -> None:
+        """Report progress of the running job: ``talo.progress(i, n, "day 2024-03-01")``. Shown by ``talo jobs``,
+        ``wait`` and ``brief``; rate-limited, so it is cheap to call in a loop."""
+        now = time.monotonic()
+        final = total is not None and done >= total
+        if self._worker.parent is None or (now - self._last < self.PROGRESS_INTERVAL and not final):
+            return
+        self._last = now
+        self._worker.send("talo_progress", {"done": done, "total": total, "note": str(note)[:200]},
+                          self._worker.parent)
+
+    def __repr__(self) -> str:
+        return "<talo helper: talo.progress(done, total=None, note='')>"
+
+
 class Worker:
     def __init__(self, sock: socket.socket, session: str):
         self.sock = sock
@@ -445,7 +472,7 @@ class Worker:
         self.session = session
         self.execution_count = 0
         self.namespace = {"__name__": "__main__", "__builtins__": __builtins__, "In": [""], "Out": {},
-                          "display": self.display}
+                          "display": self.display, "talo": Helper(self)}
         self.parent: dict | None = None    # the execute_request being run, for display_data
         self.out_path: str | None = None   # its output file; images are written next to it
         self.files = 0

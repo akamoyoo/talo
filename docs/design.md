@@ -300,8 +300,8 @@ detector: a native computation can be silent for an hour, so Talo never interrup
 The output shown by `run`, `wait` and `tail` (never the file, and never the byte offsets) is condensed: for lines
 rewritten with carriage returns (progress bars) only the final state is kept, and runs of identical lines are folded
 into one with a count (`[... repeated 120 times]`). Condensing applies to each reply separately. A result's text is
-cut to `--max-result` characters (default 10 000); the full `text/plain` is saved next to the job's output
-(`ID.result.txt`) and the reply gives its path and size. Each reply is bounded as a whole. `--raw` shows the output
+cut to `--max-result` characters (default 10 000); the full `text/plain` of results longer than that is saved next to the job's
+output (`ID-N.txt`) and the reply gives its path and size (`talo_text_path`, `talo_text_chars`). Each reply is bounded as a whole. `--raw` shows the output
 without condensing (the size limits still apply).
 
 ### Resources on shared machines
