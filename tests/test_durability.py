@@ -130,3 +130,49 @@ def test_only_changed_buffers_are_written_and_imports_come_back(talo):
     assert rc == 0
     rc, out = run_json(talo, "run", "-s", "r", "total(), float(box.b[0]), np.__name__, OrderedDict.__name__")
     assert out["job"]["result"]["data"]["text/plain"] == "(1000001.0, 5.0, 'numpy', 'OrderedDict')"
+
+
+def test_function_state_structured_views_and_damaged_buffers(talo, talo_home):
+    talo("run", "import numpy as np\ndef f(acc=[]):\n    acc.append(1)\n    return len(acc)\nf(); f()\n"
+                "rec = np.zeros(4, dtype=[('x', '<i4'), ('y', '<f8')])\nrec['y'] = [1, 2, 3, 4]\nhalf = rec[::2]")
+    rc, out = run_json(talo, "save", "--name", "s1")
+    assert out["job"]["status"] == "ok" and out["job"]["result"]["skipped"] == []
+    rc, out = run_json(talo, "restore", "default/s1", "--as", "r")
+    rc, out = run_json(talo, "run", "-s", "r", "f(), half.dtype.names, float(half['y'][1]), 'f' in globals()")
+    assert out["job"]["result"]["data"]["text/plain"] == "(3, ('x', 'y'), 3.0, True)"
+    # a damaged buffer in the store is repaired by the next save of the same content, not reused
+    buf = max((talo_home / "store" / "buffers").iterdir(), key=lambda p: p.stat().st_size)
+    buf.write_bytes(b"\0" * buf.stat().st_size)
+    talo("save", "--name", "s2")
+    rc, out = run_json(talo, "restore", "default/s2", "--as", "r2")
+    assert rc == 0 and out["status"] == "ok"
+
+
+def test_failed_imports_fail_the_restore_and_restore_returns_promptly(talo, talo_home):
+    talo("run", "import json\nx = 1")
+    talo("save", "--name", "imp")
+    path = talo_home / "checkpoints" / "default" / "imp.json"
+    m = json.loads(path.read_text())
+    m["imports"]["json"] = {"module": "no_such_module_anywhere"}
+    path.write_text(json.dumps(m))
+    rc, out = run_json(talo, "restore", "default/imp", "-s", "default")
+    assert rc == 1 and "no_such_module" in out["error"]["evalue"] and out["atomic"]["outcome"] == "restored"
+    talo("run", "import time")
+    talo("run", "time.sleep(3)", "-t", "0")             # the session is busy: the restore has to queue
+    t0 = time.time()
+    rc, out = run_json(talo, "restore", "default/imp", "--as", "fresh", "-t", "0")
+    assert time.time() - t0 < 2.5
+
+
+def test_recover_prefers_complete_checkpoints(talo, talo_home):
+    talo("run", "x = 1")
+    talo("save", "--name", "complete")
+    talo("run", "gen = (i for i in range(2))")         # cannot be saved: later checkpoints are incomplete
+    talo("save", "--name", "partial")
+    pid = call("ping")["pid"]
+    for s in call("ls")["sessions"]:
+        os.kill(s["pid"], 9)
+    os.kill(pid, 9)
+    time.sleep(0.5)
+    rc, d = run_json(talo, "ls")
+    assert d["lost"][0]["last_checkpoint"] == "default/complete"

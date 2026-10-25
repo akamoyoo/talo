@@ -73,3 +73,11 @@ def test_publish_keys_byte_counts_and_gc_exclusion(talo):
     assert {x["name"] for x in d["datasets"]} == {"t", "k"} and d["free_bytes"] > 0
     rc, out = run_json(talo, "dataset", "gc")
     assert rc == 0
+
+
+def test_dataset_names_versions_never_reused(talo):
+    talo("run", "import numpy as np\ntalo.publish('prices.v1-raw', np.ones(3))\ntalo.publish('prices.v1-raw', np.zeros(3))")
+    talo("dataset", "drop", "prices.v1-raw", "--version", "2")
+    assert result(talo, "talo.publish('prices.v1-raw', np.full(3, 7.0))") == "3"      # not 2 again
+    assert result(talo, "float(talo.get('prices.v1-raw').sum())") == "21.0"
+    assert result(talo, "float(talo.get('prices.v1-raw', version=1).sum())") == "3.0"

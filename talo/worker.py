@@ -540,24 +540,27 @@ def json_result(value, limit: int) -> dict:
 
 # ---------------------------------------------------------------- checkpoints
 
-_MAPPED: list = []  # pandas objects of shared datasets kept alive (see Helper.get)
 _RESTORE = {"ns": {}}  # the session namespace functions saved by source are rebuilt in (set by load_units)
 
 
-def _rebuild_function(name: str, source: str):
-    """Unpickling a function saved by its source: run the source in the session's namespace, so its globals are
-    the session's."""
-    ns = _RESTORE["ns"]
+def _rebuild_function(name: str, source: str, defaults=None, kwdefaults=None, attrs=None):
+    """Unpickling a function saved by its source: its code compiled from the source, bound to the session's
+    namespace as globals (without assigning any name there), with its saved defaults and attributes."""
+    import types
     filename = f"<talo-restored-{name}>"
     linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)  # for tracebacks
-    exec(compile(source, filename, "exec"), ns)
-    return ns[name]
+    module = compile(source, filename, "exec")
+    code = next(c for c in module.co_consts if hasattr(c, "co_name") and c.co_name == name)
+    fn = types.FunctionType(code, _RESTORE["ns"], name, defaults)
+    fn.__kwdefaults__ = kwdefaults
+    fn.__dict__.update(attrs or {})
+    return fn
 
 
 
 
 
-def _rebuild_view(root, offset: int, shape: tuple, strides: tuple, dtype: str):
+def _rebuild_view(root, offset: int, shape: tuple, strides: tuple, dtype):
     """Unpickling a NumPy view saved with its base: a view of the restored base, so they share memory again."""
     import numpy as np
     return np.ndarray(shape, dtype=np.dtype(dtype), buffer=root, offset=offset, strides=strides)
@@ -584,7 +587,7 @@ class _SavePickler(pickle.Pickler):
             root = _root(obj)
             if id(root) in self.roots and root.flags.c_contiguous and root is not obj:
                 offset = obj.__array_interface__["data"][0] - root.__array_interface__["data"][0]
-                return _rebuild_view, (root, offset, obj.shape, obj.strides, obj.dtype.str)
+                return _rebuild_view, (root, offset, obj.shape, obj.strides, obj.dtype)
         if isinstance(obj, types.FunctionType) and obj.__module__ == "__main__" \
                 and obj.__code__.co_filename.startswith(("<talo-", "<talo-restored-")):  # cells, not Talo's own
             if obj.__name__ == "<lambda>" or obj.__code__.co_freevars:
@@ -594,7 +597,10 @@ class _SavePickler(pickle.Pickler):
             except (OSError, TypeError) as error:
                 raise pickle.PicklingError(f"{obj.__qualname__}: source not available") from error
             import textwrap
-            return _rebuild_function, (obj.__name__, textwrap.dedent(source))
+            source = textwrap.dedent(source)
+            if source.lstrip().startswith("@") or obj.__qualname__ != obj.__name__:
+                raise pickle.PicklingError(f"{obj.__qualname__}: decorated or nested functions cannot be saved by source")
+            return _rebuild_function, (obj.__name__, source, obj.__defaults__, obj.__kwdefaults__, dict(obj.__dict__))
         return NotImplemented
 
 
@@ -604,6 +610,26 @@ def _alias_root(obj):
     while getattr(base, "base", None) is not None and type(base.base).__name__ == "ndarray":
         base = base.base
     return id(base)
+
+
+def _file_digest(path: str) -> str:
+    h = hashlib.blake2b(digest_size=20)
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 24):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _makedirs_durable(path: str) -> None:
+    """makedirs whose new directory entries survive a crash (each parent is synced after its child appears)."""
+    missing = []
+    p = os.path.abspath(path)
+    while not os.path.isdir(p):
+        missing.append(p)
+        p = os.path.dirname(p)
+    for d in reversed(missing):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        _fsync_dir(os.path.dirname(d))
 
 
 def _fsync_dir(path: str) -> None:
@@ -632,8 +658,10 @@ def _put_buffer(raw: memoryview, buffers: str) -> tuple[str, int, bool]:
     """Store one buffer by its content: (hash, size, newly written)."""
     digest = hashlib.blake2b(raw, digest_size=20).hexdigest()
     final = os.path.join(buffers, digest)
-    if os.path.exists(final):
-        return digest, raw.nbytes, False
+    if os.path.lexists(final):
+        if not os.path.islink(final) and os.path.getsize(final) == raw.nbytes and _file_digest(final) == digest:
+            return digest, raw.nbytes, False
+        os.unlink(final)  # damaged or not a regular file: write it again
     tmp = os.path.join(buffers, f".tmp-{os.getpid()}-{wire.new_id()[:8]}")
     with open(tmp, "wb") as f:
         f.write(raw)
@@ -653,8 +681,8 @@ def save_units(namespace: dict, names: list, store: str) -> dict:
         groups.setdefault(_alias_root(namespace[name]), []).append(name)
     units, skipped = [], []
     units_dir, buffers_dir = os.path.join(store, "units"), os.path.join(store, "buffers")
-    os.makedirs(units_dir, exist_ok=True)
-    os.makedirs(buffers_dir, exist_ok=True)
+    _makedirs_durable(units_dir)
+    _makedirs_durable(buffers_dir)
     for members in groups.values():
         tmp = os.path.join(units_dir, f".tmp-{os.getpid()}-{wire.new_id()[:8]}")
         os.makedirs(tmp)
@@ -688,7 +716,11 @@ def save_units(namespace: dict, names: list, store: str) -> dict:
             units.append({"hash": digest, "names": members, "bytes": stream_bytes + sum(s for _, s in buffers),
                           "new_bytes": new_bytes + (stream_bytes if new else 0),
                           "buffer_bytes": sum(s for _, s in buffers), "stream_bytes": stream_bytes})
-        except Exception as error:  # noqa: BLE001 - this unit is skipped, the others are saved
+        except OSError:  # the storage failed (disk full, I/O error): the checkpoint fails, nothing is "skipped"
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        except Exception as error:  # noqa: BLE001 - this unit cannot be serialized: skipped, the others are saved
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
             skipped += [{"name": n, "reason": f"{type(error).__name__}: {error}"[:200]} for n in members]
@@ -993,6 +1025,8 @@ class Helper:
                 self._worker.namespace[name] = value
             except Exception as error:  # noqa: BLE001
                 failed.append(f"{name} ({spec['module']}): {type(error).__name__}: {error}"[:200])
+        if failed:
+            raise ImportError("cannot restore the names bound by imports: " + "; ".join(failed))
         for m in modules or []:
             try:
                 importlib.import_module(m)
@@ -1024,7 +1058,8 @@ class Helper:
         """Publish ``value`` as a new, immutable version of the shared dataset ``name`` (``talo.get(name)`` in any
         session maps its buffers without copying); returns the version number. Unchanged buffers are shared with
         earlier versions. Publishing takes effect at once: a later failure or rollback of the job does not undo it.
-        With ``key``, publishing again under the same key returns the version already published."""
+        With ``key``, publishing again under the same key returns the version already published. Version numbers
+        are never reused, even after versions are dropped."""
         import fcntl
         import json as _json
         import shutil
@@ -1032,69 +1067,73 @@ class Helper:
             raise ValueError(f"dataset name {name!r}: letters, digits, '.', '-' and '_' only")
         root = self._datasets()
         folder = os.path.join(root, "datasets", name)
-        os.makedirs(folder, mode=0o700, exist_ok=True)
-        estimate, free = _buffer_nbytes(value) or 0, shutil.disk_usage(root).free
-        if estimate > free:
-            raise OSError(f"publishing {name} needs about {estimate >> 20} MB; {root} has {free >> 20} MB free")
-        with self._store_lock(root), open(os.path.join(folder, ".lock"), "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # versions are numbered in order, whoever publishes
+        _makedirs_durable(folder)
+        with self._store_lock(root), open(os.path.join(folder, ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # one writer of this dataset's versions and pointer at a time
             manifests = [_json.loads(open(os.path.join(folder, f)).read()) for f in os.listdir(folder)
                          if re.fullmatch(r"v\d+\.json", f)]
-            if key is not None:
+            if key is not None:  # a retry: before anything that could fail for another reason
                 done = [m for m in manifests if m.get("key") == key]
                 if done:
+                    self._dataset_message(name, done[0]["version"], "published", deduplicated=True)
                     return done[0]["version"]
-            out = save_units({name: value}, [name], os.path.join(root, "store"))
+            estimate, free = _buffer_nbytes(value) or 0, shutil.disk_usage(root).free
+            if estimate > free:
+                raise OSError(f"publishing {name} needs about {estimate >> 20} MB; {root} has {free >> 20} MB free")
+            out = save_units({"value": value}, ["value"], os.path.join(root, "store"))
             if out["skipped"]:
                 raise ValueError(f"cannot publish {name}: {out['skipped'][0]['reason']}")
             unit = out["units"][0]
-            version = max((m["version"] for m in manifests), default=0) + 1
+            counter = os.path.join(folder, "counter")
+            last = int(open(counter).read()) if os.path.exists(counter) else 0
+            version = max([last, *(m["version"] for m in manifests)]) + 1
             manifest = {"format": CHECKPOINT_FORMAT, "dataset": name, "version": version, "created": time.time(),
                         "key": key, "unit": unit, "type": type(value).__name__,
-                        "shape": list(getattr(value, "shape", []) or []),
+                        "shape": list(getattr(value, "shape", []) or []), "session": self._worker.session,
                         "job": (self._worker.parent or {}).get("metadata", {}).get("talo_job"), "pid": os.getpid()}
-            for fname, content in ((f"v{version}.json", _json.dumps(manifest, indent=1)), ("latest", str(version))):
-                tmp = os.path.join(folder, f".{fname}.tmp")
+            for fname, content in (("counter", str(version)), (f"v{version}.json", _json.dumps(manifest, indent=1)),
+                                   ("latest", str(version))):
+                tmp = os.path.join(folder, f".{fname}.{os.getpid()}.tmp")
                 with open(tmp, "w") as f:
                     f.write(content)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp, os.path.join(folder, fname))  # the version file first, then the pointer to it
+                os.replace(tmp, os.path.join(folder, fname))  # counter, the version, then the pointer to it
             _fsync_dir(folder)
-        if self._worker.parent is not None:
-            self._worker.send("talo_dataset", {"name": name, "version": version, "action": "published",
-                                               "bytes": unit["bytes"], "new_bytes": unit["new_bytes"],
-                                               "mapped_bytes": unit["buffer_bytes"],
-                                               "private_bytes": unit["stream_bytes"]}, self._worker.parent)
+        self._dataset_message(name, version, "published", bytes=unit["bytes"], new_bytes=unit["new_bytes"],
+                              mapped_bytes=unit["buffer_bytes"], private_bytes=unit["stream_bytes"])
         return version
+
+    def _dataset_message(self, name: str, version: int, action: str, **extra) -> None:
+        if self._worker.parent is not None:
+            self._worker.send("talo_dataset", {"name": name, "version": int(version), "action": action, **extra},
+                              self._worker.parent)
 
     def get(self, name: str, version: int | None = None, copy: bool = False, verify: bool = False):
         """The shared dataset ``name`` (the latest version, resolved now, or ``version``): its buffers mapped
         read-only, shared with every other reader; ``copy=True`` gives private writable memory."""
         import json as _json
-        folder = os.path.join(self._datasets(), "datasets", name)
-        if version is None:
+        root = self._datasets()
+        folder = os.path.join(root, "datasets", name)
+        with self._store_lock(root):  # held from resolving the version until its buffers are mapped: gc waits
+            if version is None:
+                try:
+                    version = int(open(os.path.join(folder, "latest")).read())
+                except FileNotFoundError:
+                    raise LookupError(f"no dataset {name!r} (`talo datasets` lists them)") from None
             try:
-                version = int(open(os.path.join(folder, "latest")).read())
+                manifest = _json.loads(open(os.path.join(folder, f"v{int(version)}.json")).read())
             except FileNotFoundError:
-                raise LookupError(f"no dataset {name!r} (`talo datasets` lists them)") from None
-        try:
-            manifest = _json.loads(open(os.path.join(folder, f"v{int(version)}.json")).read())
-        except FileNotFoundError:
-            raise LookupError(f"dataset {name!r} has no version {version}") from None
-        box: dict = {}
-        with self._store_lock(self._datasets()):  # gc waits until the buffers are mapped
-            load_units(box, os.path.join(self._datasets(), "store"), [manifest["unit"]], mapped=not copy,
-                       verify=verify)
-        if self._worker.parent is not None:
-            self._worker.send("talo_dataset", {"name": name, "version": int(version), "action": "read",
-                                               "copy": copy}, self._worker.parent)
-        value = box[name]
+                raise LookupError(f"dataset {name!r} has no version {version}") from None
+            box: dict = {}
+            load_units(box, os.path.join(root, "store"), [manifest["unit"]], mapped=not copy, verify=verify)
+        self._dataset_message(name, version, "read", copy=copy)
+        value = box["value"]
         if not copy and type(value).__module__.startswith("pandas") and hasattr(value, "copy"):
-            # pandas copies a block on write only when another object shares it: keep the mapped original alive and
-            # hand out a shallow copy, so editing the table copies the edited block instead of failing
-            _MAPPED.append(value)
-            value = value.copy(deep=False)
+            # pandas copies a block on write only when another object shares it: hand out a shallow copy that keeps
+            # the mapped original alive (for as long as the copy lives), so editing it copies the edited block
+            original, value = value, value.copy(deep=False)
+            object.__setattr__(value, "_talo_mapped", original)
         return value
 
     def _serve_call(self, name: str, kwargs: dict):

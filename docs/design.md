@@ -703,8 +703,10 @@ restored 14 variables into research2 (2.4 GB, 2.0s); content verified
   the same object after restoring; a view of a C-contiguous array saved in the same unit is rebuilt as a view of it
   (offset, shape and strides), so they share memory again. Aliasing hidden deeper (a list held by two
   dictionaries) is kept within one unit only; identical but independent values stay independent. Functions defined in a session's cells are saved by
-  their source and rebuilt in the restored session's namespace; lambdas, closures and classes defined in the session
-  are reported as not saved.
+  their source (with their current defaults and attributes) and rebuilt with the restored session's namespace as
+  their globals; lambdas, closures, decorated and nested functions and classes defined in the session are reported
+  as not saved. A buffer already in the store is reused only after its content is checked against its hash; a
+  storage error (disk full, I/O) fails the save instead of being reported as a skipped variable.
 - What cannot be saved is reported with the reason (generators, open files and sockets, locks, objects whose pickling
   fails): `saved: 12, skipped: 2 (gen: cannot pickle generator; conn: socket)`. Modules are not saved: names bound by imports
   (`import numpy as np`, `from pathlib import Path`) are recorded as imports and imported again on restore, and the
@@ -724,7 +726,9 @@ restored 14 variables into research2 (2.4 GB, 2.0s); content verified
 The supervisor keeps a registry of sessions (`sessions.json`: name, interpreter, directory, limits, autosave
 settings, last checkpoint). After a restart, `talo ls` shows the sessions that were running and are gone, with their
 last checkpoint; `talo recover SESSION` (or `--all`) recreates each with the same interpreter, directory and limits
-and restores its last **complete** checkpoint, found from the manifests themselves. Notes, ledger records, history and handoffs are already on disk. Snapshots are not
+and restores its recovery point, found from the manifests themselves: a checkpoint of all its variables, of its
+last incarnation, complete if there is one, with the latest captured revision. If the restore fails, the session
+is removed again so that `recover` can be retried. Autosave never removes the recovery point. Notes, ledger records, history and handoffs are already on disk. Snapshots are not
 recovered: they were memory.
 
 ### Automatic checkpoints: `talo autosave`
@@ -767,7 +771,7 @@ panel = talo.get("panel", copy=True)        # a private, writable copy
 - **Reading.** `talo.get` maps each buffer read-only (`mmap`), so NumPy arrays and the data of pandas objects point
   into the shared pages: every session reading a version shares one copy in memory. NumPy arrays are read-only; writing
   to them raises, and `copy=True` returns private writable memory. pandas objects can be edited: Talo hands out a
-  shallow copy that shares the mapped blocks, and pandas copies a block when it is first written (pandas 2 needs
+  shallow copy that shares the mapped blocks (and keeps the mapped original alive for as long as the copy lives), and pandas copies a block when it is first written (pandas 2 needs
   copy-on-write enabled; pandas 3 always does it). Objects that are not buffers (indexes of Python
   objects, small metadata) are unpickled privately in each reader. Sizes are checked on every read; content hashes
   are checked when the version is published and with `talo.get(..., verify=True)`.
@@ -785,7 +789,9 @@ panel = talo.get("panel", copy=True)        # a private, writable copy
   (the kernel keeps the pages of unlinked files that are mapped) and its memory is freed when the last one lets go.
   `talo datasets` lists datasets, versions, sizes, and the memory they occupy in `/dev/shm`; `talo dataset gc` removes
   buffers no version uses; it waits for no publication or mapping to be in progress (they hold a shared lock).
-  Dropping the latest version moves `latest` back to the newest one left.
+  Dropping the latest version moves `latest` back to the newest one left; version numbers are never reused.
+  Readers hold the store's shared lock from resolving a version until its buffers are mapped, and dropping takes the
+  dataset's lock, as publishing does.
 - **Memory accounting.** Pages of `/dev/shm` are shared memory: they count once for the machine, appear in
   every reader's resident and proportional memory, and are charged by the kernel to the cgroup that first touched
   them. `talo datasets` reports the bytes stored and the free space of the store; a publication also reports how

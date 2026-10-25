@@ -430,6 +430,7 @@ class Session:
         self.autosave_rev: int | None = None       # the revision of the last automatic checkpoint
         self.autosave_at = 0.0
         self.autosaving = False
+        self.store_tasks: set = set()        # running saves and publications (cancelled when the session is killed)
         self.over_limit: str | None = None  # why the session is over its limit without anything to kill
         self.dir = home() / "sessions" / name
         for sub in ("jobs", "snapshots"):
@@ -1145,7 +1146,7 @@ class Session:
             job.status, job.finished = "cancelled", time.time()
             job.done.set()
             return "cancelled"
-        if job.status == "running" and job.kind in ("execute", "trial"):
+        if job.status == "running" and job.kind in ("execute", "trial", "save", "publish"):
             job.interrupt_requested = True
             if job.phase != "executing" or not job.exec_pid:  # a checkpoint or restore is in progress
                 return "interrupt deferred" if job.phase == "preparing" else "finishing"
@@ -1391,6 +1392,11 @@ class Supervisor:
                 await asyncio.wait_for(asyncio.gather(*waiting), 15)
             except asyncio.TimeoutError:
                 log.warning("session %s: some map cases or calls did not stop within 15s", session.name)
+        for task in list(session.store_tasks):  # saves and publications of this session end with it
+            task.cancel()
+        for job in self.jobs.values():
+            if job.session_id == session.id and job.kind in ("save", "publish") and job.exec_pid:
+                kill_tree(job.exec_pid)
         for tr in [x for x in self.trials.values() if x["session_id"] == session.id]:
             if tr["status"] in ("preparing", "running"):
                 tr["task"].cancel()
@@ -1411,7 +1417,7 @@ class Supervisor:
         registry = self._load_registry()
         if session.name in registry:  # closed on purpose: not something to recover
             registry[session.name]["alive"] = False
-            (home() / "sessions.json").write_text(json.dumps(registry, indent=1))
+            self._write_registry(registry)
         return {"killed": req["name"]}
 
     def _deduplicated(self, session: Session, req: dict, fingerprint: dict) -> Job | None:
@@ -2176,6 +2182,8 @@ class Supervisor:
         def on_message(kind: str, content: dict) -> None:
             if kind == "talo_record":
                 self._add_record(content, session, call=call)
+            elif kind == "talo_dataset":
+                call.setdefault("datasets", []).append(dict(content))
 
         try:
             async with session.call_slots:  # at most CALL_PARALLEL calls of a session at once
@@ -2811,7 +2819,9 @@ class Supervisor:
         self.jobs[job.id] = job
         if key is not None:
             self.keys[("save", session.id, key)] = (job.id, fingerprint)
-        asyncio.create_task(self._run_save(session, job))
+        job.handle = asyncio.create_task(self._run_save(session, job))
+        session.store_tasks.add(job.handle)
+        job.handle.add_done_callback(session.store_tasks.discard)
         return await self._wait(job, req.get("timeout", 30))
 
     async def _run_save(self, session: Session, job: Job) -> None:
@@ -2820,6 +2830,10 @@ class Supervisor:
         fork = await self._submit(session, "fork", owner=job.owner, expect_rev=job.params.get("expect_rev"))
         await fork.done.wait()
         job.started = time.time()
+        if job.status == "cancelled":  # interrupted while waiting for the snapshot
+            if fork.handle is not None:
+                session._release(fork.handle)
+            return
         if fork.status != "ok":
             session._finish(job, "error", error={"ename": "SaveNotStarted", "evalue": str((fork.error or {}).get("evalue")),
                                                  "traceback": []})
@@ -2836,7 +2850,7 @@ class Supervisor:
             session.ephemeral[f"save {job.id}"] = channel.pid
             store = home() / "store"
             code = f"talo._save({job.params['names']!r}, {str(store)!r})"  # Python literals, not JSON
-            got = await channel.execute(code, job.output, silent=True, json_limit=16 << 20)
+            got = await channel.execute(code, job.output, silent=True, json_limit=16 << 20, job=job.id)
             if got["status"] != "ok":
                 error = got.get("error") or {}
                 session._finish(job, "error", error={"ename": error.get("ename"), "evalue": error.get("evalue"),
@@ -2875,19 +2889,21 @@ class Supervisor:
                           ("bytes", "new_bytes", "skipped", "rev")}, "variables": sum(len(u["names"]) for u in saved["units"])}
             session._finish(job, "ok")
             self.emit("checkpoint.saved", session=session.name, checkpoint=session.last_checkpoint)
-            if job.params["auto"] and session.autosave_config:  # automatic checkpoints beyond --keep go
+            if job.params["auto"] and session.autosave_config:  # automatic checkpoints beyond --keep go,
                 autos = sorted((json.loads(p.read_text()) for p in d.glob("*.json")), key=lambda m: m["created"])
+                keep = self._last_full_checkpoint(session.name)  # but never the recovery point
                 for m in [m for m in autos if m.get("auto")][:-session.autosave_config["keep"]]:
-                    (d / f"{m['name']}.json").unlink(missing_ok=True)
+                    if f"{session.name}/{m['name']}" != keep:
+                        (d / f"{m['name']}.json").unlink(missing_ok=True)
         except Exception as error:  # noqa: BLE001
             if not job.done.is_set():
                 session._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error), "traceback": []})
         finally:
-            self.store_ops -= 1
             session.ephemeral.pop(f"save {job.id}", None)
             job.exec_pid, job.phase = None, None
             if channel is not None:
-                await channel.close()
+                await channel.close()  # the writer is gone before the store is open to gc again
+            self.store_ops -= 1
             source.pins.discard(f"save {job.id}")
             if source in session.internal_snaps:
                 session.internal_snaps.remove(source)
@@ -2914,28 +2930,42 @@ class Supervisor:
                 "import json as _talo_json\n"
                 f"talo._load({str(home() / 'store')!r}, _talo_json.loads({json.dumps(json.dumps(units))}), "
                 f"{only!r}, {manifest['modules']!r}, {manifest['versions']!r}, {manifest.get('imports') or {}!r})")
-        self.store_ops += 1
+        self.store_ops += 1  # released when the restoring job ends (below), whatever happens to this request
         try:  # atomic: a unit that fails to load leaves the session as it was
             out = await self.op_run({"session": target, "code": code, "timeout": req.get("timeout", 300),
                                      "owner": req.get("owner"), "key": req.get("key"),
                                      "expect_rev": req.get("expect_rev"), "atomic": True})
-            if out["status"] in ("queued", "running"):
-                await self._wait(self.jobs[out["id"]], None)  # gc stays blocked until the restore is done
-        finally:
+        except BaseException:
             self.store_ops -= 1
+            raise
+        job = self.jobs[out["id"]]
+
+        async def release() -> None:
+            try:
+                await job.done.wait()
+            finally:
+                self.store_ops -= 1
+        asyncio.create_task(release())
         return {**out, "checkpoint": ref, "skipped": manifest["skipped"], "complete": manifest.get("complete")}
 
     def _save_registry(self) -> None:
         """sessions.json: what is needed to bring sessions back after a restart (see "talo recover")."""
         registry = self._load_registry()
         for s in self.sessions.values():
-            registry[s.name] = {"python": s.python, "cwd": s.cwd, "limits": s.limits, "max_output": s.max_output,
+            registry[s.name] = {"id": s.id, "python": s.python, "cwd": s.cwd, "limits": s.limits,
+                                "max_output": s.max_output,
                                 "memory_limit": s.memory_limit, "autosave": s.autosave_config,
                                 "last_checkpoint": s.last_checkpoint or registry.get(s.name, {}).get("last_checkpoint"),
                                 "epoch": self.epoch, "alive": s.state != "dead"}
+        self._write_registry(registry)
+
+    def _write_registry(self, registry: dict) -> None:
         path = home() / "sessions.json"
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(registry, indent=1))
+        with open(tmp, "w") as f:
+            f.write(json.dumps(registry, indent=1))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
 
     def _load_registry(self) -> dict:
@@ -2943,17 +2973,23 @@ class Supervisor:
         return json.loads(path.read_text()) if path.exists() else {}
 
     def _last_full_checkpoint(self, session: str) -> str | None:
-        """The latest checkpoint of a session that saved all its variables (a selection is not a recovery point),
-        read from the manifests themselves, so a crash between a manifest and the registry loses nothing."""
-        best = None
+        """The recovery point of a session, read from the manifests themselves (a crash between a manifest and the
+        registry loses nothing): among checkpoints of all its variables (a selection is not a recovery point), those
+        of its last incarnation first, complete ones first, then the latest captured revision."""
+        last_id = self._load_registry().get(session, {}).get("id")
+        candidates = []
         for path in self._checkpoint_dir(session).glob("*.json"):
             try:
                 m = json.loads(path.read_text())
             except ValueError:
                 continue
-            if m.get("selection") is None and (best is None or m["created"] > best["created"]):
-                best = m
-        return f"{session}/{best['name']}" if best else None
+            if m.get("selection") is None:
+                candidates.append(m)
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda m: (m.get("session_id") == last_id, bool(m.get("complete")),
+                                              m.get("rev") or 0, m["created"]))
+        return f"{session}/{best['name']}"
 
     def _lost(self) -> list:
         """Sessions an earlier supervisor was running that are gone."""
@@ -2982,6 +3018,10 @@ class Supervisor:
                 job = await self.op_restore({"checkpoint": last, "session": name,
                                              "timeout": req.get("timeout", 600), "owner": req.get("owner")})
                 item["job"] = {k: job.get(k) for k in ("id", "status", "error")}
+                if job["status"] not in ("ok", "queued", "running"):  # a session without its data is no recovery
+                    await self.op_kill({"name": name})
+                    self._write_registry({**self._load_registry(), name: {**r, "alive": True}})
+                    item["failed"] = True
             if r.get("autosave"):
                 self.sessions[name].autosave_config = r["autosave"]
             out.append(item)
@@ -3007,17 +3047,20 @@ class Supervisor:
                 if time.time() - s.autosave_at < cfg["every"]:
                     continue
                 s.autosave_at, s.autosaving = time.time(), True  # one autosave at a time per session
-                try:
-                    out = await self.op_save({"session": s.name, "name": "auto-" + time.strftime("%Y%m%d-%H%M%S"),
-                                              "auto": True, "timeout": None, "owner": "autosave"})
-                    if out["status"] == "ok":
-                        s.autosave_rev = out["result"]["rev"]  # the revision the checkpoint captured
-                    else:
-                        log.warning("autosave of session %s: %s", s.name, (out.get("error") or {}).get("evalue"))
-                except Exception:  # noqa: BLE001
-                    log.exception("autosave of session %s failed", s.name)
-                finally:
-                    s.autosaving = False
+                asyncio.create_task(self._autosave(s))  # a slow save never holds up the other sessions
+
+    async def _autosave(self, s: Session) -> None:
+        try:
+            out = await self.op_save({"session": s.name, "name": "auto-" + time.strftime("%Y%m%d-%H%M%S"),
+                                      "auto": True, "timeout": None, "owner": "autosave"})
+            if out["status"] == "ok":
+                s.autosave_rev = out["result"]["rev"]  # the revision the checkpoint captured
+            else:
+                log.warning("autosave of session %s: %s", s.name, (out.get("error") or {}).get("evalue"))
+        except Exception:  # noqa: BLE001
+            log.exception("autosave of session %s failed", s.name)
+        finally:
+            s.autosaving = False
 
     async def op_checkpoints(self, req):
         root = home() / "checkpoints"
@@ -3078,13 +3121,19 @@ class Supervisor:
         job.output = str(session.dir / "jobs" / f"{job.id}.out")
         Path(job.output).touch()
         self.jobs[job.id] = job
-        asyncio.create_task(self._run_publish(session, job))
+        job.handle = asyncio.create_task(self._run_publish(session, job))
+        session.store_tasks.add(job.handle)
+        job.handle.add_done_callback(session.store_tasks.discard)
         return await self._wait(job, req.get("timeout", 30))
 
     async def _run_publish(self, session: Session, job: Job) -> None:
         fork = await self._submit(session, "fork", owner=job.owner, expect_rev=job.params.get("expect_rev"))
         await fork.done.wait()
         job.started = time.time()
+        if job.status == "cancelled":
+            if fork.handle is not None:
+                session._release(fork.handle)
+            return
         if fork.status != "ok":
             session._finish(job, "error", error={"ename": "PublishNotStarted",
                                                  "evalue": str((fork.error or {}).get("evalue")), "traceback": []})
@@ -3096,8 +3145,9 @@ class Supervisor:
         channel = None
         try:
             channel = await ephemeral.Channel.from_snapshot(source.socket)
+            job.exec_pid = channel.pid
             session.ephemeral[f"publish {job.id}"] = channel.pid
-            got = await channel.execute(job.code, job.output, silent=True, json_limit=4096)
+            got = await channel.execute(job.code, job.output, silent=True, json_limit=4096, job=job.id)
             for m in got["messages"]:
                 if m["header"]["msg_type"] == "talo_dataset":
                     job.datasets.append(dict(m["content"]))
@@ -3118,7 +3168,7 @@ class Supervisor:
                 session._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error), "traceback": []})
         finally:
             session.ephemeral.pop(f"publish {job.id}", None)
-            job.phase = None
+            job.phase, job.exec_pid = None, None
             if channel is not None:
                 await channel.close()
             source.pins.discard(f"publish {job.id}")
@@ -3159,15 +3209,21 @@ class Supervisor:
                 "capacity_bytes": total, "free_bytes": free}
 
     async def op_dataset_drop(self, req):
+        import fcntl
         folder = datasets_root() / "datasets" / req["name"]
         if not folder.is_dir():
             raise KeyError(f"no dataset {req['name']!r}")
+        with open(folder / ".lock", "a") as lock:  # the same lock publishers take: pointer and versions stay consistent
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return self._dataset_drop(req, folder)
+
+    def _dataset_drop(self, req, folder: Path) -> dict:
         versions = [req["version"]] if req.get("version") else [int(f.stem[1:]) for f in folder.glob("v*.json")]
         for v in versions:
             (folder / f"v{v}.json").unlink(missing_ok=True)
         left = sorted(int(f.stem[1:]) for f in folder.glob("v*.json"))
         if left:
-            tmp = folder / ".latest.tmp"
+            tmp = folder / f".latest.{os.getpid()}.drop.tmp"
             tmp.write_text(str(left[-1]))
             os.replace(tmp, folder / "latest")
         else:
