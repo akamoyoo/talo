@@ -223,3 +223,28 @@ def test_sharing_levels_on_the_shared_socket(talo, monkeypatch):
     assert shared("brief", "-s", "default")[1]["error"]["type"] == "Forbidden"
     kinds = {e["type"] for e in run_json(talo, "events", "--all", "--limit", "500")[1]["events"]}
     assert {"share.granted", "share.request", "share.denied", "share.revoked"} <= kinds
+
+
+def test_identities_survive_recreation(talo):
+    import getpass
+    talo("new", "w")
+    talo("run", "-s", "w", "def f():\n    return 1\ntalo.expose(f)")
+    rc, a = run_json(talo, "call", "w.f", "--key", "k")
+    talo("snap", "-s", "w", "s")
+    rc, h = run_json(talo, "handoff", "-s", "w", "-m", "old")
+    talo("share", "-s", "w", "--user", getpass.getuser(), "--level", "read")
+    talo("kill", "w")
+    talo("new", "w")
+    talo("run", "-s", "w", "def f():\n    return 2\ntalo.expose(f)")
+    talo("snap", "-s", "w", "s")
+    rc, b = run_json(talo, "call", "w.f", "--key", "k")
+    assert not b["call"].get("deduplicated") and b["call"]["result"] == 2 and b["call"]["version"] == 2
+    rc, r = run_json(talo, "resume", h["handoff"]["id"])
+    assert r["handoff"]["snapshot_available"] is False            # the new w:s1 is not the old handoff's state
+    shares = run_json(talo, "share", "--list")[1]["shares"]
+    assert shares[0]["current"] is False                            # the grant was for the old incarnation
+    rc, out = run_json(talo, "run", "-s", "w", "talo.record(key='once', v=1)")
+    rid = out["job"]["result"]["data"]["text/plain"].strip("'")
+    rc, out = run_json(talo, "run", "-s", "w", "talo.record(key='once', v=1)")
+    assert out["job"]["result"]["data"]["text/plain"].strip("'") == rid
+    assert [r["id"] for r in run_json(talo, "ledger", "-s", "w")[1]["records"]] == [rid]

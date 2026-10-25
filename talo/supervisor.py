@@ -324,6 +324,7 @@ class Session:
         self.internal_snaps: list = []               # service versions, map sources (counted in memory)
         self.ephemeral: dict[str, int] = {}          # running map cases and calls: "m3:7" / "c12" -> pid
         self.call_slots = asyncio.Semaphore(CALL_PARALLEL)
+        self.on_handoff = None                       # set by the supervisor: run a queued handoff
         self.on_finish = lambda job: None            # set by the supervisor: fill in the outcome of the job's records  # set by the supervisor: append to the event journal
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
@@ -504,6 +505,8 @@ class Session:
                     self._finish(job, "ok", result=(await self._snap(**job.params, owner=job.owner)).to_dict())
                 elif job.kind == "checkout":
                     self._finish(job, "ok", result=await self._checkout(**job.params, owner=job.owner))
+                elif job.kind == "handoff":
+                    self._finish(job, "ok", result=await self.on_handoff(job))
                 elif job.kind == "fork":  # an internal snapshot of the current state, for map
                     job.handle = await self._fork(f"f{job.id}", strict=False)
                     self._finish(job, "ok", result={"ref": job.handle.ref, "pid": job.handle.pid})
@@ -862,6 +865,7 @@ class Supervisor:
         self.next_map = 1
         self.ledger: dict[str, dict] = self._load_ledger()
         self.services: dict[str, dict] = {}   # "session.name" -> {"versions": {n: version}, "latest": n}
+        self.version_counter: dict[str, int] = {}
         self.calls: dict[str, dict] = {}
         self.next_call = 1
         self.grants: dict[int, dict] = {}   # uid -> {"user", "sessions": {name: level}}
@@ -948,6 +952,7 @@ class Supervisor:
         session.emit = self.emit
         session.on_record = lambda job, content: self._add_record(content, session, job=job)
         session.on_finish = self._job_outcome
+        session.on_handoff = lambda job: self._do_handoff(session, job)
         session.on_publish = lambda job, snap: self._register_versions(session, job, snap)
         self.sessions[name] = session
         try:
@@ -1378,7 +1383,9 @@ class Supervisor:
         if key is not None:
             for rec in self.ledger.values():
                 if rec.get("key") == key and rec["session_id"] == session.id:
-                    return rec  # an idempotent retry
+                    if rec["fields"] != (content.get("fields") or {}):
+                        self.emit("record.conflict", session=session.name, record=rec["id"], key=key)
+                    return rec  # an idempotent retry (a retry with other fields keeps the first, and says so)
         if call is not None:
             producer = {"kind": "call", "call": call["id"], "service": call["service"], "version": call["version"]}
             svc = self.services.get(call["service"])
@@ -1455,9 +1462,11 @@ class Supervisor:
         out = []
         for name in job.staged:
             full = f"{session.name}.{name}"
-            svc = self.services.setdefault(full, {"name": full, "session": session.name, "function": name,
-                                                  "versions": {}, "latest": 0})
-            n = svc["latest"] + 1
+            svc = self.services.setdefault(full, {"name": full, "id": wire.new_id()[:12], "session": session.name,
+                                                  "session_id": session.id, "function": name, "versions": {},
+                                                  "latest": 0})
+            n = self.version_counter.get(full, 0) + 1  # never reused, even after the service was removed
+            self.version_counter[full] = n
             svc["versions"][n] = {"version": n, "snapshot": snap, "job": job.id, "owner": job.owner,
                                   "created": time.time(), "in_flight": set()}
             svc["latest"] = n
@@ -1516,8 +1525,8 @@ class Supervisor:
             raise KeyError(f"no service {req['service']!r} (`talo services` lists them)")
         key = req.get("key")
         fingerprint = {"service": svc["name"], "args": req.get("args") or {}, "version": req.get("version")}
-        if key is not None and ("call", key) in self.keys:
-            call_id, known = self.keys[("call", key)]
+        if key is not None and ("call", svc["id"], key) in self.keys:
+            call_id, known = self.keys[("call", svc["id"], key)]
             if known != fingerprint:
                 raise ValueError(f"key {key!r} was used for call {call_id} with a different request; use a new key")
             return {**await self._wait_call(self.calls[call_id], req.get("timeout", 30)), "deduplicated": True}
@@ -1541,7 +1550,7 @@ class Supervisor:
         Path(call["output"]).touch()
         self.calls[call_id] = call
         if key is not None:
-            self.keys[("call", key)] = (call_id, fingerprint)
+            self.keys[("call", svc["id"], key)] = (call_id, fingerprint)
         version["in_flight"].add(call_id)
         call["task"] = asyncio.create_task(self._run_call(svc, version, call, int(req.get("max_result") or 65536)))
         return await self._wait_call(call, req.get("timeout", 30))
@@ -1609,42 +1618,65 @@ class Supervisor:
             self._close_handoff(h, "closed")
             return {"handoff": self._handoff_view(h)}
         session = self._session(req["session"])
+        fingerprint = {"op": "handoff", "message": req.get("message", ""), "to": req.get("to"), "snap": req.get("snap"),
+                       "expect_rev": req.get("expect_rev")}
         key = req.get("key")
         if key is not None and ("handoff", session.id, key) in self.keys:
-            return {"handoff": self._handoff_view(self.handoffs[self.keys[("handoff", session.id, key)][0]]),
+            job_id, known = self.keys[("handoff", session.id, key)]
+            if known != fingerprint:
+                raise ValueError(f"key {key!r} was used for another handoff request; use a new key")
+            return {**self._handoff_reply(await self._wait(self.jobs[job_id], req.get("timeout", 300))),
                     "deduplicated": True}
         hid = f"h{self.next_handoff}"
         self.next_handoff += 1
-        if req.get("snap"):
-            snap = self._snapshot(req["snap"], session.name)
-        else:  # queued like any snapshot, so it captures the state after the jobs before it
-            out = await self._control(session, "snap", req.get("timeout", 300), req, name=f"handoff-{hid}",
-                                      message=f"handoff {hid}: {req.get('message', '')}"[:200], strict=False)
-            if "job" in out:
-                raise RuntimeError(f"the handoff snapshot did not finish in time (job {out['job']['id']})")
-            snap = session.find(f"handoff-{hid}")
+        # one queued operation: the snapshot, the pin, the cursors and the summary all see the same state
+        job = await self._submit(session, "handoff", owner=req.get("owner"), expect_rev=req.get("expect_rev"),
+                                 hid=hid, message=req.get("message", ""), to=req.get("to"), snap=req.get("snap"))
+        if key is not None:
+            self.keys[("handoff", session.id, key)] = (job.id, fingerprint)
+        return self._handoff_reply(await self._wait(job, req.get("timeout", 300)))
+
+    def _handoff_reply(self, out: dict) -> dict:
+        if out["status"] == "error":
+            raise RuntimeError(out["error"]["evalue"])
+        if out["status"] != "ok":
+            return {"job": out}
+        return {"handoff": self._handoff_view(self.handoffs[out["result"]["handoff"]])}
+
+    async def _do_handoff(self, session: Session, job: Job) -> dict:
+        """Runs in the session's queue (the worker is idle)."""
+        params = job.params
+        hid = params["hid"]
+        if params.get("snap"):
+            snap = self._snapshot(params["snap"], session.name)
+        else:
+            snap = await session._snap(f"handoff-{hid}", message=f"handoff {hid}: {params['message']}"[:200],
+                                       owner=job.owner)
+        snap.pins.add(f"handoff {hid}")
         previous = [h for h in self.handoffs.values() if h["session_id"] == session.id]
-        since = previous[-1]["time"] if previous else 0.0
-        notes = [n for n in self._notes(session) if n["time"] > since]
-        records = [r for r in self.ledger.values() if r["session_id"] == session.id and r["time"] > since]
-        brief = await self.op_brief({"session": session.name, "notes": 0, "jobs": 8, "vars": 15})
-        h = {"id": hid, "session": session.name, "session_id": session.id, "time": time.time(),
-             "owner": req.get("owner") or "user", "to": req.get("to"), "message": req.get("message", ""),
-             "snapshot": snap.ref, "snapshot_name": snap.name, "rev": session.rev, "status": "open",
-             "notes": {"count": len(notes), "last": notes[-10:]},
-             "records": {"count": len(records), "ids": [r["id"] for r in records][-50:]},
-             "active_jobs": brief["active_jobs"], "variables": brief["variables"],
+        notes_from = previous[-1]["notes"]["upto"] if previous else 0
+        records_from = previous[-1]["records"]["upto"] if previous else 0
+        notes = self._notes(session)
+        records = [r for r in self.ledger.values() if r["session_id"] == session.id]
+        rows = (await session.request("talo_vars_request", {"pattern": None}, timeout=60))["content"]["variables"]
+        session.vars_seen = {"rev": session.rev, "time": time.time(), "variables": rows}
+        brief = await self.op_brief({"session": session.name, "notes": 0, "jobs": 8, "vars": 15, "_cached": True})
+        h = {"id": hid, "session": session.name, "session_id": session.id, "time": time.time(), "job": job.id,
+             "owner": job.owner, "to": params.get("to"), "message": params["message"],
+             "snapshot": snap.ref, "snapshot_id": snap.id, "snapshot_name": snap.name, "rev": session.rev,
+             "status": "open",
+             "notes": {"count": len(notes) - notes_from, "last": notes[notes_from:][-10:], "upto": len(notes)},
+             "records": {"count": len(records) - records_from, "ids": [r["id"] for r in records[records_from:]][-50:],
+                         "upto": len(records)},
+             "active_jobs": [j for j in brief["active_jobs"] if j["id"] != job.id], "variables": brief["variables"],
              "recent_jobs": brief["recent_jobs"],
              "continue": [f"talo resume {hid} --branch NAME   # a new session from {snap.ref}",
                           f"talo attach -s {session.name}            # the live session"]}
-        snap.pins.add(f"handoff {hid}")
         self.handoffs[hid] = h
-        if key is not None:
-            self.keys[("handoff", session.id, key)] = (hid, None)
         with open(session.dir / "handoffs.jsonl", "a") as f:
             f.write(json.dumps(h, ensure_ascii=False, default=str) + "\n")
         self.emit("handoff.created", session=session.name, handoff=hid, to=h["to"], owner=h["owner"])
-        return {"handoff": self._handoff_view(h)}
+        return {"handoff": hid}
 
     def _handoff(self, hid: str) -> dict:
         if hid not in self.handoffs:
@@ -1652,9 +1684,9 @@ class Supervisor:
         return self.handoffs[hid]
 
     def _handoff_snapshot(self, h: dict) -> Snapshot | None:
-        session, _, sid = h["snapshot"].partition(":")
-        s = self.sessions.get(session)
-        return s.snapshots.get(sid) if s else None
+        """The handoff's snapshot, if the session incarnation that took it still holds it."""
+        s = next((x for x in self.sessions.values() if x.id == h["session_id"]), None)
+        return s.snapshots.get(h["snapshot_id"]) if s else None
 
     def _handoff_view(self, h: dict) -> dict:
         return {**h, "snapshot_available": self._handoff_snapshot(h) is not None}

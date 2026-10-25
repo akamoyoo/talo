@@ -611,7 +611,9 @@ class Helper:
             elif not (value is None or isinstance(value, (bool, int, float))):
                 raise TypeError(f"talo.record: {name} must be a number, bool, None or string, not {type(value).__name__}")
             clean[name] = value
-        record_id = "r" + wire.new_id()[:10]
+        # with a key, the id is derived from it, so a retry returns the id of the record that exists
+        record_id = ("rk" + hashlib.blake2b(f"{self._worker.session}:{key}".encode(), digest_size=5).hexdigest()
+                     if key is not None else "r" + wire.new_id()[:10])
         modules = {name: h for name, h in self._worker.reloader.hashes.items()
                    if (m := sys.modules.get(name)) is not None and getattr(m, "__file__", None)
                    and not _excluded(m.__file__) and os.path.realpath(m.__file__).startswith(os.getcwd() + os.sep)}
