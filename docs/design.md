@@ -431,6 +431,28 @@ Everything that agents may wait for is appended to an event journal (`events.jso
 time for the first one; the reply's `next` is the cursor to pass back. Delivery is at least once; the journal is
 kept for the supervisor's lifetime and capped in size.
 
+### Sharing a session
+
+- **One user, several clients.** An agent using the CLI, a human in `talo attach` and (M7) notebooks attached through
+  the Jupyter bridge share the session's queue. Every client sees jobs that other clients ran as a one-line notice
+  (owner, job, status, revision), not their full output; `--expect-rev` keeps each client from acting on a state it
+  has not seen.
+- **Other users on the same machine.** Running code in a session means running it as the session's owner, with all
+  of that account's access, so sharing has levels:
+
+  | Level | Allows |
+  |---|---|
+  | `read` | `vars`, `show`, `brief`, `tree`, `diff`, `snaps`, `jobs`, `history`, `ledger`, `events`, `notes` |
+  | `call` | `read`, plus calling the functions the owner exposed (`talo call`, JSON arguments only) |
+  | `run` | everything, including running arbitrary code (equivalent to the owner's account; stated when granted) |
+
+  `talo share SESSION --user NAME --level LEVEL` creates a socket for that user (`$TALO_HOME/shared/NAME.sock`, owned by
+  the owner and readable only by the given user through a POSIX ACL or a shared group), and the supervisor checks
+  every request on it against the level; the peer's uid is verified with `SO_PEERCRED`. `talo share --list` and
+  `talo unshare` manage grants; every grant and every request on a shared socket is recorded in the event journal.
+  The other user connects with `talo --connect PATH ...`.
+- **Other machines** are out of scope for M5: forward the socket over SSH, or (M7) use a Jupyter remote kernel.
+
 ### Handing over: `talo handoff`
 
 `talo handoff -m "MESSAGE" [--to OWNER]` takes a snapshot of the current state (or names an existing one with
