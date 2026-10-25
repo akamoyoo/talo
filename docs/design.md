@@ -429,7 +429,7 @@ r38  ic=0.0120 rank_ic=0.0110  job 211 · base default:s4 (dropped) · rolled ba
   **provenance** the supervisor adds: id, time, owner, session id, the job, case or call that produced it, revision,
   source snapshot, and hashes of the code and of reloaded modules. `--key` makes a record idempotent.
 - Each record shows the **outcome** of its producer, filled in when the producer ends: `running`, `succeeded`,
-  `failed`, `interrupted` or `rolled_back`; records of failed work are kept but labelled. The ledger says whether
+  `failed`, `interrupted`, `rolled_back`, or `unknown` when the supervisor restarted before the producer ended; records of failed work are kept but labelled. The ledger says whether
   the source snapshot still exists; the exact state of a map case or call is never kept, only the snapshot it came
   from.
 - `talo ledger` filters (`--session`, `--owner`, `--where KEY=VALUE`, `--has KEY`, `--outcome`), sorts on one numeric

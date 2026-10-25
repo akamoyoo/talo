@@ -1371,6 +1371,9 @@ class Supervisor:
                         records[rec["outcome_of"]]["outcome"] = rec["outcome"]
                 else:
                     records[rec["id"]] = rec
+        for rec in records.values():  # producers of an earlier supervisor are gone; their ids will be reused
+            if rec["outcome"] == "running":
+                rec["outcome"] = "unknown"
         return records
 
     def _ledger_write(self, entry: dict) -> None:
