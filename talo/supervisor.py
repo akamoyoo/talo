@@ -60,6 +60,7 @@ def private_dirty(pid: int | None) -> int | None:
 
 MEMORY_FIELDS = {"Rss:": "rss", "Pss:": "pss", "Private_Clean:": "private_clean", "Private_Dirty:": "private_dirty"}
 MEMORY_LIMIT_INTERVAL = 0.5  # seconds between samples of a session with --memory-limit
+GUARD_GRACE = 5.0           # seconds a job past its deadline or output limit gets to stop after the interrupt
 MEMORY_LIMIT_GRACE = 3.0     # seconds an interrupted job gets to stop before its worker is killed
 
 
@@ -96,6 +97,90 @@ def case_seed(map_id: str, index: int) -> int:
     """A seed per map case: forks inherit identical random generator states, so cases should seed from this."""
     import hashlib
     return int.from_bytes(hashlib.blake2b(f"{map_id}:{index}".encode(), digest_size=4).digest(), "little")
+
+
+def descendants(pid: int) -> list[int]:
+    """Processes started (directly or not) by ``pid``, from /proc."""
+    children: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    out, todo = [], [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            out.append(child)
+            todo.append(child)
+    return out
+
+
+def kill_tree(pid: int, sig: int = signal.SIGKILL) -> None:
+    """Signal a process and everything it started (children first, so none is re-parented and missed)."""
+    for p in [*reversed(descendants(pid)), pid]:
+        try:
+            os.kill(p, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+LIMIT_PROPERTIES = {"memory": ("MemoryMax", "memory"), "pids": ("TasksMax", "pids"), "cpu": ("CPUQuota", "cpu")}
+
+
+def delegated_controllers() -> set:
+    """cgroup v2 controllers the user's systemd instance may use for scopes."""
+    uid = os.getuid()
+    try:
+        text = Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.controllers").read_text()
+    except OSError:
+        return set()
+    return set(text.split())
+
+
+def scope_command(limits: dict, unit: str) -> list[str]:
+    """``systemd-run --user --scope`` with the limits (``{"memory": "100G", "pids": "512", "cpu": "8"}``); raises if
+    a limit cannot be enforced here."""
+    import shutil
+    if shutil.which("systemd-run") is None:
+        raise RuntimeError("--limit needs systemd-run (a systemd user instance); use --memory-limit for a soft limit")
+    available = delegated_controllers()
+    cmd = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}", "--collect"]
+    for key, value in limits.items():
+        if key not in LIMIT_PROPERTIES:
+            raise ValueError(f"unknown limit {key!r}: use memory, pids or cpu")
+        prop, controller = LIMIT_PROPERTIES[key]
+        if controller not in available:
+            raise RuntimeError(f"the {controller} controller is not delegated to your systemd user instance "
+                               f"(available: {', '.join(sorted(available)) or 'none'}), so {key}= cannot be enforced")
+        if key == "cpu":
+            value = f"{int(float(value) * 100)}%"
+        cmd += ["-p", f"{prop}={value}"]
+        if key == "memory":  # without this the kernel swaps the excess out instead of enforcing the limit
+            cmd += ["-p", "MemorySwapMax=0"]
+    return cmd + ["--"]
+
+
+def memory_events_path(pid: int) -> Path | None:
+    """The memory.events file of the cgroup ``pid`` is in."""
+    try:
+        rel = Path(f"/proc/{pid}/cgroup").read_text().strip().split("::", 1)[1]
+    except (OSError, IndexError):
+        return None
+    return Path(f"/sys/fs/cgroup{rel}/memory.events")
+
+
+def oom_kills(events: Path | None) -> int | None:
+    try:
+        for line in events.read_text().splitlines():
+            if line.startswith("oom_kill "):
+                return int(line.split()[1])
+    except (OSError, AttributeError, ValueError):
+        return None
+    return None
 
 
 def machine_memory() -> dict:
@@ -304,11 +389,16 @@ SHARE_STATE_PARAMS = {"diff": ("a", "b"), "map": ("from",), "checkout": ("name",
 
 class Session:
     def __init__(self, name: str, python: str, cwd: str, env: dict | None = None, memory_budget: int | None = None,
-                 memory_limit: int | None = None):
+                 memory_limit: int | None = None, limits: dict | None = None, max_output: int | None = None):
         self.name, self.python, self.cwd = name, python, cwd
         self.env = env or {}
         self.memory_budget = memory_budget
         self.memory_limit = memory_limit   # soft limit on the PSS of the worker plus its snapshots (--memory-limit)
+        self.limits = limits or {}         # hard limits of the systemd scope (--limit memory=,pids=,cpu=)
+        self.max_output = max_output       # default bound of a job's output file (--max-output)
+        self.scope: str | None = None
+        self.oom_kills: int | None = None   # the scope's oom_kill count when the worker started
+        self.memory_events: Path | None = None
         self.over_limit: str | None = None  # why the session is over its limit without anything to kill
         self.dir = home() / "sessions" / name
         for sub in ("jobs", "snapshots"):
@@ -353,9 +443,13 @@ class Session:
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         env = {"MPLBACKEND": "Agg", **os.environ, **self.env, "PYTHONUNBUFFERED": "1",  # figures become files
                "TALO_SOCKET": str(socket_path())}                                  # talo.call reaches us here
+        prefix = []
+        if self.limits:  # the worker, its snapshots and all their forks live in one cgroup the kernel enforces
+            self.scope = f"talo-{self.name}-{wire.new_id()[:8]}.scope"
+            prefix = scope_command(self.limits, self.scope.removesuffix(".scope"))
         with open(self.dir / "worker.log", "ab") as errlog:
             proc = await asyncio.create_subprocess_exec(
-                self.python, str(WORKER), "--fd", str(child.fileno()), "--session", self.name,
+                *prefix, self.python, str(WORKER), "--fd", str(child.fileno()), "--session", self.name,
                 cwd=self.cwd, env=env, pass_fds=(child.fileno(),), stdin=asyncio.subprocess.DEVNULL,
                 stdout=errlog, stderr=errlog, start_new_session=True)
         child.close()
@@ -410,6 +504,9 @@ class Session:
         self.generation += 1
         self.proc, self.children_file, self.writer = proc, children_file, writer
         self.worker_pid = info["content"].get("talo_pid")
+        if self.limits and self.memory_events is None:
+            self.memory_events = memory_events_path(self.worker_pid)
+        self.oom_kills = oom_kills(self.memory_events) if self.limits else None
         self.death = None
         self.state = "busy" if self.current is not None else "idle"  # an atomic restore is still part of its job
         self.tasks.append(asyncio.create_task(self._read(reader, self.generation)))
@@ -460,6 +557,8 @@ class Session:
 
     async def _died(self, generation: int) -> None:
         death = f"the worker process {describe_exit(await self._exit_code())}"
+        if self.limits.get("memory") and self.oom_kills is not None and (oom_kills(self.memory_events) or 0) > self.oom_kills:
+            death += f" by the memory limit of its scope ({self.limits['memory']})"
         if generation != self.generation:  # replaced while we waited for the exit status: not this worker's death
             return
         self.death = death
@@ -571,6 +670,7 @@ class Session:
                            session=self.name, metadata={"talo_output": job.output, "talo_job": job.id})
         job.phase, job.exec_pid = "executing", self.worker_pid
         q = self._send(msg)
+        guard = asyncio.create_task(self._guard(job))  # deadline and output limit
         try:
             while True:
                 got = await q.get()
@@ -605,16 +705,50 @@ class Session:
                     job.metrics = dict(got.get("metadata", {}))
                     if status == "error" and job.interrupt_requested and (job.error or {}).get("ename") == "KeyboardInterrupt":
                         status = "interrupted"
-                    if job.termination == "memory_limit" and status == "ok":  # it caught the interrupt: still stopped
+                    if job.termination and status == "ok":  # it caught Talo's interrupt: still stopped
                         status = "interrupted"
-                        job.error = {"ename": "MemoryLimit", "traceback": [],
-                                     "evalue": "the session went over its memory limit; the job caught the interrupt"}
+                        job.error = {"ename": {"memory_limit": "MemoryLimit", "deadline": "Deadline",
+                                               "output_limit": "OutputLimit"}.get(job.termination, "Stopped"),
+                                     "traceback": [], "evalue": f"stopped by Talo ({job.termination})"}
+                    elif status == "error" and job.termination and (job.error or {}).get("ename") == "KeyboardInterrupt":
+                        status = "interrupted"
                     self.jobs_since_base.append(job.id)
                     self.counts.append(job.execution_count)
                     return status
         finally:
+            guard.cancel()
             job.exec_pid = None
             self.waiters.pop(msg["header"]["msg_id"], None)
+
+    async def _guard(self, job: Job) -> None:
+        """Stop a job that passes its deadline (--deadline) or writes more than its output limit (--max-output): an
+        interrupt, then, after a grace period, the worker and every process it started are killed."""
+        deadline = job.params.get("deadline")
+        limit = job.params.get("max_output") or self.max_output
+        if not deadline and not limit:
+            return
+        started = time.monotonic()
+        while job.phase == "executing":
+            await asyncio.sleep(0.25)
+            reason = None
+            if deadline and time.monotonic() - started > deadline:
+                reason = "deadline"
+            elif limit:
+                try:
+                    if os.stat(job.output).st_size > limit:
+                        reason = "output_limit"
+                except OSError:
+                    pass
+            if reason is None:
+                continue
+            job.termination = reason
+            pid = job.exec_pid
+            self.interrupt(job)
+            await asyncio.sleep(GUARD_GRACE)
+            if job.phase == "executing" and job.exec_pid == pid and pid:
+                log.warning("session %s: job %s ignored the interrupt (%s); killing it", self.name, job.id, reason)
+                kill_tree(pid)
+            return
 
     async def _execute_atomic(self, job: Job) -> str:
         """run --atomic: checkpoint, execute, then commit or restore (see "run --atomic" in docs/design.md)."""
@@ -804,10 +938,7 @@ class Session:
             if not job.done.is_set() and self.generation == generation and job.phase == "executing" \
                     and job.exec_pid == pid:
                 log.warning("session %s: job %s still over the memory limit; killing the worker", self.name, job.id)
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                kill_tree(pid)
                 await job.done.wait()
 
     async def _snap(self, name: str | None = None, message: str = "", strict: bool = False,
@@ -930,7 +1061,8 @@ class Session:
                 "current_job": self.current.id if self.current else None, "death": self.death, "base": self.base,
                 "jobs_since_base": list(self.jobs_since_base), "snapshots": len(self.snapshots), "rev": self.rev,
                 "id": self.id,
-                "memory_budget": self.memory_budget, "memory_limit": self.memory_limit, "over_limit": self.over_limit}
+                "memory_budget": self.memory_budget, "memory_limit": self.memory_limit, "over_limit": self.over_limit,
+                "limits": self.limits, "scope": self.scope, "max_output": self.max_output}
 
 
 class Supervisor:
@@ -1027,7 +1159,13 @@ class Supervisor:
             python, cwd = self.sessions[source.session].python, self.sessions[source.session].cwd
         else:
             python, cwd = req.get("python") or sys.executable, req.get("cwd") or os.getcwd()
-        session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"), req.get("memory_limit"))
+        limits = {k: str(v) for k, v in (req.get("limits") or {}).items()}
+        if source and limits:
+            raise ValueError("a session started --from a snapshot lives in its source's scope and limits")
+        if limits:
+            scope_command(limits, "check")  # refuse limits this machine cannot enforce, before starting anything
+        session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"), req.get("memory_limit"),
+                          limits, req.get("max_output"))
         session.rev = self.last_rev.get(name, 0)  # revisions never repeat for a name, so a stale --expect-rev fails
         session.emit = self.emit
         session.on_record = lambda job, content: self._add_record(content, session, job=job)
@@ -1091,7 +1229,8 @@ class Supervisor:
         session = self._session(req["session"])
         fingerprint = {"op": "run", "code": req["code"], "expect_rev": req.get("expect_rev"),
                        "atomic": bool(req.get("atomic")), "silent": bool(req.get("silent")),
-                       "store_history": req.get("store_history", True)}
+                       "store_history": req.get("store_history", True), "deadline": req.get("deadline"),
+                       "max_output": req.get("max_output")}
         if job := self._deduplicated(session, req, fingerprint):
             return {**await self._wait(job, req.get("timeout", 30)), "deduplicated": True}
         if session.state == "dead":
@@ -1101,6 +1240,8 @@ class Supervisor:
                                  fingerprint=fingerprint, expect_rev=req.get("expect_rev"),
                                  **({"atomic": True} if req.get("atomic") else {}),
                                  **({"silent": True} if req.get("silent") else {}),
+                                 **({"deadline": float(req["deadline"])} if req.get("deadline") else {}),
+                                 **({"max_output": int(req["max_output"])} if req.get("max_output") else {}),
                                  **({"store_history": False} if req.get("store_history") is False else {}),
                                  **({"user_expressions": req["user_expressions"]} if req.get("user_expressions") else {}))
         return await self._wait(job, req.get("timeout", 30))

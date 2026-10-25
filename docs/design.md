@@ -594,9 +594,10 @@ $ talo reject clean                        # or drop it
 
 ### Hard limits and deadlines
 
-- `new --limit memory=100G,cpu=8,pids=512` runs the worker in a systemd user scope (cgroup v2): `MemoryMax`, `CPUQuota`
-  and `TasksMax` apply to the worker, its snapshots and every fork of them together — the kernel enforces them, there
-  is no sampling. Talo checks at `new` that a user systemd instance is available and refuses otherwise (the soft
+- `new --limit memory=100G,cpu=8,pids=512` runs the worker in a systemd user scope (cgroup v2): `MemoryMax` (with
+  `MemorySwapMax=0`, without which the excess is swapped out instead of enforced), `CPUQuota` and `TasksMax` apply to the worker, its snapshots and every fork of them together — the kernel enforces them, there
+  is no sampling. Talo checks at `new` that a user systemd instance is available and that the needed controllers are
+  delegated to it (often only `memory` and `pids` are; `cpu=` is then refused), and refuses otherwise (the soft
   `--memory-limit` remains for machines without it). An out-of-memory kill inside the scope is reported as such.
 - `run --deadline SECONDS` bounds a job's run time independently of how long the client waits (`-t`): at the deadline
   Talo interrupts the job, then kills it after a grace period; the job ends with `termination: "deadline"`.

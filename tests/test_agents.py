@@ -254,3 +254,42 @@ def test_memory_limit_wins_over_a_caught_interrupt(talo):
     assert job["status"] == "interrupted" and job["termination"] == "memory_limit"
     assert job["atomic"]["outcome"] == "restored"
     assert run_json(talo, "run", "-s", "lim", "x")[1]["job"]["result"]["data"]["text/plain"] == "1"
+
+
+def test_deadline_output_limit_and_child_processes(talo):
+    import os
+    import time
+    talo("run", "import time, subprocess, sys")
+    rc, out = run_json(talo, "run", "time.sleep(60)", "--deadline", "1", "-t", "30")
+    assert out["job"]["status"] == "interrupted" and out["job"]["termination"] == "deadline"
+    rc, out = run_json(talo, "run", "while True:\n    print('x' * 1000)", "--max-output", "1M", "-t", "30")
+    assert out["job"]["termination"] == "output_limit"
+    # a job that ignores the interrupt and has a child: both are killed after the grace period
+    code = ("child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+            "open('child.pid', 'w').write(str(child.pid))\n"
+            "while True:\n    try:\n        time.sleep(60)\n    except KeyboardInterrupt:\n        pass")
+    rc, out = run_json(talo, "run", code, "--deadline", "1", "-t", "30")
+    assert out["job"]["status"] == "lost" and out["job"]["termination"] == "deadline"
+    pid = int(open("child.pid").read())
+    os.unlink("child.pid")
+    time.sleep(0.5)
+    assert not os.path.exists(f"/proc/{pid}") or open(f"/proc/{pid}/stat").read().split()[2] == "Z"
+
+
+def test_hard_limits_through_a_systemd_scope(talo):
+    import shutil
+    import pytest
+    if shutil.which("systemd-run") is None:
+        pytest.skip("no systemd-run")
+    rc, out = run_json(talo, "new", "hard", "--limit", "memory=300M,pids=64")
+    if rc != 0:
+        pytest.skip(out["error"]["message"])
+    assert out["scope"].startswith("talo-hard-")
+    rc, out = run_json(talo, "run", "-s", "hard", "import numpy as np\nblocks = [np.ones(10_000_000) for _ in range(10)]",
+                       "-t", "60")
+    assert out["job"]["status"] == "lost"
+    rc, s = run_json(talo, "ls")
+    death = [x for x in s["sessions"] if x["name"] == "hard"][0]["death"]
+    assert "memory limit of its scope" in death
+    rc, out = run_json(talo, "new", "nocpu", "--limit", "cpu=2")
+    assert rc == 2 or out.get("scope")                 # refused where the cpu controller is not delegated

@@ -139,8 +139,9 @@ def status_line(job: dict) -> str:
         return (f"[job {jid} {status}{elapsed}{live}] `talo wait {jid}` for the result, `talo tail {jid}` for output, "
                 f"`talo interrupt {jid}` to stop it")
     atomic = job.get("atomic") or {}
-    if job.get("termination") == "memory_limit":
-        status += ", stopped by the memory limit"
+    if job.get("termination"):
+        status += {"memory_limit": ", stopped by the memory limit", "deadline": ", stopped at its deadline",
+                   "output_limit": ", stopped: too much output"}.get(job["termination"], f", stopped ({job['termination']})")
     if atomic.get("outcome") == "restored":
         status += ", state restored"
     elif atomic.get("outcome") in ("restore_failed", "not_started"):
@@ -160,6 +161,19 @@ def exit_code(job: dict) -> int:
 
 # ---------------------------------------------------------------- commands
 
+def parse_limits(text: str | None) -> dict | None:
+    """"memory=100G,pids=512,cpu=8" -> {"memory": "100G", ...} (sizes as systemd understands them)."""
+    if not text:
+        return None
+    out = {}
+    for item in text.split(","):
+        key, sep, value = item.partition("=")
+        if not sep or not value:
+            raise ValueError(f"--limit expects KEY=VALUE pairs, got {item!r}")
+        out[key.strip()] = value.strip()
+    return out
+
+
 def parse_size(text: str | None) -> int | None:
     """'200G', '512M', '1.5T' or a number of bytes."""
     if not text:
@@ -177,7 +191,8 @@ def cmd_new(args):
                                        "directory; --python / --cwd cannot change them")
     s = call("new", name=args.name, python=args.python or (None if args.from_ else sys.executable),
              cwd=os.path.abspath(args.cwd or os.getcwd()), memory_budget=parse_size(args.memory_budget),
-             memory_limit=parse_size(args.memory_limit),
+             memory_limit=parse_size(args.memory_limit), limits=parse_limits(args.limit),
+             max_output=parse_size(args.max_output),
              **({"from": args.from_} if args.from_ else {}))
     origin = f", forked from {s['base']}" if s.get("base") else ""
     emit(args, s, lambda d: print(f"session {d['name']} started: pid {d['pid']}, {d['python']}, cwd {d['cwd']}{origin}"))
@@ -224,7 +239,7 @@ def cmd_run(args):
     code = read_code(args)
     ensure_session(name, args.python)
     job = call("run", session=name, code=code, timeout=args.timeout, key=args.key, expect_rev=args.expect_rev,
-               atomic=args.atomic)
+               atomic=args.atomic, deadline=args.deadline, max_output=parse_size(args.max_output))
     show_job(args, job)
     return exit_code(job)
 
@@ -925,6 +940,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cwd", help="working directory of the worker (default: the current directory)")
     p.add_argument("--from", dest="from_", metavar="[SESSION:]SNAPSHOT",
                    help="start from a snapshot instead of an empty interpreter (a branch)")
+    p.add_argument("--limit", metavar="KEY=VALUE,...",
+                   help="hard limits enforced by the kernel through a systemd user scope: memory=100G,pids=512,cpu=8")
+    p.add_argument("--max-output", metavar="SIZE", help="default output limit of a job (e.g. 1G)")
     p.add_argument("--memory-limit", metavar="SIZE",
                    help="soft limit on the session's memory (worker plus snapshots, PSS): a job that exceeds it is "
                         "interrupted, then its worker killed (e.g. 100G)")
@@ -945,6 +963,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect-rev", type=int, metavar="N", help="refuse to run unless the session is at revision N")
     p.add_argument("--raw", action="store_true", help="show the output as written (no condensing)")
     p.add_argument("--max-result", type=int, default=MAX_RESULT, help="characters of the result shown")
+    p.add_argument("--deadline", type=float, metavar="SECONDS",
+                   help="stop the job after this long (independent of -t, which only bounds the wait)")
+    p.add_argument("--max-output", metavar="SIZE", help="stop the job if its output grows past this (e.g. 100M)")
     p.add_argument("--atomic", action="store_true",
                    help="run inside a checkpoint: if the code fails, the session is restored to its state before it")
     p = add("wait", cmd_wait, "wait for a job to finish", session=False)
