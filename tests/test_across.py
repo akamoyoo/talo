@@ -190,6 +190,12 @@ def test_sharing_levels_on_the_shared_socket(talo, monkeypatch):
     assert rc == 2 and d["error"]["type"] == "Forbidden"
     rc, d = shared("brief", "-s", "private")
     assert rc == 2 and d["error"]["type"] == "Forbidden"
+    talo("run", "-s", "private", "secret = 1")
+    talo("snap", "-s", "private", "hidden")
+    rc, d = shared("diff", "-s", "default", "private:hidden", "@")      # another session's state, by ref ...
+    assert rc == 2 and d["error"]["type"] == "Forbidden"
+    rc, d = shared("diff", "-s", "default", "hidden", "@")              # ... or by a bare name found elsewhere
+    assert rc == 2 and d["error"]["type"] == "Forbidden"
     talo("share", "--user", me, "--level", "call")
     assert shared("call", "default.f")[1]["call"]["result"] == 7
     talo("share", "--user", me, "--level", "run")
@@ -197,6 +203,8 @@ def test_sharing_levels_on_the_shared_socket(talo, monkeypatch):
     assert rc == 0 and d["job"]["owner"] == f"{me}@shared"
     rc, d = shared("stop")
     assert rc == 2
+    rc, d = shared("map", "-s", "default", "--from", "private:hidden", "--range", "1", "secret")
+    assert rc == 2 and d["error"]["type"] == "Forbidden"
     talo("unshare", "--user", me)
     assert shared("brief", "-s", "default")[1]["error"]["type"] == "Forbidden"
     kinds = {e["type"] for e in run_json(talo, "events", "--all", "--limit", "500")[1]["events"]}

@@ -277,6 +277,7 @@ SHARE_READ = {"ping", "ls", "vars", "show", "brief", "tree", "diff", "snaps", "j
 SHARE_CALL = SHARE_READ | {"call"}
 SHARE_RUN_EXCLUDED = {"shutdown", "share", "unshare", "shares", "kill", "new"}
 SHARE_LEVELS = ("read", "call", "run")
+SHARE_STATE_PARAMS = {"diff": ("a", "b"), "map": ("from",), "checkout": ("name",), "handoff": ("snap",)}
 
 
 class Session:
@@ -1931,6 +1932,22 @@ class Supervisor:
             self.emit("share.denied", user=grant["user"], op=op, session=target)
             raise Forbidden(f"{grant['user']} may not {op} " + (f"in session {target}" if target else "here") +
                             f" (level {level_of(target) or 'none'})")
+        # parameters that name states (snapshots, live workers) must stay inside the granted sessions too
+        for param in SHARE_STATE_PARAMS.get(op, ()):
+            ref = req.get(param)
+            if not ref:
+                continue
+            owner_session, _, name = str(ref).rpartition(":")
+            if name == "@":
+                ref_session = owner_session or target
+            else:
+                try:
+                    ref_session = self._snapshot(str(ref), target).session
+                except KeyError:
+                    ref_session = owner_session or target
+            if ref_session not in sessions:
+                self.emit("share.denied", user=grant["user"], op=op, session=ref_session)
+                raise Forbidden(f"{grant['user']} may not use {ref} (session {ref_session} is not shared)")
         self.emit("share.request", user=grant["user"], op=op, session=target)
         return req
 
