@@ -329,7 +329,7 @@ without condensing (the size limits still apply).
   (it increments the revision and accepts `--expect-rev` and `--key`). `talo reload --changed [--root DIR]` selects the
   imported modules whose source file is under `DIR` (default: the session's working directory, excluding virtual
   environments and `site-packages`) and changed since it was imported, judged by a content hash recorded at import
-  time; `--dry-run` only lists them.
+  time; `--dry-run` only lists them. `talo reload` without modules means `--changed`.
 - The report gives, per module, `status` (`reloaded`, `unchanged`, `failed` with the error), old and new hashes, and
   `stale_bindings`: names in the session's namespace that are bound directly to a function or class from the module's
   previous version, or to an instance of such a class (`from factors import f` keeps the old `f`). Only the namespace

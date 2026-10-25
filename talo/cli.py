@@ -777,8 +777,8 @@ def cmd_resources(args):
 
 
 def cmd_reload(args):
-    if not args.modules and not args.changed:
-        raise TaloError("BadArgument", "name the modules to reload, or use --changed")
+    if not args.modules:  # `talo reload` alone: the project modules edited since they were loaded
+        args.changed = True
     d = call("reload", session=session_name(args), modules=args.modules, changed=args.changed, root=args.root,
              in_place=args.in_place, dry_run=args.dry_run, timeout=args.timeout, expect_rev=args.expect_rev, key=args.key)
     if args.dry_run:
@@ -1437,7 +1437,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--snap", metavar="NAME", help="export the path to this snapshot instead")
     p.add_argument("--all", action="store_true", help="every job of the session, including rolled-back ones")
     p = add("reload", cmd_reload, "reload edited project modules; report names still bound to the old code")
-    p.add_argument("modules", nargs="*", help="modules to reload, in this order")
+    p.add_argument("modules", nargs="*", help="modules to reload, in this order (none: every changed one, as --changed)")
     p.add_argument("--changed", action="store_true",
                    help="also every imported module under --root whose source changed since it was loaded")
     p.add_argument("--root", help="directory for --changed (default: the session's working directory)")

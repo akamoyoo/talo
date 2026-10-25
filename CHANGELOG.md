@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `talo reload` without module names reloads the changed ones (as `--changed`).
 - MCP: `snaps`, `memory` and `snapshot_demote` tools.
 - Snapshots stay small: before every fork the worker collects garbage and returns free heap pages to the kernel
   (`malloc_trim`); measured on a research session, a snapshot's private memory after the same work fell from 475 MB
