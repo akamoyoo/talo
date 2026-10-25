@@ -2,41 +2,50 @@
 
 ## Unreleased
 
-### Changed
+## 0.1.0a1 — first release
 
-- Agent-facing CLI contract (from a review): `snap` / `checkout` take `-t` and return the queued job with exit code 3;
-  `--json` for `stop`, `export` and errors in arguments; `jobs --last` is applied by the supervisor and shows a code
-  preview; `tail --offset` for incremental reads; named sessions are no longer created implicitly; branches report
-  the interpreter and directory they actually inherit; `Out` keeps the last three results.
+Everything of the [roadmap](docs/roadmap.md), M0 to M9.
 
-### Added
+### Sessions and jobs
 
-- M6: shared datasets (`talo publish`, `talo.publish`, `talo.get`, `datasets`, `dataset drop|gc`): immutable
-  versions on `/dev/shm` in the checkpoint format, mapped read-only by readers, versions recorded on jobs.
-- M9: `save` / `restore` (content-addressed checkpoints written from a fork, aliasing and NumPy views kept,
-  verified on reading), `checkpoints`, `checkpoint drop`, `store gc`, `recover` after a restart, `autosave`.
-- M8: `verify` (hot / cold replay agreement), `run --trial` with `review` / `adopt` / `reject`, `new --limit`
-  (systemd scope, kernel-enforced), `run --deadline` / `--max-output`, `diagnose`, `run --retain-error`,
-  `talo.artifact_path()` and `artifacts`, `queue pause|resume`, `lease`, `memory` (explain and prune).
-- M7: `talo kernel` (a Jupyter kernel bridged to a session; displays in order, magics, persistent across front
-  end restarts), `kernelspec install`, `notebook`, `autosnap` / `undo`, and `talo mcp` (MCP over stdio).
-- M5, across sessions: ephemeral workers and `map` (fan-out of a snapshot under memory limits); services
-  (`talo.expose`, `talo call`, versions pinned to snapshots); the experiment ledger (`talo.record`, `ledger`) with
-  provenance and outcomes; the event journal (`events`); `handoff` / `resume`; `share` with read / call / run levels.
-- M4, agents at scale: `brief`, `note` / `notes`; owners on every request (`--owner`, `$TALO_AGENT`); session
-  revisions and `--expect-rev`; idempotency keys (`--key`) for `run`, `snap`, `checkout`, `reload`; `run --atomic`
-  (internal checkpoint, restored on failure); `talo.progress()` and activity ages; condensed output and bounded
-  results (`--raw`, `--max-result`); `resources` and a soft `--memory-limit`; `reload` with a stale-binding report.
-- `attach`: an interactive prompt on a session (multi-line blocks, tab completion via `complete_request`,
-  per-session input history, `%` commands, Ctrl-C interrupts, Ctrl-D detaches), sharing the job queue with other
-  clients. Images (`_repr_png_` / `_repr_jpeg_` / `_repr_svg_`, `display()`, matplotlib figures) are saved as files
-  listed in the job's `outputs`. `export` writes the lineage of the current state as `.py` or `.ipynb`.
-- Snapshots (`snap`), rollback (`checkout`, with `--discard` / `--snap`), branches (`new --from`), `snaps`,
-  `drop`; per-snapshot private memory, `--memory-budget`, `snap --strict`; snapshots survive a killed worker.
-- `tree`: all snapshots and live workers of all sessions as one tree; `diff A [B]`: variables added, removed or
-  changed between two snapshots or a snapshot and a live worker, by summary and by content fingerprint.
-- Supervisor (one per `TALO_HOME`, started automatically) managing sessions, job queues and execution history.
-- Worker running in any interpreter; standard-library only; Jupyter-shaped messages; fd-level output capture.
-- CLI: `run` (timeout → background job), `wait`, `tail`, `interrupt`, `jobs`, `vars`, `show`, `history`, `new`, `ls`,
-  `kill`, `stop`, `--json` everywhere.
-- Measurements of `fork()` snapshot cost and of libraries after `fork()` (`spikes/`).
+- A supervisor (one per `TALO_HOME`, started automatically, holding no user data) manages sessions, job queues and
+  execution history; workers run in any interpreter, use the standard library only, speak Jupyter-shaped messages
+  and capture output at the file-descriptor level.
+- CLI: `run` (a timeout turns a job into a background job), `wait`, `tail`, `interrupt`, `jobs`, `vars`, `show`,
+  `history`, `new`, `ls`, `kill`, `stop`; `--json` everywhere, structured errors, exit code 3 for running work.
+- `attach`: an interactive prompt on a session, sharing its queue with other clients.
+- Images and `display()` as files listed with the job; `export` of the code behind the current state as `.py` or
+  `.ipynb`, with replay hazards marked.
+
+### States
+
+- Snapshots (`snap`), rollback (`checkout`), branches (`new --from`), `tree`, `diff` (by summary and content
+  fingerprint), per-snapshot memory and budgets; `autosnap` and `undo`.
+- `run --atomic`; `run --trial` with `review`, `adopt` and `reject`; `verify` (hot and cold replay agreement);
+  `run --retain-error`.
+
+### Agents at scale
+
+- `brief`, notes, owners, revisions (`--expect-rev`), idempotency keys (`--key`), `talo.progress()`, condensed
+  output and bounded results, `reload` with a stale-binding report.
+- Across sessions: `map` (fan-out of a snapshot into ephemeral forks), services (`talo.expose`, `talo call`), the
+  experiment ledger (`talo.record`, `ledger`), the event journal (`events`), `handoff` / `resume`, `share` with
+  read / call / run levels.
+- Shared datasets: `talo publish` / `talo.publish`, `talo.get` (immutable versions on `/dev/shm`, mapped read-only by
+  every reader), `datasets`, `dataset drop | gc`, with hints when a value cannot be shared.
+
+### Front ends
+
+- `talo kernel` (a Jupyter kernel bridged to a session), `kernelspec install`, `notebook`, notebook magics;
+  `talo mcp` (an MCP server over stdio).
+
+### Safety and durability
+
+- Hard limits through systemd scopes (`new --limit`), a soft `--memory-limit`, `run --deadline` / `--max-output`,
+  `resources`, `memory`, `diagnose`, `queue pause | resume`, `lease`, `talo.artifact_path()` and `artifacts`.
+- Checkpoints: `save`, `restore`, `checkpoints`, `checkpoint drop`, `store gc` (content-addressed, crash-consistent,
+  aliasing and NumPy views kept, verified on reading); `recover` after a restart; `autosave`.
+
+### Measurements
+
+- The cost of `fork()` snapshots and the behaviour of common libraries after `fork()` (`spikes/`).

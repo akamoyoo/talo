@@ -1,4 +1,4 @@
-"""talo: a resident in-memory Python session driven from the terminal (see README.md and DESIGN.md)."""
+"""Talo: a resident in-memory Python session driven from the terminal (see README.md and docs/design.md)."""
 
 from talo.wire import VERSION as __version__
 

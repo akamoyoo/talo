@@ -1,16 +1,41 @@
 [project]
 name = "talo"
-version = "0.0.1"
+dynamic = ["version"]
 description = "A resident in-memory Python session you drive from the terminal: load data once, snapshot, roll back, branch. Built for coding agents and humans."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+authors = [{ name = "akamoyoo" }]
+keywords = ["repl", "kernel", "jupyter", "agents", "snapshot", "fork", "data analysis", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: Jupyter",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Interpreters",
+]
 dependencies = []
 
 [project.optional-dependencies]
 jupyter = ["pyzmq>=25"]
 dev = ["pytest", "numpy", "pandas>=3", "matplotlib", "nbformat", "pyzmq>=25", "jupyter_client>=8", "nbclient", "pyarrow", "polars"]
+
+[project.urls]
+Homepage = "https://github.com/akamoyoo/talo"
+Documentation = "https://github.com/akamoyoo/talo/blob/main/docs/design.md"
+Repository = "https://github.com/akamoyoo/talo"
+Issues = "https://github.com/akamoyoo/talo/issues"
+Changelog = "https://github.com/akamoyoo/talo/blob/main/CHANGELOG.md"
 
 [project.scripts]
 talo = "talo.cli:main"
@@ -21,6 +46,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["talo"]
+
+[tool.setuptools.dynamic]
+version = { attr = "talo.wire.VERSION" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

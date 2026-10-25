@@ -15,7 +15,7 @@ import datetime as _dt
 import json
 import uuid
 
-VERSION = "0.0.1"
+VERSION = "0.1.0a1"
 PROTOCOL_VERSION = "5.3"
 MAX_LINE = 64 << 20  # upper bound for one message in bytes; results and tracebacks are truncated well below this
 

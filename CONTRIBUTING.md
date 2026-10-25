@@ -1,7 +1,7 @@
 # Contributing to Talo
 
-Talo is pre-alpha: interfaces change, and design discussions come before code. Please open an issue describing the
-problem or the idea before sending a large change.
+Talo is alpha: interfaces may still change, and design discussions come before code. Please open an issue describing
+the problem or the idea before sending a large change.
 
 ## Development setup
 
@@ -28,3 +28,11 @@ Tests start their own supervisor under a temporary `TALO_HOME`, so they never to
 
 One coherent change per commit. Summary line in the imperative (`Add snapshot memory accounting`), followed by a
 short explanation of why.
+
+## Releasing
+
+1. Set the version in `talo/wire.py` (`VERSION`; the package reads it from there) and move the `Unreleased` section of
+   `CHANGELOG.md` under the new version.
+2. Run the tests, then build and check: `uv build && uvx twine check dist/*`.
+3. Install the wheel into a fresh virtualenv and try a session (`talo run`, `snap`, `checkout`).
+4. Upload with `uvx twine upload dist/*`, tag the commit (`git tag vX.Y.Z && git push --tags`).

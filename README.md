@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo.svg" alt="Talo" width="128" height="128">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/akamoyoo/talo/main/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/akamoyoo/talo/main/assets/logo.svg" alt="Talo" width="128" height="128">
   </picture>
 </p>
 
@@ -13,19 +13,19 @@
 </p>
 
 <p align="center">
-  <a href="#status">Status: pre-alpha</a> ·
-  <a href="docs/design.md">Design</a> ·
-  <a href="docs/protocol.md">Protocol</a> ·
-  <a href="docs/roadmap.md">Roadmap</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a> ·
-  <a href="LICENSE">Apache-2.0</a>
+  <a href="#status">Status: alpha</a> ·
+  <a href="https://github.com/akamoyoo/talo/blob/main/docs/design.md">Design</a> ·
+  <a href="https://github.com/akamoyoo/talo/blob/main/docs/protocol.md">Protocol</a> ·
+  <a href="https://github.com/akamoyoo/talo/blob/main/docs/roadmap.md">Roadmap</a> ·
+  <a href="https://github.com/akamoyoo/talo/blob/main/CONTRIBUTING.md">Contributing</a> ·
+  <a href="https://github.com/akamoyoo/talo/blob/main/LICENSE">Apache-2.0</a>
 </p>
 
 ---
 
-**Talo** is a long-lived Python process that keeps your variables in memory while you —
-or your coding agent — send it code from the terminal, one command at a time. Think of it as a Jupyter kernel without
-the notebook UI, built for workflows where the expensive part is getting the data into memory (illustrative session):
+**Talo** is a long-lived Python process that keeps your variables in memory while you — or your coding agent — send it
+code from the terminal, one command at a time. Think of it as a Jupyter kernel without the notebook UI, built for work
+where the expensive part is getting the data into memory (illustrative session):
 
 ```console
 $ talo run 'import pandas as pd; df = pd.read_parquet("trades.parquet")'   # once: 40 s, 30 GB
@@ -39,61 +39,61 @@ BTCUSDT    812.4
 ```
 
 Every command returns quickly: if the code is still running after the timeout, you get a job id and the computation
-keeps going in the background. Output is captured at the file-descriptor level (so prints from C extensions show up
-too), truncated sensibly for humans and agents alike, and kept in full on disk.
+keeps going in the background. Output is captured at the file-descriptor level (prints from C extensions show up
+too), cut to a sensible size for people and agents alike, and kept in full on disk.
 
 ## Why Talo?
 
-Data analysis by trial and error — and that is exactly how coding agents work — keeps paying two costs over and over:
+Data analysis by trial and error — which is exactly how coding agents work — keeps paying three costs:
 
 1. **Reloading.** Every new idea becomes a new script that loads the same gigabytes again.
-2. **No way back.** Once a step mutates a DataFrame in place, the only way to recover is to reload and redo.
+2. **No way back.** Once a step changes a table in place, the only way to recover is to reload and redo.
+3. **No parallelism.** Trying ten ideas at once means ten copies of the data, or ten reloads.
 
-Jupyter solves the first one for humans in a browser. Talo aims to be a superset of what a Jupyter kernel gives you,
-driven from the shell, plus what Jupyter does not have:
+Talo keeps one prepared state in memory and makes it cheap to **snapshot** it, **roll back** to it, and **fork** it —
+for one more idea, for a whole fan of parallel experiments, or for a change you want to review before adopting:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/akamoyoo/talo/main/assets/workflow.svg" alt="A session as a tree of states: load once, snapshot, fan out a map of forks, try a change in a fork, review and adopt it, roll back at any time" width="860">
+</p>
+
+Snapshots and forks use copy-on-write `fork()`: taking one costs milliseconds even with tens of gigabytes in memory,
+and it only consumes extra memory for the pages that change afterwards
+([measurements](https://github.com/akamoyoo/talo/blob/main/spikes/README.md)).
 
 | | Jupyter kernel | Talo |
 |---|---|---|
 | Variables stay in memory between executions | ✓ | ✓ |
-| Rich outputs (HTML, images), `.ipynb` | ✓ | ✓ (M3) |
-| Connect from JupyterLab / VS Code | ✓ | ✓ (M7, Jupyter messaging protocol) |
-| Driven from the terminal by agents, non-blocking commands, background jobs | – | ✓ |
-| Structured, truncated output with `--json` | – | ✓ |
-| **Snapshots, rollback and branches of the in-memory state** | – | ✓ |
-| Execution history with memory deltas, export of the code behind the current state (`.py` / `.ipynb`) | partial | ✓ |
-| A human and an agent on the same live session | – | ✓ |
-| Memory accounting and budgets per session | – | ✓ |
-
-Snapshots use copy-on-write `fork()`: taking one costs milliseconds even with tens of gigabytes in memory, and it only
-consumes extra memory for the pages you modify afterwards (measurements: [spikes/README.md](spikes/README.md)).
+| Rich outputs (HTML, images), `.ipynb` | ✓ | ✓ |
+| Open from JupyterLab / VS Code | ✓ | ✓ |
+| Driven from the terminal by agents: non-blocking commands, background jobs, `--json` | – | ✓ |
+| **Snapshots, rollback, branches and forks of the in-memory state** | – | ✓ |
+| Parallel experiments from one state, sessions as services, an experiment ledger | – | ✓ |
+| Review a change in a fork before adopting it; check that replaying the code gives the same state | – | ✓ |
+| Several agents and people on one session, with revisions, leases and sharing | – | ✓ |
+| Memory accounting, hard limits, durable checkpoints, shared datasets | – | ✓ |
 
 ## Status
 
-**Pre-alpha.** Interfaces will change. Working today:
+**Alpha:** interfaces may still change. Linux only. Every milestone of the
+[roadmap](https://github.com/akamoyoo/talo/blob/main/docs/roadmap.md) works:
 
-- resident sessions and background jobs (M1);
-- snapshots, rollback, branches, `tree`, `diff` (M2);
-- an interactive prompt, images as files, export to `.py` / `.ipynb` (M3);
-- tools for agents at scale: `brief`, notes, atomic runs, safe retries, revisions, progress, memory limits,
-  `reload` (M4);
-- work across sessions: `map`, services, the experiment ledger, events, handoffs, sharing (M5).
-
-- Jupyter front ends and MCP: a kernel bridge for JupyterLab / VS Code / nbclient, notebook magics, autosnap and
-  undo, `talo notebook`, `talo mcp` (M7).
-
-- trust and safety: `verify`, trial / review / adopt, hard limits, deadlines, `diagnose`, `--retain-error`,
-  artifacts, pause and lease, `memory` (M8).
-
-- durability: `save` / `restore` (content-addressed checkpoints), `recover` after a restart, `autosave` (M9).
-- shared datasets: `publish` / `talo.get` / `datasets` (M6).
-Linux only. See the [roadmap](docs/roadmap.md).
+- resident sessions and background jobs; snapshots, rollback, branches, `tree`, `diff`;
+- an interactive prompt, images as files, export to `.py` / `.ipynb`;
+- for agents at scale: `brief`, notes, atomic runs, safe retries, revisions, progress, memory limits, `reload`;
+- across sessions: `map`, services, the experiment ledger, events, handoffs, sharing;
+- shared datasets: immutable versions in memory, mapped by every session without copying;
+- Jupyter front ends (a kernel bridge, notebook magics, autosnap and undo) and an MCP server;
+- trust and safety: `verify`, trial / review / adopt, hard limits, deadlines, `diagnose`, `--retain-error`, leases;
+- durability: content-addressed checkpoints, `recover` after a restart, `autosave`.
 
 ## Install
 
-Talo has no runtime dependencies and needs Python ≥ 3.10.
+Talo needs Python ≥ 3.10 on Linux and has no runtime dependencies (`pip install "talo[jupyter]"` adds what the
+Jupyter kernel bridge needs).
 
 ```console
-$ pip install -e .            # from a checkout; a PyPI release will follow
+$ pip install talo
 $ talo --version
 ```
 
@@ -110,28 +110,24 @@ $ talo run 'x + 1'
 
 $ talo run -f load.py -t 5                # long job: returns after 5 s, keeps running
 [job 3 running 5.00s] `talo wait 3` for the result, `talo tail 3` for output, `talo interrupt 3` to stop it
-$ talo tail 3 -f                          # follow its output
 $ talo wait 3
 
 $ talo vars                               # what's in memory
 df                   pandas.DataFrame (12000000, 8)  1.1 GB
 x                    int  28 B = 41
-$ talo show df -r 5                       # dtypes and the first rows
 
 $ talo snap loaded                        # snapshot: milliseconds, even with tens of GB in memory
 $ talo run 'df = df[df.price > 0]'        # experiment ...
 $ talo checkout loaded --discard          # ... and roll back
-$ talo new idea --from loaded             # or try another idea in parallel from the same state
+$ talo map --from loaded --range 8 -f evaluate.py -j 8   # eight ideas at once, one copy of the data
 
 $ talo new research --python ~/proj/.venv/bin/python --cwd ~/proj
 $ talo run -s research 'import mylib'     # sessions are independent processes
-$ talo ls
-$ talo kill research
 ```
 
 ### For coding agents
 
-Add `--json` to any command for stable, machine-readable output:
+Add `--json` to any command for stable, machine-readable output; `talo mcp` offers the same tools to MCP clients.
 
 ```console
 $ talo run --json 'df.shape'
@@ -140,73 +136,70 @@ $ talo run --json 'df.shape'
 ```
 
 Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo itself failed, `3` still running
-(use `talo wait ID`). A typical agent loop never blocks for more than the timeout it chose.
+(`talo wait ID`). After losing its context, an agent gets back to work with `talo brief`.
 
 ## Commands
 
+`talo COMMAND --help` documents every option.
+
+**Running code**
+
 | Command | What it does |
 |---|---|
-| `talo run CODE` / `-f FILE` / `-` | run code in a session (`-s NAME`, `-t SECONDS`, `-n LINES`) |
-| `talo wait ID` | wait for a job and print its result |
-| `talo tail ID [-f] [--all]` | a job's output, optionally following it |
-| `talo interrupt ID` | interrupt a running job (cancels a queued one) |
-| `talo jobs` | jobs and their status |
-| `talo vars [PATTERN]` | variables: type, shape, dtype, memory |
-| `talo show EXPR` | a summary of a variable or expression (`df`, `df.x`, `d["k"]`) |
-| `talo history` | finished jobs with duration and memory deltas |
-| `talo snap [NAME]` | snapshot the in-memory state (milliseconds, copy-on-write) |
-| `talo checkout NAME` | roll back: replace the worker with a fork of a snapshot (`--discard`, `--snap NAME`) |
-| `talo new NAME --from SNAPSHOT` | branch: a new session forked from a snapshot |
-| `talo snaps` / `drop NAME` | snapshots with their private memory; free one |
-| `talo tree` | all snapshots and workers of all sessions as one tree |
-| `talo diff A [B]` | variables added, removed or changed between two snapshots (or a snapshot and the live worker) |
-| `talo attach` | an interactive prompt on the session: completion, history, `%snap` / `%diff` / ...; Ctrl-D detaches |
-| `talo export [-o FILE]` | the code that produced the current state as `.py` or `.ipynb` (`--snap NAME`, `--all`) |
-| `talo brief` / `note TEXT` | resume after losing context: state, notes, variables, recent and running jobs |
-| `talo run --atomic` / `--key K` / `--expect-rev N` | restore on failure; safe retries; refuse if the state changed |
-| `talo resources` | memory (PSS) of every worker and snapshot; `new --memory-limit` sets a soft limit |
-| `talo reload [MODULE] [--changed]` | reload edited modules, report names still bound to old code |
-| `talo map --from SNAP --cases FILE -f code.py -j 8` | run code once per case, each in a fork of one snapshot, in parallel |
-| `talo.expose(fn)` / `talo call SESSION.FN '{...}'` | a session as a service: calls run in forks of a pinned version |
-| `talo.record(...)` / `talo ledger` | an experiment ledger tied to the job, case and snapshot that produced each record |
-| `talo events --after CURSOR --wait 30` | wait for jobs, maps, calls, snapshots, notes without polling |
-| `talo handoff -m MSG` / `resume ID --branch NAME` | hand work over to another agent or a human |
-| `talo share --user NAME --level read/call/run` | share a session with another user on the machine |
-| `talo notebook -s NAME` / `kernelspec install` | open a session in JupyterLab / VS Code: a notebook of its code, attached to it |
-| `talo autosnap on` / `undo` | a snapshot after every execution; undo the last one (`%undo` in notebooks) |
-| `talo verify [--cold]` | replay the lineage and check it gives the same variables |
-| `talo run --trial NAME` / `review` / `adopt` | run in a fork, review, then switch the session to the result |
-| `talo new --limit memory=100G,pids=512` / `run --deadline 600` | hard limits by the kernel; deadlines and output limits |
-| `talo diagnose JOB` / `run --retain-error` | stacks of a running job; keep a failed state to debug |
-| `talo queue pause` / `lease` / `memory` | a human takes over; where the memory is and what can be released |
-| `talo save` / `restore` / `recover` / `autosave on` | durable checkpoints of variables; bring sessions back after a restart |
-| `talo publish NAME` / `talo.get("NAME")` | share a table between sessions: versions in memory, mapped without copying |
-| `talo mcp` | the same tools for an MCP client (stdio) |
-| `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
-| `talo stop` | stop the supervisor and all sessions |
+| `talo run CODE` / `-f FILE` / `-` | run code in a session (`-s NAME`, `-t SECONDS`, `--deadline`, `--atomic`, `--key`) |
+| `talo wait ID` / `tail ID [-f]` / `interrupt ID` | a job's result, its output, stop it |
+| `talo jobs` / `history` / `diagnose ID` | jobs; finished jobs with memory deltas; stacks of a running job |
+| `talo vars` / `show EXPR` / `memory` | what is in memory, a summary of one value, where the memory went |
+| `talo attach` | an interactive prompt on the session (completion, history, `%` commands) |
+| `talo new NAME` / `ls` / `kill NAME` / `stop` | manage sessions (`--python`, `--cwd`, `--limit memory=100G`) |
 
-`talo COMMAND --help` documents every option.
+**States**
+
+| Command | What it does |
+|---|---|
+| `talo snap [NAME]` / `checkout NAME` / `undo` | snapshot; roll back; go back one execution (`autosnap on`) |
+| `talo new NAME --from SNAPSHOT` | branch: a new session forked from a snapshot |
+| `talo snaps` / `tree` / `diff A [B]` / `drop NAME` | snapshots and their memory, the tree of all states, what changed |
+| `talo run --trial NAME` / `review` / `adopt` | run in a fork, review it, switch the session to it |
+| `talo verify [--cold]` | replay the code behind the current state and check it gives the same variables |
+| `talo export [-o FILE]` / `notebook` | that code as `.py` / `.ipynb`; a notebook attached to the session |
+
+**Across sessions and agents**
+
+| Command | What it does |
+|---|---|
+| `talo map --from SNAP --cases FILE -f code.py -j 8` | run code once per case, each in a fork of one snapshot |
+| `talo.expose(fn)` / `talo call SESSION.FN '{...}'` | a session as a service: calls run in forks of a pinned version |
+| `talo publish NAME` / `talo.get("NAME")` | share a table between sessions: versions in memory, mapped without copying |
+| `talo.record(...)` / `talo ledger` | an experiment ledger tied to the job, case and snapshot behind each record |
+| `talo brief` / `note TEXT` / `handoff -m MSG` | resume after losing context; hand work over |
+| `talo events --after CURSOR --wait 30` | wait for jobs, maps, calls, snapshots without polling |
+| `talo queue pause` / `lease` / `share --user NAME` | a person takes over; share with another user |
+
+**Durability**
+
+| Command | What it does |
+|---|---|
+| `talo save` / `restore` / `checkpoints` | durable checkpoints of variables, stored by content |
+| `talo recover` / `autosave on` | bring sessions back after a restart; checkpoint periodically |
 
 ## How it works
 
-```
-talo CLI (humans, agents)        JupyterLab / VS Code (M7)
-        │  JSON over a Unix socket       │  ZMQ bridge
-        └───────────────┬────────────────┘
-                 supervisor  (one per machine; holds no user data)
-                 ├─ sessions, job queues, history, output files
-                 ├─ session "default": worker process + snapshots (M2)
-                 └─ session "research": ...
-```
+<p align="center">
+  <img src="https://raw.githubusercontent.com/akamoyoo/talo/main/assets/architecture.svg" alt="Clients talk to a supervisor that holds no data; each session has a worker, snapshots and ephemeral forks; checkpoints and shared datasets are stored by content" width="860">
+</p>
 
-- The **supervisor** starts automatically on first use and routes requests; it never holds your data, so it survives
+- The **supervisor** starts automatically on first use and routes requests; it never holds your data, so it outlives
   a worker crash and tells you what happened (for example an out-of-memory kill).
-- Each session's **worker** is a single-threaded process running in your chosen interpreter. It is a single
-  standard-library-only file executed by path.
-- Messages use the structure of the **Jupyter messaging protocol** (`execute_request`, `execute_result`, `error`,
-  `status`, ...), with Talo's own extensions prefixed `talo_`. See [docs/protocol.md](docs/protocol.md).
+- Each session's **worker** is a single-threaded process running in your chosen interpreter: one standard-library-only
+  file executed by path.
+- **Snapshots** are suspended `fork()`s of the worker taken between executions; **ephemeral forks** of them run map
+  cases, service calls and trials in parallel; all of them share the pages they do not change.
+- Messages follow the **Jupyter messaging protocol** (`execute_request`, `execute_result`, `error`, `status`, ...),
+  with Talo's own extensions prefixed `talo_` ([protocol](https://github.com/akamoyoo/talo/blob/main/docs/protocol.md)).
 
-Details, trade-offs and known limitations are in [docs/design.md](docs/design.md).
+Details, trade-offs and known limitations are in
+[docs/design.md](https://github.com/akamoyoo/talo/blob/main/docs/design.md).
 
 ## Development
 
@@ -215,8 +208,10 @@ $ uv venv && uv pip install -e ".[dev]"
 $ .venv/bin/pytest
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+See [CONTRIBUTING.md](https://github.com/akamoyoo/talo/blob/main/CONTRIBUTING.md). Changes are listed in
+[CHANGELOG.md](https://github.com/akamoyoo/talo/blob/main/CHANGELOG.md).
 
 ## License
 
-[Apache License 2.0](LICENSE). The Talo name and logo are not covered by the license.
+[Apache License 2.0](https://github.com/akamoyoo/talo/blob/main/LICENSE). The Talo name and logo are not covered by
+the license.

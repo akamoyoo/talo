@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 470" width="900" height="470" role="img"
+     aria-label="Talo architecture: clients talk to a supervisor that holds no data; each session has a worker, snapshots and ephemeral forks; datasets and checkpoints are stored by content">
+  <title>Talo architecture</title>
+  <style>
+    text { font-family: "Latin Modern Roman", "CMU Serif", "Computer Modern", Georgia, "Times New Roman", serif; fill: #1f2937; }
+    .small { font-size: 12.5px; }
+    .label { font-size: 15px; }
+    .title { font-size: 16px; font-weight: bold; }
+    .note { font-size: 12px; font-style: italic; fill: #4b5563; }
+    .box { stroke: #374151; stroke-width: 1.2; }
+    .client { fill: #e8eef9; }
+    .sup { fill: #fdecd8; }
+    .sess { fill: #f7f7f7; stroke-dasharray: 5 3; }
+    .worker { fill: #dcefdc; }
+    .snap { fill: #e8eef9; }
+    .eph { fill: #fff7d6; }
+    .store { fill: #efe6f7; }
+    .edge { stroke: #374151; stroke-width: 1.2; fill: none; }
+    .fork { stroke: #374151; stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+    .head { fill: #374151; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e5e7eb; }
+      .note { fill: #9ca3af; }
+      .box, .edge, .fork { stroke: #9ca3af; }
+      .head { fill: #9ca3af; }
+      .client { fill: #1e2a3d; }
+      .sup { fill: #3a2a17; }
+      .sess { fill: #161b22; }
+      .worker { fill: #183222; }
+      .snap { fill: #1e2a3d; }
+      .eph { fill: #33300f; }
+      .store { fill: #2a1f36; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 z" class="head"/>
+    </marker>
+  </defs>
+
+  <!-- clients -->
+  <rect class="box client" x="20" y="40" width="190" height="52" rx="8"/>
+  <text class="label" x="115" y="62" text-anchor="middle">talo CLI</text>
+  <text class="small" x="115" y="80" text-anchor="middle">agents and people, --json</text>
+  <rect class="box client" x="20" y="110" width="190" height="52" rx="8"/>
+  <text class="label" x="115" y="132" text-anchor="middle">JupyterLab · VS Code</text>
+  <text class="small" x="115" y="150" text-anchor="middle">talo kernel (ZMQ bridge)</text>
+  <rect class="box client" x="20" y="180" width="190" height="52" rx="8"/>
+  <text class="label" x="115" y="202" text-anchor="middle">MCP clients</text>
+  <text class="small" x="115" y="220" text-anchor="middle">talo mcp (stdio)</text>
+  <rect class="box client" x="20" y="250" width="190" height="52" rx="8"/>
+  <text class="label" x="115" y="272" text-anchor="middle">other users</text>
+  <text class="small" x="115" y="290" text-anchor="middle">shared socket, by level</text>
+
+  <!-- supervisor -->
+  <rect class="box sup" x="270" y="95" width="200" height="150" rx="10"/>
+  <text class="title" x="370" y="122" text-anchor="middle">supervisor</text>
+  <text class="small" x="370" y="146" text-anchor="middle">holds no user data</text>
+  <text class="small" x="370" y="170" text-anchor="middle">job queues · revisions</text>
+  <text class="small" x="370" y="188" text-anchor="middle">history · events · ledger</text>
+  <text class="small" x="370" y="206" text-anchor="middle">snapshot tree · pins</text>
+  <text class="small" x="370" y="224" text-anchor="middle">memory limits · leases</text>
+
+  <path class="edge" d="M210,66 C240,66 245,140 268,150" marker-end="url(#arrow)"/>
+  <path class="edge" d="M210,136 C238,136 245,160 268,163" marker-end="url(#arrow)"/>
+  <path class="edge" d="M210,206 C238,206 245,180 268,177" marker-end="url(#arrow)"/>
+  <path class="edge" d="M210,276 C240,276 245,200 268,192" marker-end="url(#arrow)"/>
+  <text class="note" x="115" y="326" text-anchor="middle">all of them: JSON over Unix sockets</text>
+
+  <!-- session -->
+  <rect class="box sess" x="520" y="20" width="360" height="300" rx="12"/>
+  <text class="title" x="700" y="44" text-anchor="middle">session "research"</text>
+
+  <rect class="box worker" x="550" y="62" width="300" height="62" rx="8"/>
+  <text class="label" x="700" y="86" text-anchor="middle">worker: your variables, in memory</text>
+  <text class="small" x="700" y="106" text-anchor="middle">any interpreter · stdlib only · cgroup limits</text>
+  <path class="edge" d="M470,150 C500,150 515,93 548,93" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text class="note" x="495" y="62" text-anchor="middle">Jupyter-</text>
+  <text class="note" x="495" y="76" text-anchor="middle">shaped</text>
+
+  <!-- snapshots -->
+  <rect class="box snap" x="560" y="160" width="80" height="40" rx="7"/>
+  <text class="label" x="600" y="185" text-anchor="middle">loaded</text>
+  <rect class="box snap" x="660" y="160" width="80" height="40" rx="7"/>
+  <text class="label" x="700" y="185" text-anchor="middle">@12</text>
+  <rect class="box snap" x="760" y="160" width="80" height="40" rx="7"/>
+  <text class="label" x="800" y="185" text-anchor="middle">trial-clean</text>
+  <path class="fork" d="M640,124 L605,158" marker-end="url(#arrow)"/>
+  <path class="fork" d="M700,124 L700,158" marker-end="url(#arrow)"/>
+  <path class="fork" d="M760,124 L795,158" marker-end="url(#arrow)"/>
+
+  <!-- ephemeral -->
+  <rect class="box eph" x="560" y="240" width="56" height="30" rx="6"/>
+  <rect class="box eph" x="624" y="240" width="56" height="30" rx="6"/>
+  <rect class="box eph" x="688" y="240" width="56" height="30" rx="6"/>
+  <rect class="box eph" x="752" y="240" width="88" height="30" rx="6"/>
+  <text class="small" x="588" y="260" text-anchor="middle">case 0</text>
+  <text class="small" x="652" y="260" text-anchor="middle">case 1</text>
+  <text class="small" x="716" y="260" text-anchor="middle">case 2</text>
+  <text class="small" x="796" y="260" text-anchor="middle">call v1</text>
+  <path class="fork" d="M590,200 L588,238" marker-end="url(#arrow)"/>
+  <path class="fork" d="M605,200 L650,238" marker-end="url(#arrow)"/>
+  <path class="fork" d="M615,200 L712,238" marker-end="url(#arrow)"/>
+  <path class="fork" d="M700,200 L790,238" marker-end="url(#arrow)"/>
+  <text class="note" x="700" y="294" text-anchor="middle">snapshots, map cases, calls, trials: fork()s,</text>
+  <text class="note" x="700" y="309" text-anchor="middle">sharing every page they do not change</text>
+
+  <!-- stores -->
+  <rect class="box store" x="270" y="360" width="290" height="80" rx="10"/>
+  <text class="title" x="415" y="386" text-anchor="middle">checkpoints</text>
+  <text class="small" x="415" y="406" text-anchor="middle">on disk · buffers stored by content</text>
+  <text class="small" x="415" y="424" text-anchor="middle">save · restore · recover after a restart</text>
+  <rect class="box store" x="590" y="360" width="290" height="80" rx="10"/>
+  <text class="title" x="735" y="386" text-anchor="middle">shared datasets</text>
+  <text class="small" x="735" y="406" text-anchor="middle">/dev/shm · immutable versions</text>
+  <text class="small" x="735" y="424" text-anchor="middle">mapped read-only by every session</text>
+  <path class="edge" d="M560,320 C545,345 450,335 430,358" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text class="note" x="485" y="333" text-anchor="middle">save · restore</text>
+  <path class="edge" d="M735,320 L735,358" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text class="note" x="790" y="344" text-anchor="middle">publish · get</text>
+</svg>
