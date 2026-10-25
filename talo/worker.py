@@ -686,7 +686,8 @@ def save_units(namespace: dict, names: list, store: str) -> dict:
             stream_bytes = os.path.getsize(os.path.join(tmp, "stream"))
             new = _install(tmp, os.path.join(units_dir, digest), units_dir)
             units.append({"hash": digest, "names": members, "bytes": stream_bytes + sum(s for _, s in buffers),
-                          "new_bytes": new_bytes + (stream_bytes if new else 0)})
+                          "new_bytes": new_bytes + (stream_bytes if new else 0),
+                          "buffer_bytes": sum(s for _, s in buffers), "stream_bytes": stream_bytes})
         except Exception as error:  # noqa: BLE001 - this unit is skipped, the others are saved
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1010,29 +1011,48 @@ class Helper:
             raise RuntimeError("shared datasets need $TALO_DATASETS (set for workers started by Talo)")
         return root
 
-    def publish(self, name: str, value) -> int:
+    def _store_lock(self, root: str):
+        """Shared while publishing or mapping, exclusive for garbage collection: gc never removes buffers that a
+        publication has written but not yet listed, or that a reader is about to map."""
+        import fcntl
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        lock = open(os.path.join(root, ".gc-lock"), "a")
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        return lock
+
+    def publish(self, name: str, value, key: str | None = None) -> int:
         """Publish ``value`` as a new, immutable version of the shared dataset ``name`` (``talo.get(name)`` in any
-        session maps it without copying); returns the version number. Unchanged buffers are shared with earlier
-        versions."""
+        session maps its buffers without copying); returns the version number. Unchanged buffers are shared with
+        earlier versions. Publishing takes effect at once: a later failure or rollback of the job does not undo it.
+        With ``key``, publishing again under the same key returns the version already published."""
         import fcntl
         import json as _json
+        import shutil
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
             raise ValueError(f"dataset name {name!r}: letters, digits, '.', '-' and '_' only")
         root = self._datasets()
-        out = save_units({name: value}, [name], os.path.join(root, "store"))
-        if out["skipped"]:
-            raise ValueError(f"cannot publish {name}: {out['skipped'][0]['reason']}")
-        unit = out["units"][0]
         folder = os.path.join(root, "datasets", name)
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, ".lock"), "w") as lock:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        estimate, free = _buffer_nbytes(value) or 0, shutil.disk_usage(root).free
+        if estimate > free:
+            raise OSError(f"publishing {name} needs about {estimate >> 20} MB; {root} has {free >> 20} MB free")
+        with self._store_lock(root), open(os.path.join(folder, ".lock"), "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)  # versions are numbered in order, whoever publishes
-            versions = [int(f[1:-5]) for f in os.listdir(folder) if re.fullmatch(r"v\d+\.json", f)]
-            version = max(versions, default=0) + 1
+            manifests = [_json.loads(open(os.path.join(folder, f)).read()) for f in os.listdir(folder)
+                         if re.fullmatch(r"v\d+\.json", f)]
+            if key is not None:
+                done = [m for m in manifests if m.get("key") == key]
+                if done:
+                    return done[0]["version"]
+            out = save_units({name: value}, [name], os.path.join(root, "store"))
+            if out["skipped"]:
+                raise ValueError(f"cannot publish {name}: {out['skipped'][0]['reason']}")
+            unit = out["units"][0]
+            version = max((m["version"] for m in manifests), default=0) + 1
             manifest = {"format": CHECKPOINT_FORMAT, "dataset": name, "version": version, "created": time.time(),
-                        "unit": unit, "type": type(value).__name__, "shape": list(getattr(value, "shape", []) or []),
-                        "job": (self._worker.parent or {}).get("metadata", {}).get("talo_job"),
-                        "pid": os.getpid()}
+                        "key": key, "unit": unit, "type": type(value).__name__,
+                        "shape": list(getattr(value, "shape", []) or []),
+                        "job": (self._worker.parent or {}).get("metadata", {}).get("talo_job"), "pid": os.getpid()}
             for fname, content in ((f"v{version}.json", _json.dumps(manifest, indent=1)), ("latest", str(version))):
                 tmp = os.path.join(folder, f".{fname}.tmp")
                 with open(tmp, "w") as f:
@@ -1043,8 +1063,9 @@ class Helper:
             _fsync_dir(folder)
         if self._worker.parent is not None:
             self._worker.send("talo_dataset", {"name": name, "version": version, "action": "published",
-                                               "bytes": unit["bytes"], "new_bytes": unit["new_bytes"]},
-                              self._worker.parent)
+                                               "bytes": unit["bytes"], "new_bytes": unit["new_bytes"],
+                                               "mapped_bytes": unit["buffer_bytes"],
+                                               "private_bytes": unit["stream_bytes"]}, self._worker.parent)
         return version
 
     def get(self, name: str, version: int | None = None, copy: bool = False, verify: bool = False):
@@ -1062,7 +1083,9 @@ class Helper:
         except FileNotFoundError:
             raise LookupError(f"dataset {name!r} has no version {version}") from None
         box: dict = {}
-        load_units(box, os.path.join(self._datasets(), "store"), [manifest["unit"]], mapped=not copy, verify=verify)
+        with self._store_lock(self._datasets()):  # gc waits until the buffers are mapped
+            load_units(box, os.path.join(self._datasets(), "store"), [manifest["unit"]], mapped=not copy,
+                       verify=verify)
         if self._worker.parent is not None:
             self._worker.send("talo_dataset", {"name": name, "version": int(version), "action": "read",
                                                "copy": copy}, self._worker.parent)

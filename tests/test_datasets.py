@@ -60,3 +60,16 @@ def test_map_cases_read_one_copy(talo):
     assert all(r["datasets"][0]["version"] == 1 for r in d["map"]["rows"])
     rc, ds = run_json(talo, "datasets")
     assert ds["datasets"][0]["name"] == "big" and ds["stored_bytes"] >= 40_000_000
+
+
+def test_publish_keys_byte_counts_and_gc_exclusion(talo):
+    talo("run", "import numpy as np, pandas as pd\n"
+                "t = pd.DataFrame({'x': np.arange(100_000.0), 's': [str(i) for i in range(100_000)]})")
+    rc, out = run_json(talo, "publish", "t")
+    r = out["job"]["result"]
+    assert r["mapped_bytes"] >= 800_000 and r["private_bytes"] > 0
+    assert result(talo, "talo.publish('k', np.ones(3), key='once'), talo.publish('k', np.ones(3), key='once')") == "(1, 1)"
+    rc, d = run_json(talo, "datasets")
+    assert {x["name"] for x in d["datasets"]} == {"t", "k"} and d["free_bytes"] > 0
+    rc, out = run_json(talo, "dataset", "gc")
+    assert rc == 0

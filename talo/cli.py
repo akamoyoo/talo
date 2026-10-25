@@ -1093,8 +1093,9 @@ def cmd_publish(args):
         print(json.dumps({"job": d}, ensure_ascii=False, default=str))
     elif d["status"] == "ok":
         r = d["result"]
-        print(f"dataset {r['dataset']} v{r['version']}: {human_bytes(r['bytes'])} ({human_bytes(r['new_bytes'])} new), "
-              f"from {d['session']} rev {r['rev']}; read it with talo.get({r['dataset']!r})")
+        print(f"dataset {r['dataset']} v{r['version']}: {human_bytes(r['bytes'])} ({human_bytes(r['new_bytes'])} new; "
+              f"{human_bytes(r['mapped_bytes'])} shared by mapping, {human_bytes(r['private_bytes'])} rebuilt by each "
+              f"reader), from {d['session']} rev {r['rev']}; read it with talo.get({r['dataset']!r})")
     else:
         show_job(args, d)
     return exit_code(d)
@@ -1111,7 +1112,8 @@ def cmd_datasets(args):
                 shape = f" {tuple(v['shape'])}" if v["shape"] else ""
                 print(f"{ds['name']:20s} v{v['version']:<3} {v['type']}{shape}  {human_bytes(v['bytes'])} "
                       f"({human_bytes(v['new_bytes'])} new){latest}")
-        print(f"({human_bytes(d['stored_bytes'])} stored in {where})", file=sys.stderr)
+        print(f"({human_bytes(d['stored_bytes'])} stored in {where}; {human_bytes(d['free_bytes'])} free of "
+              f"{human_bytes(d['capacity_bytes'])})", file=sys.stderr)
     emit(args, call("datasets"), human)
 
 

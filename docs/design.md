@@ -746,7 +746,8 @@ for the pages it changes; restoring needs the memory of the restored values.
 ## Shared datasets (M6)
 
 One session prepares a table; other sessions, agents and map cases use it without loading it again and without
-copying it, and move to a newer version when they choose. Versions are immutable; there is no live shared object.
+copying it, and move to a newer version when they choose. The published data is immutable; there is no live shared object. Producers and consumers must trust each other:
+reading a dataset unpickles it, which runs code.
 
 ```console
 $ talo publish panel -s loader              # the variable panel, as version 1 of dataset "panel"
@@ -771,18 +772,25 @@ panel = talo.get("panel", copy=True)        # a private, writable copy
   objects, small metadata) are unpickled privately in each reader. Sizes are checked on every read; content hashes
   are checked when the version is published and with `talo.get(..., verify=True)`.
 - **Publishing.** `talo publish NAME [VAR] [-s SESSION]` writes from a fork of the session through the queue (like
-  `save`); `talo.publish(name, value)` writes from running code. The version's manifest is written last and
+  `save`); `talo.publish(name, value, key=None)` writes from running code; publishing takes
+  effect at once and is not undone if the job later fails or is rolled back (`key` makes a retry return the version
+  already published). Free space is checked first; a publication that fails leaves `latest` where it was. The version's manifest is written last and
   `latest` is moved atomically, so a reader always gets a complete version. The manifest records the publishing
   session, job, revision and time.
 - **Versions are explicit.** `talo.get(name)` resolves `latest` once; the arrays it returned stay that version for as
-  long as they are used, whatever is published later. Each job records the dataset versions it read
-  (`datasets` on the job), so the ledger, export and verify know what a result depended on.
+  long as they are used, whatever is published later. Each job records the versions it acquired with `talo.get`
+  or published (`datasets` on the job). This is what was observed, not a complete dependency record: a later job
+  that uses a table obtained earlier does not call `get` again.
 - **Lifetime.** `talo dataset drop NAME [--version V]` removes versions; sessions that hold a version keep using it
   (the kernel keeps the pages of unlinked files that are mapped) and its memory is freed when the last one lets go.
   `talo datasets` lists datasets, versions, sizes, and the memory they occupy in `/dev/shm`; `talo dataset gc` removes
-  buffers no version uses.
-- **Memory accounting.** Pages of `/dev/shm` are shared memory: they count once for the machine, not per reader, and
-  `talo resources` reports the datasets' memory separately. A cgroup charges them to the session that wrote them.
+  buffers no version uses; it waits for no publication or mapping to be in progress (they hold a shared lock).
+  Dropping the latest version moves `latest` back to the newest one left.
+- **Memory accounting.** Pages of `/dev/shm` are shared memory: they count once for the machine, appear in
+  every reader's resident and proportional memory, and are charged by the kernel to the cgroup that first touched
+  them. `talo datasets` reports the bytes stored and the free space of the store; a publication also reports how
+  much of the version is shared by mapping and how much each reader rebuilds privately (the pickle stream: object
+  columns, Python objects, metadata).
 
 ## Known limitations
 

@@ -3107,7 +3107,9 @@ class Supervisor:
                 return
             published = next(d for d in job.datasets if d["action"] == "published")
             job.result = {"dataset": published["name"], "version": published["version"],
-                          "bytes": published["bytes"], "new_bytes": published["new_bytes"], "rev": fork.result["rev"]}
+                          "bytes": published["bytes"], "new_bytes": published["new_bytes"],
+                          "mapped_bytes": published["mapped_bytes"], "private_bytes": published["private_bytes"],
+                          "rev": fork.result["rev"]}
             session._finish(job, "ok")
             self.emit("dataset.published", session=session.name, dataset=published["name"],
                       version=published["version"], job=job.id)
@@ -3151,7 +3153,10 @@ class Supervisor:
             for f in d.rglob("*") if d.exists() else []:
                 if f.is_file():
                     used += f.stat().st_blocks * 512
-        return {"root": str(root), "datasets": out, "stored_bytes": used, "in_memory": str(root).startswith("/dev/shm")}
+        import shutil
+        total, _, free = shutil.disk_usage(root) if root.exists() else (0, 0, 0)
+        return {"root": str(root), "datasets": out, "stored_bytes": used, "in_memory": str(root).startswith("/dev/shm"),
+                "capacity_bytes": total, "free_bytes": free}
 
     async def op_dataset_drop(self, req):
         folder = datasets_root() / "datasets" / req["name"]
@@ -3172,6 +3177,21 @@ class Supervisor:
 
     async def op_dataset_gc(self, req):
         """Remove dataset buffers no version uses (files still mapped by a session stay in memory until unmapped)."""
+        import fcntl
+        import shutil
+        datasets_root().mkdir(mode=0o700, parents=True, exist_ok=True)
+        gc_lock = open(datasets_root() / ".gc-lock", "a")
+        try:  # exclusive: no publication or mapping in progress (they hold it shared)
+            fcntl.flock(gc_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            gc_lock.close()
+            raise RuntimeError("datasets are being published or mapped right now; run gc again in a moment") from None
+        try:
+            return self._dataset_gc(req)
+        finally:
+            gc_lock.close()
+
+    def _dataset_gc(self, req) -> dict:
         import shutil
         root = datasets_root() / "store"
         used_units = {v["unit"]["hash"] for vs in self._dataset_manifests().values() for v in vs}
