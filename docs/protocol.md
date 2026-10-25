@@ -43,7 +43,6 @@ provides `_repr_html_` / `_repr_markdown_`.
 |---|---|
 | `talo_vars_request` (`pattern`) | `variables`: list of `{name, type, nbytes, shape | len, dtype, columns, value}`; `rss` |
 | `talo_show_request` (`name`: variable or expression, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
-
 | `talo_snapshot_request` (`id`, `socket`: path to listen on, `strict`) | `pid` of the snapshot process, `threads`: names of the other threads present at fork time — or `status: error` (`strict` and other threads exist) |
 
 ### Snapshot sockets
@@ -56,6 +55,7 @@ one per connection:
 | `{"op": "info"}` | `{"ok": true, "pid": …, "execution_count": …}` |
 | `{"op": "vars"}` | `{"ok": true, "variables": [...]}` (as `talo_vars_reply`; the snapshot's state is never modified) |
 | `{"op": "spawn"}` | the snapshot forks; the child replies `{"ok": true, "pid": …}` and from then on speaks the kernel protocol on this connection as the session's new worker |
+| `{"op": "hold"}` | no reply; the supervisor keeps this connection open, and the snapshot exits when it closes |
 | `{"op": "exit"}` | the snapshot exits |
 
 ## Control requests

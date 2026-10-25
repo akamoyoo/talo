@@ -91,9 +91,23 @@ def exit_code(job: dict) -> int:
 
 # ---------------------------------------------------------------- commands
 
+def parse_size(text: str | None) -> int | None:
+    """'200G', '512M', '1.5T' or a number of bytes."""
+    if not text:
+        return None
+    units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    text = text.strip().upper().rstrip("B")
+    if text and text[-1] in units:
+        return int(float(text[:-1]) * units[text[-1]])
+    return int(text)
+
+
 def cmd_new(args):
-    s = call("new", name=args.name, python=args.python or sys.executable, cwd=os.path.abspath(args.cwd or os.getcwd()))
-    emit(args, s, lambda d: print(f"session {d['name']} started: pid {d['pid']}, {d['python']}, cwd {d['cwd']}"))
+    s = call("new", name=args.name, python=args.python or (None if args.from_ else sys.executable),
+             cwd=os.path.abspath(args.cwd or os.getcwd()), memory_budget=parse_size(args.memory_budget),
+             **({"from": args.from_} if args.from_ else {}))
+    origin = f", forked from {s['base']}" if s.get("base") else ""
+    emit(args, s, lambda d: print(f"session {d['name']} started: pid {d['pid']}, {d['python']}, cwd {d['cwd']}{origin}"))
 
 
 def cmd_ls(args):
@@ -214,6 +228,39 @@ def cmd_history(args):
     emit(args, call("history", session=session_name(args), last=args.last), human)
 
 
+def cmd_snap(args):
+    d = call("snap", session=session_name(args), name=args.name, message=args.message or "", strict=args.strict)
+    def human(x):
+        threads = f"; {len(x['threads'])} other threads at fork time" if x.get("threads") else ""
+        print(f"snapshot {x['name']} ({x['ref']}): pid {x['pid']}, after {len(x['jobs'])} jobs since "
+              f"{x['parent'] or 'session start'}{threads}")
+    emit(args, d, human)
+
+
+def cmd_snaps(args):
+    def human(d):
+        if not d["snapshots"]:
+            print("(no snapshots; `talo snap NAME` takes one)")
+        for s in d["snapshots"]:
+            here = "  <- base of the current worker" if s["ref"] == d["base"] else ""
+            alive = "" if s["alive"] else "  (gone)"
+            msg = f"  {s['message']}" if s["message"] else ""
+            print(f"{s['name']:16s} {s['ref']:20s} parent {s['parent'] or '-':20s} private {human_bytes(s['private_bytes'])}"
+                  f"  jobs {','.join(s['jobs']) or '-'}{msg}{alive}{here}")
+        if d["jobs_since_base"]:
+            print(f"(jobs since the base: {', '.join(d['jobs_since_base'])})")
+    emit(args, call("snaps", session=session_name(args)), human)
+
+
+def cmd_checkout(args):
+    d = call("checkout", session=session_name(args), name=args.name, discard=args.discard, snap=args.snap)
+    emit(args, d, lambda x: print(f"session {x['name']} now runs a fork of {x['base']} (pid {x['pid']})"))
+
+
+def cmd_drop(args):
+    emit(args, call("drop", session=session_name(args), name=args.name), lambda d: print(f"dropped {d['dropped']}"))
+
+
 def cmd_stop(args):
     try:
         call("shutdown", autostart=False)
@@ -245,6 +292,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("--python", help="interpreter for the worker (default: the one running talo)")
     p.add_argument("--cwd", help="working directory of the worker (default: the current directory)")
+    p.add_argument("--from", dest="from_", metavar="[SESSION:]SNAPSHOT",
+                   help="start from a snapshot instead of an empty interpreter (a branch)")
+    p.add_argument("--memory-budget", metavar="SIZE",
+                   help="refuse new snapshots when the worker plus its snapshots use more than this (e.g. 200G)")
     add("ls", cmd_ls, "list sessions", session=False)
     p = add("kill", cmd_kill, "close a session (its variables are freed)", session=False)
     p.add_argument("name")
@@ -276,6 +327,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-r", "--rows", type=int, default=10)
     p = add("history", cmd_history, "execution history")
     p.add_argument("--last", type=int, default=20)
+    p = add("snap", cmd_snap, "snapshot the session's in-memory state (queued after running jobs)")
+    p.add_argument("name", nargs="?", help="snapshot name (default s1, s2, ...)")
+    p.add_argument("-m", "--message")
+    p.add_argument("--strict", action="store_true", help="refuse when the worker has other threads (see docs)")
+    add("snaps", cmd_snaps, "list the session's snapshots with their private memory")
+    p = add("checkout", cmd_checkout, "replace the session's worker with a fork of a snapshot (roll back)")
+    p.add_argument("name", help="[SESSION:]SNAPSHOT")
+    p.add_argument("--discard", action="store_true", help="drop the state of jobs run since the current base")
+    p.add_argument("--snap", metavar="NAME", help="snapshot the current state under NAME before checking out")
+    p = add("drop", cmd_drop, "free a snapshot")
+    p.add_argument("name")
     add("stop", cmd_stop, "stop the supervisor (closes all sessions)", session=False)
     add("daemon", cmd_daemon, "run the supervisor in the foreground (for debugging; normally started automatically)",
         session=False)

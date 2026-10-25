@@ -18,13 +18,17 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib.util
+import json
 import linecache
 import os
+import select
 import signal
 import socket
 import sys
+import threading
 import time
 import traceback
+import warnings
 from pathlib import Path
 
 
@@ -219,6 +223,99 @@ def show(value, rows: int) -> str:
     return truncate(repr(value), 5000)[0]
 
 
+# ---------------------------------------------------------------- snapshots
+
+def other_threads() -> list[str]:
+    """Names of the threads in this process other than the calling one (from /proc/self/task/*/comm)."""
+    me = str(threading.get_native_id())
+    names = []
+    for tid in os.listdir("/proc/self/task"):
+        if tid == me:
+            continue
+        try:
+            with open(f"/proc/self/task/{tid}/comm") as f:
+                names.append(f.read().strip())
+        except OSError:
+            pass
+    return names
+
+
+def _reply(conn: socket.socket, obj: dict) -> None:
+    conn.sendall(json.dumps(obj, default=str).encode() + b"\n")
+
+
+class Snapshot:
+    """The snapshot side of a fork: a suspended copy of the worker that serves requests on its own socket.
+
+    ``serve`` only returns in a process created by ``spawn``: that process is the session's new worker, and
+    ``serve`` hands it the connection it should use."""
+
+    def __init__(self, worker: "Worker", listener: socket.socket, path: str):
+        self.worker, self.listener, self.path = worker, listener, path
+        self.holds: list[socket.socket] = []
+        self.children_file = path[: -len(".sock")] + ".children" if path.endswith(".sock") else path + ".children"
+
+    def _reap(self, *_):
+        """SIGCHLD: record how spawned workers ended, so the supervisor can report it."""
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid == 0:
+                return
+            with open(self.children_file, "a") as f:
+                f.write(f"{pid} {os.waitstatus_to_exitcode(status)}\n")
+
+    def serve(self) -> socket.socket:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGCHLD, self._reap)
+        while True:
+            readable, _, _ = select.select([self.listener, *self.holds], [], [])
+            for sock in readable:
+                if sock in self.holds:  # the supervisor closed its hold connection: it is gone or dropped us
+                    if not sock.recv(1):
+                        os._exit(0)
+                    continue
+                conn, _ = self.listener.accept()
+                line = conn.makefile("rb").readline()
+                if not line:
+                    conn.close()
+                    continue
+                op = json.loads(line).get("op")
+                if op == "hold":
+                    self.holds.append(conn)
+                elif op == "info":
+                    _reply(conn, {"ok": True, "pid": os.getpid(), "execution_count": self.worker.execution_count})
+                    conn.close()
+                elif op == "vars":
+                    rows = [describe(k, v) for k, v in list(self.worker.namespace.items()) if is_user_variable(k, v)]
+                    _reply(conn, {"ok": True, "variables": rows})
+                    conn.close()
+                elif op == "spawn":
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)  # see "Fork safety" in docs/design.md
+                        pid = os.fork()
+                    if pid == 0:
+                        return self._become_worker(conn)
+                    conn.close()
+                elif op == "exit":
+                    _reply(conn, {"ok": True})
+                    os._exit(0)
+                else:
+                    _reply(conn, {"ok": False, "error": f"unknown op {op!r}"})
+                    conn.close()
+
+    def _become_worker(self, conn: socket.socket) -> socket.socket:
+        self.listener.close()
+        for h in self.holds:
+            h.close()
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        _reply(conn, {"ok": True, "pid": os.getpid()})
+        return conn
+
+
 # ---------------------------------------------------------------- execution
 
 class Worker:
@@ -307,11 +404,47 @@ class Worker:
         self.send("execute_reply", reply, msg, metadata=metrics)
         self.status("idle", msg)
 
+    def snapshot(self, msg: dict) -> None:
+        """Fork a snapshot of the current state (see "Snapshots" in docs/design.md). In the parent this replies with
+        the snapshot's pid; in a worker later spawned from the snapshot, it returns with ``self.sock`` replaced."""
+        content = msg["content"]
+        threads = other_threads()
+        if content.get("strict") and threads:
+            self.send("talo_snapshot_reply", {"status": "error", "ename": "ThreadsPresent",
+                                              "evalue": f"{len(threads)} other threads: {', '.join(threads[:10])}",
+                                              "threads": threads}, msg)
+            return
+        path = content["socket"]
+        if os.path.exists(path):
+            os.unlink(path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        os.chmod(path, 0o600)
+        listener.listen(16)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # see "Fork safety" in docs/design.md
+            pid = os.fork()
+        if pid:
+            listener.close()
+            self.send("talo_snapshot_reply", {"status": "ok", "pid": pid, "threads": threads,
+                                              "execution_count": self.execution_count}, msg)
+            return
+        # the snapshot process: drop the worker's connection and wait; serve() returns only in a spawned worker
+        self.rfile.close()
+        self.wfile.close()
+        self.sock.close()
+        conn = Snapshot(self, listener, path).serve()
+        self.sock, self.rfile, self.wfile = conn, conn.makefile("rb"), conn.makefile("wb")
+
     def handle(self, msg: dict) -> bool:
         """Handle one message; return False to exit."""
         kind = wire.msg_type(msg)
         if kind == "execute_request":
             self.execute(msg)
+        elif kind == "talo_snapshot_request":
+            self.snapshot(msg)
         elif kind == "kernel_info_request":
             self.send("kernel_info_reply", {
                 "status": "ok", "protocol_version": wire.PROTOCOL_VERSION, "implementation": "talo",

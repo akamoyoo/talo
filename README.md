@@ -50,16 +50,16 @@ driven from the shell, plus what Jupyter does not have:
 | Connect from JupyterLab / VS Code | ✓ | ✓ (M4, Jupyter messaging protocol) |
 | Driven from the terminal by agents, non-blocking commands, background jobs | – | ✓ |
 | Structured, truncated output with `--json` | – | ✓ |
-| **Snapshots, rollback and branches of the in-memory state** | – | ✓ (M2) |
+| **Snapshots, rollback and branches of the in-memory state** | – | ✓ |
 | Execution history with memory deltas, export to a replayable script | partial | ✓ |
-| Memory accounting and budgets per session | – | ✓ (M2) |
+| Memory accounting and budgets per session | – | ✓ |
 
 Snapshots use copy-on-write `fork()`: taking one costs milliseconds even with tens of gigabytes in memory, and it only
 consumes extra memory for the pages you modify afterwards (measurements: [spikes/README.md](spikes/README.md)).
 
 ## Status
 
-**Pre-alpha.** Milestone M1 (resident execution) works; snapshots (M2) are in progress. Interfaces will change.
+**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches (M2) work; `diff` between snapshots and the remaining M2 items are next. Interfaces will change.
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
@@ -92,6 +92,11 @@ df                   pandas.DataFrame (12000000, 8)  1.1 GB
 x                    int  28 B = 41
 $ talo show df -r 5                       # dtypes and the first rows
 
+$ talo snap loaded                        # snapshot: milliseconds, even with tens of GB in memory
+$ talo run 'df = df[df.price > 0]'        # experiment ...
+$ talo checkout loaded --discard          # ... and roll back
+$ talo new idea --from loaded             # or try another idea in parallel from the same state
+
 $ talo new research --python ~/proj/.venv/bin/python --cwd ~/proj
 $ talo run -s research 'import mylib'     # sessions are independent processes
 $ talo ls
@@ -123,7 +128,11 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` talo its
 | `talo vars [PATTERN]` | variables: type, shape, dtype, memory |
 | `talo show EXPR` | a summary of a variable or expression (`df`, `df.x`, `d["k"]`) |
 | `talo history` | finished jobs with duration and memory deltas |
-| `talo new NAME` / `ls` / `kill NAME` | manage sessions |
+| `talo snap [NAME]` | snapshot the in-memory state (milliseconds, copy-on-write) |
+| `talo checkout NAME` | roll back: replace the worker with a fork of a snapshot (`--discard`, `--snap NAME`) |
+| `talo new NAME --from SNAPSHOT` | branch: a new session forked from a snapshot |
+| `talo snaps` / `drop NAME` | snapshots with their private memory; free one |
+| `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
 
 `talo COMMAND --help` documents every option.
