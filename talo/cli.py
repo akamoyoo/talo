@@ -229,6 +229,8 @@ def cmd_run(args):
 
 def cmd_wait(args):
     job = call("job", id=args.id, wait=args.timeout)
+    if "call" in job:
+        return show_call(args, job["call"])
     if "map" in job:
         return show_map(args, job["map"])
     show_job(args, job)
@@ -267,6 +269,59 @@ def show_map(args, m: dict) -> int:
         print(f"[map {m['id']} running {m['elapsed_s']:.1f}s] `talo wait {m['id']}`, `talo interrupt {m['id']}`",
               file=sys.stderr)
     return code
+
+
+def show_call(args, c: dict) -> int:
+    code = {"ok": 0, "running": 3}.get(c["status"], 1)
+    if args.json:
+        print(json.dumps({"call": c}, ensure_ascii=False, default=str))
+        return code
+    if c["status"] == "ok":
+        print(json.dumps(c["result"], ensure_ascii=False, default=str) if c.get("result") is not None
+              else (c.get("result_error") or c.get("text") or ""))
+    elif c.get("error"):
+        print("\n".join(c["error"].get("traceback") or [f"{c['error']['ename']}: {c['error']['evalue']}"]))
+    sys.stdout.flush()
+    tail = f"`talo wait {c['id']}`" if c["status"] == "running" else ""
+    print(f"[call {c['id']} {c['status']}, {c['service']} v{c['version']}, {c['elapsed_s']:.2f}s] {tail}".rstrip(),
+          file=sys.stderr)
+    return code
+
+
+def cmd_call(args):
+    payload = json.loads(args.args) if args.args else {}
+    d = call("call", service=args.service, args=payload, version=args.version, timeout=args.timeout, key=args.key,
+             max_result=args.max_result)
+    return show_call(args, d["call"])
+
+
+def cmd_expose(args):
+    job = call("expose", session=session_name(args), name=args.name, timeout=args.timeout)
+    if args.json:
+        print(json.dumps({"job": job}, ensure_ascii=False, default=str))
+    elif job.get("published", {}) and "versions" in job["published"]:
+        for v in job["published"]["versions"]:
+            print(f"published {v['service']} v{v['version']}")
+    else:
+        show_job(args, job)
+    return exit_code(job)
+
+
+def cmd_services(args):
+    def human(d):
+        if not d["services"]:
+            print("(no services; `talo.expose(fn)` in a job publishes one)")
+        for s in d["services"]:
+            for v in s["versions"]:
+                latest = "  (latest)" if v["version"] == s["latest"] else ""
+                print(f"{s['name']:28s} v{v['version']:<3} {human_bytes(v['pss'])} pss  calls in flight "
+                      f"{v['calls_in_flight']}  job {v['job']}{latest}")
+    emit(args, call("services", session=args.session), human)
+
+
+def cmd_unexpose(args):
+    emit(args, call("unexpose", service=args.service, version=args.version),
+         lambda d: print("removed " + ", ".join(d["removed"])))
 
 
 def cmd_map(args):
@@ -823,6 +878,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key", help="idempotency key")
     p.add_argument("--expect-rev", type=int, metavar="N", help="without --from: refuse unless the session is at revision N")
     add("maps", cmd_maps, "fan-outs and their progress")
+    p = add("call", cmd_call, "call a service of a session (SESSION.NAME) with JSON arguments", session=False)
+    p.add_argument("service")
+    p.add_argument("args", nargs="?", help="JSON object of keyword arguments")
+    p.add_argument("--version", type=int, help="service version (default: the latest, resolved now)")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
+    p.add_argument("--key", help="idempotency key")
+    p.add_argument("--max-result", type=int, default=65536, help="bytes of JSON kept")
+    p = add("expose", cmd_expose, "publish a function of the session as a service (like talo.expose)")
+    p.add_argument("name", help="name of a function in the session")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
+    p = add("services", cmd_services, "services, their versions, memory and calls in flight", session=False)
+    p.add_argument("-s", "--session", help="only this session's services")
+    p = add("unexpose", cmd_unexpose, "remove a service (or one version) that has no calls in flight", session=False)
+    p.add_argument("service")
+    p.add_argument("--version", type=int)
     p = add("record", cmd_record, "add a record to the experiment ledger from the shell")
     p.add_argument("fields", nargs="+", metavar="KEY=VALUE", help="values are parsed as JSON when possible")
     p.add_argument("--key", help="idempotency key")

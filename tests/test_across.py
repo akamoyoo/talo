@@ -111,3 +111,36 @@ def test_ledger_records_provenance_and_outcomes(talo):
     assert cases[0]["source_snapshot"] == "default:s1" and cases[0]["source_state"] == "kept"
     rc, d = run_json(talo, "ledger", "--where", "note=manual")
     assert d["records"][0]["fields"]["score"] == 3 and d["records"][0]["outcome"] == "reported"
+
+
+def test_services_versions_calls_and_pins(talo):
+    talo("new", "host")
+    code = ("import time\ndata = [1, 2, 3]\ndef total(scale=1, nap=0):\n    time.sleep(nap)\n    data.append(99)  # only the fork\n"
+            "    return sum(data) * scale\ntalo.expose(total)")
+    rc, out = run_json(talo, "run", "-s", "host", code)
+    assert out["job"]["published"]["versions"][0] == {"service": "host.total", "version": 1, "snapshot": "host:v1"}
+    rc, c = run_json(talo, "call", "host.total", '{"scale": 2}')
+    assert rc == 0 and c["call"]["result"] == 210 and c["call"]["version"] == 1
+    talo("run", "-s", "host", "data[:] = [10]")
+    assert run_json(talo, "call", "host.total")[1]["call"]["result"] == 105      # v1 never sees later changes
+    talo("expose", "-s", "host", "total")
+    assert run_json(talo, "call", "host.total")[1]["call"]["result"] == 109      # v2
+    assert run_json(talo, "call", "host.total", "--version", "1")[1]["call"]["result"] == 105
+    assert run_json(talo, "run", "-s", "host", "data")[1]["job"]["result"]["data"]["text/plain"] == "[10]"
+    # a failing job publishes nothing
+    rc, out = run_json(talo, "run", "-s", "host", "talo.expose(total, 'never')\nraise ValueError('no')")
+    assert out["job"]["published"] is None and "host.never" not in {s["name"] for s in run_json(talo, "services")[1]["services"]}
+    # another session calls from Python; nested calls from a map case are refused
+    talo("new", "other")
+    rc, out = run_json(talo, "run", "-s", "other", "talo.call('host.total', scale=3)")
+    assert out["job"]["result"]["data"]["text/plain"] == "327"
+    rc, d = run_json(talo, "map", "-s", "other", "--range", "1", "talo.call('host.total')")
+    assert "nested" in d["map"]["rows"][0]["error"]["evalue"]
+    # a version with a call in flight cannot be removed; its snapshot is pinned
+    rc, c = run_json(talo, "call", "host.total", '{"nap": 3}', "-t", "0.5")
+    rc, out = run_json(talo, "unexpose", "host.total", "--version", "2")
+    assert rc == 2 and c["call"]["id"] in out["error"]["message"]
+    rc, out = run_json(talo, "wait", c["call"]["id"], "-t", "30")
+    assert out["call"]["status"] == "ok"
+    rc, out = run_json(talo, "unexpose", "host.total")
+    assert rc == 0 and run_json(talo, "services")[1]["services"] == []

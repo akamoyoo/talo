@@ -406,8 +406,8 @@ $ talo call default.evaluate '{"expr": "ret_5 - ret_30", "horizon": 60}'
   resolved once, at submission, and a retry with the same `--key` gets the same version and the same call.
 - Versions stay until `talo unexpose NAME [--version V]`; `talo services` lists services, versions, their memory and
   calls in flight. A version with calls in flight cannot be removed.
-- Arguments and results are JSON, bounded like map results. From Python, `talo.call(name, **kwargs)` returns the
-  result or raises; `talo.submit(name, **kwargs)` returns a handle with `.result(timeout)`. A call made from inside a
+- Arguments and results are JSON, bounded like map results. From Python, `talo.call(name, args=None, *, version=None,
+  timeout=None, **kwargs)` returns the result or raises (`TimeoutError` names the call id to wait for). A call made from inside a
   service call or a map case is refused: nested synchronous calls are where deadlocks start.
 - User code reaches the supervisor through the socket in `$TALO_SOCKET`, identifying the job or case it runs in.
 - Deferred: services that run in the host's queue and change it (stateful services), and passing Python objects

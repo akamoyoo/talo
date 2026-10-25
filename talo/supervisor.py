@@ -145,6 +145,8 @@ class Job:
     phase: str | None = None                   # preparing | executing | restoring | committing (signals only while executing)
     exec_pid: int | None = None                # the worker running the user code, the only process ever signalled
     handle: object = field(default=None, repr=False)  # a "fork" job's internal snapshot
+    staged: list = field(default_factory=list)  # services staged with talo.expose, published if the job succeeds
+    published: dict | None = None              # {"versions": [...]} or {"error": ...} after publication
     progress: dict | None = None               # the last talo.progress() of a running job
     progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
@@ -154,7 +156,7 @@ class Job:
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "owner", "key",
-                                            "rev", "atomic", "termination", "phase")}
+                                            "rev", "atomic", "termination", "phase", "published")}
         out["progress"] = self.progress
         if self.status == "running":
             out["last_progress_age_s"] = round(time.monotonic() - self.progress_at, 1) if self.progress_at else None
@@ -277,6 +279,8 @@ class Session:
         self.owners: dict[str, str] = {}    # job id -> owner, for refusals that name whose work would be lost
         self.emit = lambda event_type, /, **fields: None
         self.on_record = lambda job, content: None   # set by the supervisor: talo.record() from a job
+        self.on_publish = lambda job, snap: None      # set by the supervisor: register new service versions
+        self.service_snaps: list = []                # snapshots holding service versions (counted in memory)
         self.on_finish = lambda job: None            # set by the supervisor: fill in the outcome of the job's records  # set by the supervisor: append to the event journal
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
@@ -287,7 +291,8 @@ class Session:
     async def start(self) -> None:
         """Start a fresh worker process."""
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        env = {"MPLBACKEND": "Agg", **os.environ, **self.env, "PYTHONUNBUFFERED": "1"}  # figures become files
+        env = {"MPLBACKEND": "Agg", **os.environ, **self.env, "PYTHONUNBUFFERED": "1",  # figures become files
+               "TALO_SOCKET": str(socket_path())}                                  # talo.call reaches us here
         with open(self.dir / "worker.log", "ab") as errlog:
             proc = await asyncio.create_subprocess_exec(
                 self.python, str(WORKER), "--fd", str(child.fileno()), "--session", self.name,
@@ -447,10 +452,11 @@ class Session:
                     self.rev += 1
                 job.rev = self.rev
                 self.owners[job.id] = job.owner
-                if job.kind == "execute" and job.params.get("atomic"):
-                    self._finish(job, await self._execute_atomic(job))
-                elif job.kind == "execute":
-                    self._finish(job, await self._execute(job))
+                if job.kind == "execute":
+                    status = await (self._execute_atomic(job) if job.params.get("atomic") else self._execute(job))
+                    if status == "ok" and job.staged:
+                        await self._publish(job)
+                    self._finish(job, status)
                 elif job.kind == "snap":
                     self._finish(job, "ok", result=(await self._snap(**job.params, owner=job.owner)).to_dict())
                 elif job.kind == "checkout":
@@ -514,6 +520,9 @@ class Session:
                     job.progress, job.progress_at = dict(got["content"]), time.monotonic()
                 elif kind == "talo_record":
                     self.on_record(job, got["content"])
+                elif kind == "talo_expose":
+                    if got["content"]["name"] not in job.staged:
+                        job.staged.append(got["content"]["name"])
                 elif kind == "execute_reply":
                     status = got["content"]["status"]
                     job.metrics = dict(got.get("metadata", {}))
@@ -610,7 +619,17 @@ class Session:
     # ---------------------------------------------------------------- snapshots
 
     def held(self) -> list:
-        return [*self.snapshots.values(), *([self.checkpoint] if self.checkpoint else [])]
+        return [*self.snapshots.values(), *self.service_snaps, *([self.checkpoint] if self.checkpoint else [])]
+
+    async def _publish(self, job: Job) -> None:
+        """Publish the services a successful job staged, as new versions on one snapshot of the state it left."""
+        try:
+            snap = await self._fork(f"v{job.id}", strict=False, name=f"services of job {job.id}", owner=job.owner)
+        except Exception as error:  # noqa: BLE001 - the code succeeded; only the publication failed
+            job.published = {"error": f"{type(error).__name__}: {error}"}
+            return
+        self.service_snaps.append(snap)
+        job.published = {"versions": self.on_publish(job, snap)}
 
     def memory_usage(self) -> tuple[int, list]:
         """(PSS of the worker plus its snapshots, pids whose memory could not be read). Shared pages are counted once
@@ -797,7 +816,10 @@ class Supervisor:
         self.event_added = asyncio.Event()
         self.maps: dict[str, MapRun] = {}
         self.next_map = 1
-        self.ledger: dict[str, dict] = self._load_ledger()   # record id -> record (shared by all sessions)
+        self.ledger: dict[str, dict] = self._load_ledger()
+        self.services: dict[str, dict] = {}   # "session.name" -> {"versions": {n: version}, "latest": n}
+        self.calls: dict[str, dict] = {}
+        self.next_call = 1   # record id -> record (shared by all sessions)
         self.last_rev: dict[str, int] = {}             # session name -> its revision when it was closed
         self.epoch = wire.new_id()[:12]               # changes when the supervisor restarts (keys do not survive it)
         self.state_file = home() / "state.json"
@@ -878,6 +900,7 @@ class Supervisor:
         session.emit = self.emit
         session.on_record = lambda job, content: self._add_record(content, session, job=job)
         session.on_finish = self._job_outcome
+        session.on_publish = lambda job, snap: self._register_versions(session, job, snap)
         self.sessions[name] = session
         try:
             await (session.start_from(source) if source else session.start())
@@ -895,6 +918,16 @@ class Supervisor:
     async def op_kill(self, req):
         session = self._session(req["name"])
         self._kill_maps(session.name)
+        for svc in [s for s in self.services.values() if s["session"] == session.name]:
+            for call in self.calls.values():
+                if call["service"] == svc["name"] and call["pid"]:
+                    try:
+                        os.kill(call["pid"], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            for n in list(svc["versions"]):
+                self._drop_version(svc, n)
+            del self.services[svc["name"]]
         await session.stop()
         self.last_rev[session.name] = session.rev
         del self.sessions[req["name"]]
@@ -926,6 +959,8 @@ class Supervisor:
         return await self._wait(job, req.get("timeout", 30))
 
     async def op_job(self, req):
+        if str(req["id"]) in self.calls:
+            return await self._wait_call(self.calls[str(req["id"])], req.get("wait", 0))
         if str(req["id"]) in self.maps:
             return await self._wait_map(self.maps[str(req["id"])], req.get("wait", 0))
         return await self._wait(self._job(req["id"]), req.get("wait", 0))
@@ -951,6 +986,14 @@ class Supervisor:
                 "text": data.decode(errors="replace"), "status": job.status}
 
     async def op_interrupt(self, req):
+        if str(req["id"]) in self.calls:
+            call = self.calls[str(req["id"])]
+            if call["pid"]:
+                try:
+                    os.kill(call["pid"], signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+            return {"id": call["id"], "result": "interrupting" if call["status"] == "running" else call["status"]}
         if str(req["id"]) in self.maps:
             m = self.maps[str(req["id"])]
             m.interrupt_requested = True
@@ -1301,6 +1344,130 @@ class Supervisor:
         out = [{**r, "source_state": "none" if not r["source_snapshot"] else
                 ("kept" if r["source_snapshot"] in alive else "gone")} for r in recs]
         return {"records": out, "total": total}
+
+    # ---------------------------------------------------------------- services
+
+    def _register_versions(self, session: Session, job: Job, snap: Snapshot) -> list:
+        out = []
+        for name in job.staged:
+            full = f"{session.name}.{name}"
+            svc = self.services.setdefault(full, {"name": full, "session": session.name, "function": name,
+                                                  "versions": {}, "latest": 0})
+            n = svc["latest"] + 1
+            svc["versions"][n] = {"version": n, "snapshot": snap, "job": job.id, "owner": job.owner,
+                                  "created": time.time(), "in_flight": set()}
+            svc["latest"] = n
+            snap.pins.add(f"service {full} v{n}")
+            out.append({"service": full, "version": n, "snapshot": snap.ref})
+            self.emit("service.published", session=session.name, service=full, version=n, job=job.id)
+        return out
+
+    def _service_info(self, svc: dict) -> dict:
+        return {"name": svc["name"], "session": svc["session"], "latest": svc["latest"],
+                "versions": [{"version": v["version"], "snapshot": v["snapshot"].ref, "job": v["job"],
+                              "owner": v["owner"], "created": v["created"], "calls_in_flight": len(v["in_flight"]),
+                              "pss": (memory(v["snapshot"].pid) or {}).get("pss")} for v in svc["versions"].values()]}
+
+    async def op_services(self, req):
+        return {"services": [self._service_info(s) for s in self.services.values()
+                             if not req.get("session") or s["session"] == req["session"]]}
+
+    async def op_expose(self, req):
+        """Publish an existing function of the session (the shell form of talo.expose)."""
+        name = req["name"]
+        if not name.isidentifier():
+            raise ValueError(f"service name {name!r} must be an identifier")
+        return await self.op_run({**req, "code": f"talo.expose({name})"})
+
+    async def op_unexpose(self, req):
+        svc = self.services.get(req["service"])
+        if svc is None:
+            raise KeyError(f"no service {req['service']!r} (`talo services` lists them)")
+        versions = [int(req["version"])] if req.get("version") else list(svc["versions"])
+        for n in versions:
+            v = svc["versions"].get(n)
+            if v is None:
+                raise KeyError(f"service {svc['name']} has no version {n}")
+            if v["in_flight"]:
+                raise RuntimeError(f"{svc['name']} v{n} has calls in flight: {', '.join(sorted(v['in_flight']))}")
+        for n in versions:
+            self._drop_version(svc, n)
+        if not svc["versions"]:
+            del self.services[svc["name"]]
+        return {"removed": [f"{svc['name']} v{n}" for n in versions]}
+
+    def _drop_version(self, svc: dict, n: int) -> None:
+        v = svc["versions"].pop(n)
+        snap = v["snapshot"]
+        snap.pins.discard(f"service {svc['name']} v{n}")
+        if not snap.pins and svc["session"] in self.sessions:
+            session = self.sessions[svc["session"]]
+            if snap in session.service_snaps:
+                session.service_snaps.remove(snap)
+            session._release(snap)
+
+    async def op_call(self, req):
+        svc = self.services.get(req["service"])
+        if svc is None:
+            raise KeyError(f"no service {req['service']!r} (`talo services` lists them)")
+        key = req.get("key")
+        fingerprint = {"service": svc["name"], "args": req.get("args") or {}, "version": req.get("version")}
+        if key is not None and ("call", key) in self.keys:
+            call_id, known = self.keys[("call", key)]
+            if known != fingerprint:
+                raise ValueError(f"key {key!r} was used for call {call_id} with a different request; use a new key")
+            return {**await self._wait_call(self.calls[call_id], req.get("timeout", 30)), "deduplicated": True}
+        n = int(req["version"]) if req.get("version") else svc["latest"]
+        version = svc["versions"].get(n)
+        if version is None:
+            raise KeyError(f"service {svc['name']} has no version {n}")
+        args = req.get("args") or {}
+        if not isinstance(args, dict):
+            raise ValueError("call arguments must be a JSON object")
+        call_id = f"c{self.next_call}"
+        self.next_call += 1
+        session = self.sessions[svc["session"]]
+        out_dir = session.dir / "calls"
+        out_dir.mkdir(exist_ok=True)
+        call = {"id": call_id, "kind": "call", "service": svc["name"], "version": n, "args": args, "status": "running",
+                "owner": req.get("owner") or "user", "started": time.time(), "finished": None, "result": None,
+                "result_error": None, "error": None, "pid": None, "output": str(out_dir / f"{call_id}.out"),
+                "done": asyncio.Event()}
+        Path(call["output"]).touch()
+        self.calls[call_id] = call
+        if key is not None:
+            self.keys[("call", key)] = (call_id, fingerprint)
+        version["in_flight"].add(call_id)
+        asyncio.create_task(self._run_call(svc, version, call, int(req.get("max_result") or 65536)))
+        return await self._wait_call(call, req.get("timeout", 30))
+
+    async def _run_call(self, svc: dict, version: dict, call: dict, json_limit: int) -> None:
+        code = f"talo._serve_call({svc['function']!r}, __import__('json').loads({json.dumps(call['args'])!r}))"
+        try:
+            out = await ephemeral.run(version["snapshot"].socket, code, call["output"], json_limit=json_limit,
+                                      started=lambda pid: call.update(pid=pid))
+        except Exception as error:  # noqa: BLE001
+            out = {"status": "error", "error": {"ename": type(error).__name__, "evalue": str(error), "traceback": []}}
+        finally:
+            version["in_flight"].discard(call["id"])
+        error = out.get("error")
+        call.update(status=out["status"], result=out.get("result"), result_error=out.get("result_error"),
+                    text=out.get("text"), elapsed_s=out.get("elapsed_s"), finished=time.time(), pid=None,
+                    error={"ename": error.get("ename"), "evalue": str(error.get("evalue"))[:500],
+                           "traceback": (error.get("traceback") or [])[-20:]} if error else None)
+        call["done"].set()
+        self.emit("call.finished", session=svc["session"], call=call["id"], service=svc["name"],
+                  version=call["version"], status=call["status"], owner=call["owner"])
+
+    async def _wait_call(self, call: dict, timeout: float | None) -> dict:
+        if timeout is None or timeout > 0:
+            try:
+                await asyncio.wait_for(call["done"].wait(), timeout)
+            except asyncio.TimeoutError:
+                pass
+        view = {k: v for k, v in call.items() if k != "done"}
+        view["elapsed_s"] = round((call["finished"] or time.time()) - call["started"], 3)
+        return {"call": view, "epoch": self.epoch}
 
     # ---------------------------------------------------------------- events
 

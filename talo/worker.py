@@ -619,8 +619,59 @@ class Helper:
                           self._worker.parent)
         return record_id
 
+    def expose(self, fn, name: str | None = None) -> str:
+        """Offer ``fn`` as a service of this session: other sessions and agents call it with JSON arguments
+        (``talo call SESSION.NAME '{...}'``). The service is published when the running job ends successfully, as a
+        new version that keeps the session's state at that moment; calls run in forks of it."""
+        if self._worker.parent is None:
+            raise RuntimeError("talo.expose can only be used while code runs in a Talo session")
+        if not callable(fn):
+            raise TypeError("talo.expose needs a function")
+        name = name or getattr(fn, "__name__", None)
+        if not name or not name.isidentifier():
+            raise ValueError(f"service name {name!r} must be an identifier")
+        self._worker.services[name] = fn
+        self._worker.send("talo_expose", {"name": name}, self._worker.parent)
+        return name
+
+    def _serve_call(self, name: str, kwargs: dict):
+        """Run a service function (in a fork of a service version)."""
+        self.in_call = True
+        if name not in self._worker.services:
+            raise LookupError(f"this version has no service {name!r}")
+        return self._worker.services[name](**kwargs)
+
+    def call(self, service: str, args: dict | None = None, *, version: int | None = None,
+             timeout: float | None = None, **kwargs):
+        """Call a service of a session (``"session.name"``) with JSON arguments (``args`` and keyword arguments
+        together; put arguments named ``version`` or ``timeout`` in ``args``); returns its result or raises."""
+        kwargs = {**(args or {}), **kwargs}
+        if self.case is not None or getattr(self, "in_call", False):
+            raise RuntimeError("talo.call cannot be used inside a map case or a service call (nested calls can "
+                               "deadlock)")
+        path = os.environ.get("TALO_SOCKET")
+        if not path:
+            raise RuntimeError("talo.call needs $TALO_SOCKET (set for workers started by Talo)")
+        request = {"op": "call", "service": service, "args": kwargs, "timeout": timeout, "version": version,
+                   "owner": os.environ.get("TALO_AGENT") or "user"}
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(path)
+            s.sendall(json.dumps(request).encode() + b"\n")
+            reply = json.loads(s.makefile("rb").readline() or b'{"ok": false, "error": {"message": "disconnected"}}')
+        if not reply.get("ok"):
+            raise RuntimeError(f"talo.call {service}: {reply['error']['message']}")
+        call = reply["call"]
+        if call["status"] == "ok":
+            if call.get("result_error"):
+                raise RuntimeError(f"talo.call {service}: {call['result_error']}")
+            return call["result"]
+        if call["status"] in ("running", "queued"):
+            raise TimeoutError(f"talo.call {service}: call {call['id']} still running (`talo wait {call['id']}`)")
+        error = call.get("error") or {}
+        raise RuntimeError(f"talo.call {service} failed: {error.get('ename')}: {error.get('evalue')}")
+
     def __repr__(self) -> str:
-        return "<talo helper: talo.progress(done, total, note), talo.record(**fields)>"
+        return "<talo helper: talo.progress, talo.record, talo.expose, talo.call>"
 
 
 class Worker:
@@ -636,6 +687,7 @@ class Worker:
         self.out_path: str | None = None   # its output file; images are written next to it
         self.files = 0
         self.pyplot_patched = False
+        self.services: dict = {}  # name -> function exposed with talo.expose
         self.reloader = Reloader()
         self.reloader.record()
 
