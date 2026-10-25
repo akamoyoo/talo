@@ -94,13 +94,14 @@ class Job:
     key: str | None = None                     # idempotency key (run --key)
     expect_rev: int | None = None              # refuse to start unless the session is at this revision
     rev: int | None = None                     # the session's revision when the job started
+    atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
     interrupt_requested: bool = False
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "owner", "key",
-                                            "rev")}
+                                            "rev", "atomic")}
         out["elapsed_s"] = round((self.finished or time.time()) - (self.started or time.time()), 3) if self.started else None
         return out
 
@@ -165,6 +166,7 @@ class Session:
         self.jobs_since_base: list[str] = []
         self.rev = 0                        # increases whenever the state may change (execution, checkout)
         self.owners: dict[str, str] = {}    # job id -> owner, for refusals that name whose work would be lost
+        self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
         self.tasks: list[asyncio.Task] = []
 
@@ -304,8 +306,10 @@ class Session:
                     self.rev += 1
                 job.rev = self.rev
                 self.owners[job.id] = job.owner
-                if job.kind == "execute":
-                    await self._execute(job)
+                if job.kind == "execute" and job.params.get("atomic"):
+                    self._finish(job, await self._execute_atomic(job))
+                elif job.kind == "execute":
+                    self._finish(job, await self._execute(job))
                 elif job.kind == "snap":
                     self._finish(job, "ok", result=(await self._snap(**job.params, owner=job.owner)).to_dict())
                 elif job.kind == "checkout":
@@ -319,10 +323,11 @@ class Session:
                 if self.state != "dead":
                     self.state = "idle"
 
-    async def _execute(self, job: Job) -> None:
+    async def _execute(self, job: Job) -> str:
+        """Run an execute job on the worker; returns its status (the caller finishes the job)."""
         if self.state == "dead":
-            self._finish(job, "lost", error={"ename": "SessionDead", "evalue": self.death, "traceback": []})
-            return
+            job.error = {"ename": "SessionDead", "evalue": self.death, "traceback": []}
+            return "lost"
         msg = wire.message("execute_request", {"code": job.code, "silent": False, "store_history": True,
                                                "user_expressions": {}, "allow_stdin": False, "stop_on_error": True},
                            session=self.name, metadata={"talo_output": job.output, "talo_job": job.id})
@@ -331,8 +336,8 @@ class Session:
             while True:
                 got = await q.get()
                 if got is None:  # the worker died mid-job
-                    self._finish(job, "lost", error={"ename": "WorkerDied", "evalue": self.death, "traceback": []})
-                    return
+                    job.error = {"ename": "WorkerDied", "evalue": self.death, "traceback": []}
+                    return "lost"
                 kind = wire.msg_type(got)
                 if kind == "execute_input":
                     job.execution_count = got["content"].get("execution_count")
@@ -350,10 +355,54 @@ class Session:
                     if status == "error" and job.interrupt_requested and (job.error or {}).get("ename") == "KeyboardInterrupt":
                         status = "interrupted"
                     self.jobs_since_base.append(job.id)
-                    self._finish(job, status)
-                    return
+                    return status
         finally:
             self.waiters.pop(msg["header"]["msg_id"], None)
+
+    async def _execute_atomic(self, job: Job) -> str:
+        """run --atomic: checkpoint, execute, then commit or restore (see "run --atomic" in docs/design.md)."""
+        if self.state == "dead":
+            return await self._execute(job)
+        try:
+            checkpoint = await self._fork(f"c{job.id}", strict=False)
+        except Exception as error:  # noqa: BLE001 - no code ran
+            job.error = {"ename": "CheckpointFailed", "evalue": str(error), "traceback": []}
+            job.atomic = {"outcome": "not_started", "error": str(error)}
+            return "error"
+        base, before = self.base, list(self.jobs_since_base)
+        self.checkpoint = checkpoint
+        try:
+            status = await self._execute(job)
+            if status == "ok":
+                job.atomic = {"outcome": "committed"}
+                return status
+            try:
+                await self._replace_from(checkpoint)
+                self.base, self.jobs_since_base = base, before  # the failed job leaves the lineage
+                job.atomic = {"outcome": "restored"}
+            except Exception as error:  # noqa: BLE001
+                job.atomic = {"outcome": "restore_failed", "error": f"{type(error).__name__}: {error}"}
+            return status
+        finally:
+            self.checkpoint = None
+            self._release(checkpoint)
+
+    async def _replace_from(self, snap: "Snapshot") -> None:
+        """Replace the worker with a fork of ``snap``; the old worker is shut down only once the new one answers."""
+        old_writer, old_proc, old_alive = self.writer, self.proc, self.state != "dead"
+        await self._spawn_from(snap)
+        if old_alive and old_writer is not None:
+            try:
+                old_writer.write(wire.encode(wire.message("shutdown_request", {"restart": False}, session=self.name)))
+                await old_writer.drain()
+            except (ConnectionError, RuntimeError):
+                pass
+            old_writer.close()
+        if old_proc is not None and old_proc.returncode is None:
+            try:
+                await asyncio.wait_for(old_proc.wait(), 5)
+            except asyncio.TimeoutError:
+                old_proc.kill()
 
     def _finish(self, job: Job, status: str, *, error: dict | None = None, result=None) -> None:
         job.status, job.finished = status, time.time()
@@ -374,7 +423,8 @@ class Session:
     # ---------------------------------------------------------------- snapshots
 
     def memory_in_use(self) -> int:
-        return (resident(self.worker_pid) or 0) + sum(private_dirty(s.pid) or 0 for s in self.snapshots.values())
+        held = [*self.snapshots.values(), *([self.checkpoint] if self.checkpoint else [])]
+        return (resident(self.worker_pid) or 0) + sum(private_dirty(s.pid) or 0 for s in held)
 
     async def _snap(self, name: str | None = None, message: str = "", strict: bool = False,
                     owner: str = "user") -> Snapshot:
@@ -384,6 +434,15 @@ class Session:
         name = name or sid
         if self.find(name, missing_ok=True):
             raise ValueError(f"session {self.name} already has a snapshot named {name!r}")
+        snap = await self._fork(sid, strict, name=name, message=message, owner=owner)
+        self.next_snapshot += 1
+        self.snapshots[sid] = snap
+        self.base, self.jobs_since_base = snap.ref, []
+        return snap
+
+    async def _fork(self, sid: str, strict: bool, *, name: str | None = None, message: str = "",
+                    owner: str = "user") -> Snapshot:
+        """Fork the worker into a held snapshot process (named snapshots and internal checkpoints alike)."""
         if self.memory_budget and self.memory_in_use() > self.memory_budget:
             biggest = sorted(self.snapshots.values(), key=lambda s: -(private_dirty(s.pid) or 0))[:3]
             hint = ", ".join(f"{s.name} ({(private_dirty(s.pid) or 0) >> 20} MB)" for s in biggest) or "none"
@@ -394,15 +453,19 @@ class Session:
         content = reply["content"]
         if content.get("status") != "ok":
             raise RuntimeError(f"{content.get('ename')}: {content.get('evalue')}")
-        self.next_snapshot += 1
-        snap = Snapshot(sid, name, self.name, path, content["pid"], self.base, list(self.jobs_since_base),
+        snap = Snapshot(sid, name or sid, self.name, path, content["pid"], self.base, list(self.jobs_since_base),
                         content.get("execution_count", 0), content.get("threads", []), message, owner)
         snap.hold = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         snap.hold.connect(path)
         snap.hold.sendall(b'{"op": "hold"}\n')
-        self.snapshots[sid] = snap
-        self.base, self.jobs_since_base = snap.ref, []
         return snap
+
+    def _release(self, snap: Snapshot) -> None:
+        """Let a snapshot process exit and remove its files."""
+        if snap.hold is not None:
+            snap.hold.close()  # the snapshot exits when its hold connection closes
+        for path in (Path(snap.socket), Path(snap.socket).with_suffix(".children")):
+            path.unlink(missing_ok=True)
 
     def find(self, name: str, missing_ok: bool = False) -> Snapshot | None:
         for snap in self.snapshots.values():
@@ -428,11 +491,8 @@ class Session:
         return self.to_dict()
 
     def drop(self, snap: Snapshot) -> None:
-        if snap.hold is not None:
-            snap.hold.close()  # the snapshot exits when its hold connection closes
+        self._release(snap)
         self.snapshots.pop(snap.id, None)
-        for path in (Path(snap.socket), Path(snap.socket).with_suffix(".children")):
-            path.unlink(missing_ok=True)
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -594,7 +654,8 @@ class Supervisor:
             raise SessionDead(f"session {session.name} is dead: {session.death} (`talo checkout SNAPSHOT` to roll "
                               f"back, or `talo kill {session.name}` and create it again)")
         job = await self._submit(session, "execute", req["code"], owner=req.get("owner"), key=req.get("key"),
-                                 fingerprint=fingerprint, expect_rev=req.get("expect_rev"))
+                                 fingerprint=fingerprint, expect_rev=req.get("expect_rev"),
+                                 **({"atomic": True} if req.get("atomic") else {}))
         return await self._wait(job, req.get("timeout", 30))
 
     async def op_job(self, req):

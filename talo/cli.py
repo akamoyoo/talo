@@ -80,6 +80,11 @@ def status_line(job: dict) -> str:
     if status in ("running", "queued"):
         return (f"[job {jid} {status}{elapsed}] `talo wait {jid}` for the result, `talo tail {jid}` for output, "
                 f"`talo interrupt {jid}` to stop it")
+    atomic = job.get("atomic") or {}
+    if atomic.get("outcome") == "restored":
+        status += ", state restored"
+    elif atomic.get("outcome") in ("restore_failed", "not_started"):
+        status += f", atomic {atomic['outcome']}: {atomic.get('error')}"
     mem = ""
     m = job.get("metrics") or {}
     if m.get("talo_rss_after") and m.get("talo_rss_before"):
@@ -157,7 +162,8 @@ def cmd_run(args):
     name = session_name(args)
     code = read_code(args)
     ensure_session(name, args.python)
-    job = call("run", session=name, code=code, timeout=args.timeout, key=args.key, expect_rev=args.expect_rev)
+    job = call("run", session=name, code=code, timeout=args.timeout, key=args.key, expect_rev=args.expect_rev,
+               atomic=args.atomic)
     show_job(args, job)
     return exit_code(job)
 
@@ -511,6 +517,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--python", help="interpreter for the session if it has to be created")
     p.add_argument("--key", help="idempotency key: retrying with the same key returns the job already submitted")
     p.add_argument("--expect-rev", type=int, metavar="N", help="refuse to run unless the session is at revision N")
+    p.add_argument("--atomic", action="store_true",
+                   help="run inside a checkpoint: if the code fails, the session is restored to its state before it")
     p = add("wait", cmd_wait, "wait for a job to finish", session=False)
     p.add_argument("id")
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)

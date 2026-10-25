@@ -76,7 +76,7 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `new` | `name`, `python`, `cwd`, `env`, `from` (`[session:]snapshot`), `memory_budget` (bytes) | the session |
 | `ls` | – | `sessions` |
 | `kill` | `name` | `killed` |
-| `run` | `session`, `code`, `timeout` (seconds), `key` (idempotency), `expect_rev` | the job (with the supervisor's `epoch`), possibly still `running`; for a known `key`, the job already submitted, with `deduplicated: true` |
+| `run` | `session`, `code`, `timeout` (seconds), `key` (idempotency), `expect_rev`, `atomic` | the job (with the supervisor's `epoch`), possibly still `running`; for a known `key`, the job already submitted, with `deduplicated: true` |
 | `job` | `id`, `wait` (seconds) | the job |
 | `jobs` | `session` (optional), `last` | `jobs` (the last `last`, each with `code_preview`: the first 200 characters of its code), `total` |
 | `output` | `id`, `offset` (default: the end), `max_bytes` | `text`, `offset`, `next_offset`, `size`, `status` |
@@ -100,7 +100,7 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 A **session** is `{name, state (starting | idle | busy | dead), python, cwd, pid, rss, created, queued, current_job,
 death, base, jobs_since_base, snapshots, rev, memory_budget}`. A **snapshot** is `{id, name, session, parent, pid, created, message, execution_count,
 jobs (ids run between its parent and itself), private_bytes, threads, owner}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
-started, finished, elapsed_s, execution_count, result, error, metrics, output, outputs, owner, key, rev}`.
+started, finished, elapsed_s, execution_count, result, error, metrics, output, outputs, owner, key, rev, atomic}`.
 
 The control protocol is versioned together with Talo while it is pre-alpha; it will be frozen and versioned
 separately at 1.0.

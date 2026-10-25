@@ -78,3 +78,35 @@ def test_brief_and_notes(talo):
     assert "rev " in text and "goal: test the brief" in text and "NameError" in text
     rc, d = run_json(talo, "notes")
     assert d["total"] == 1 and d["notes"][0]["owner"] == "user"
+
+
+def test_atomic_run_restores_the_state_on_failure(talo):
+    talo("run", "import numpy as np, pandas as pd\ndf = pd.DataFrame({'x': np.arange(5.0)})\nalias = df\nn = 0")
+    rc, out = run_json(talo, "run", "--atomic", "df.drop(columns=['x'], inplace=True)\nn += 1\nraise ValueError('half')")
+    job = out["job"]
+    assert rc == 1 and job["status"] == "error" and job["atomic"]["outcome"] == "restored"
+    rc, out = run_json(talo, "run", "list(df.columns), n, alias is df")
+    assert out["job"]["result"]["data"]["text/plain"] == "(['x'], 0, True)"
+    rc, snaps = run_json(talo, "snaps")
+    assert snaps["snapshots"] == [] and job["id"] not in snaps["jobs_since_base"]  # no checkpoint left, not in lineage
+    assert "raise ValueError" not in talo("export").stdout
+    rc, out = run_json(talo, "run", "--atomic", "n = 5")
+    assert out["job"]["atomic"]["outcome"] == "committed" and out["job"]["id"] in run_json(talo, "snaps")[1]["jobs_since_base"]
+
+
+def test_atomic_run_restores_after_the_worker_dies(talo):
+    talo("run", "x = 1")
+    rc, out = run_json(talo, "run", "--atomic", "import os, signal\nx = 2\nos.kill(os.getpid(), signal.SIGKILL)")
+    assert out["job"]["status"] == "lost" and out["job"]["atomic"]["outcome"] == "restored"
+    rc, out = run_json(talo, "run", "x")
+    assert rc == 0 and out["job"]["result"]["data"]["text/plain"] == "1"
+
+
+def test_atomic_interrupt_restores(talo):
+    talo("run", "import time\nx = 1")
+    rc, out = run_json(talo, "run", "--atomic", "x = 2\ntime.sleep(30)", "-t", "1")
+    jid = out["job"]["id"]
+    talo("interrupt", jid)
+    rc, out = run_json(talo, "wait", jid, "-t", "30")
+    assert out["job"]["status"] == "interrupted" and out["job"]["atomic"]["outcome"] == "restored"
+    assert run_json(talo, "run", "x")[1]["job"]["result"]["data"]["text/plain"] == "1"
