@@ -760,10 +760,14 @@ panel = talo.get("panel", copy=True)        # a private, writable copy
 
 - **Format.** A dataset version is a checkpoint unit (the M9 format: a pickle stream plus buffers stored by content)
   in a store on `/dev/shm` (`talo-UID/datasets`, falling back to `TALO_HOME` when there is no `/dev/shm`). A new
-  version only writes the buffers that changed: an unchanged column is the same file, and the same memory.
+  version only writes the buffers that changed: an unchanged buffer is the same file, and the same memory. For
+  pandas the buffers are its blocks (pandas keeps columns of one dtype together in one block), so changing one
+  float column of a table of float columns rewrites that block.
 - **Reading.** `talo.get` maps each buffer read-only (`mmap`), so NumPy arrays and the data of pandas objects point
-  into the shared pages: every session reading a version shares one copy in memory. The arrays are read-only; writing
-  to them raises, and `copy=True` returns private writable memory. Objects that are not buffers (indexes of Python
+  into the shared pages: every session reading a version shares one copy in memory. NumPy arrays are read-only; writing
+  to them raises, and `copy=True` returns private writable memory. pandas objects can be edited: Talo hands out a
+  shallow copy that shares the mapped blocks, and pandas copies a block when it is first written (pandas 2 needs
+  copy-on-write enabled; pandas 3 always does it). Objects that are not buffers (indexes of Python
   objects, small metadata) are unpickled privately in each reader. Sizes are checked on every read; content hashes
   are checked when the version is published and with `talo.get(..., verify=True)`.
 - **Publishing.** `talo publish NAME [VAR] [-s SESSION]` writes from a fork of the session through the queue (like

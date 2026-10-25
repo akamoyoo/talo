@@ -131,6 +131,8 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `checkpoints` / `checkpoint_drop` / `store_gc` | `session`; `checkpoint`; `dry_run` | `checkpoints`; `dropped`; `removed`, `freed_bytes` |
 | `recover` | `name` or `all` | `recovered`: `{session, checkpoint, job}` |
 | `autosave` | `session`, `on`, `every` (seconds), `keep` | `autosave` |
+| `publish` | `session`, `name`, `var`, `expect_rev`, `timeout` | the publishing job; its `result`: `dataset`, `version`, `bytes`, `new_bytes`, `rev` |
+| `datasets` / `dataset_drop` / `dataset_gc` | –; `name`, `version`; `dry_run` | `datasets`, `stored_bytes`, `in_memory`, `root`; `dropped`; `removed`, `freed_bytes` |
 | `record` | `session`, `fields`, `key` | `record` |
 | `ledger` | `session`, `owner`, `outcome`, `has` (list), `where` (list of `KEY=VALUE`), `sort` (`KEY` or `-KEY`), `last` | `records`: `{id, key, time, owner, session, session_id, producer ({kind: job / case / shell, ...}), rev, source_snapshot, source_state (kept / gone / none), code_hash, modules, fields, outcome}`, `total` |
 | `events` | `after` (cursor `EPOCH:SEQ`; default: now), `all`, `wait` (seconds), `session`, `type` (comma-separated), `limit` | `events`, `next` (cursor), `has_more`, `oldest`; `CursorExpired` for a cursor of another epoch or older than the journal |

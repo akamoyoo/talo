@@ -540,6 +540,7 @@ def json_result(value, limit: int) -> dict:
 
 # ---------------------------------------------------------------- checkpoints
 
+_MAPPED: list = []  # pandas objects of shared datasets kept alive (see Helper.get)
 _RESTORE = {"ns": {}}  # the session namespace functions saved by source are rebuilt in (set by load_units)
 
 
@@ -701,9 +702,11 @@ def _unit_digest(stream_hash, buffers: list) -> str:
     return h.hexdigest()
 
 
-def load_units(namespace: dict, store: str, units: list, only: list | None = None) -> dict:
+def load_units(namespace: dict, store: str, units: list, only: list | None = None, mapped: bool = False,
+               verify: bool = True) -> dict:
     """Read units back into ``namespace``, checking every buffer's and stream's hash; buffers become ordinary
-    writable memory, a separate allocation for each restored buffer."""
+    writable memory, a separate allocation for each restored buffer. With ``mapped``, buffers are mapped read-only
+    from their files instead (shared datasets): no copy, shared with every other reader."""
     import json as _json
     hex40 = re.compile(r"[0-9a-f]{40}")
     for unit in units:  # checked before anything is unpickled: names, hashes, no link in the way
@@ -732,14 +735,19 @@ def load_units(namespace: dict, store: str, units: list, only: list | None = Non
             if os.path.islink(path) or os.path.getsize(path) != size:
                 raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: buffer {digest} "
                                  "is missing, truncated or a link")
-            data = bytearray(size)
-            with open(path, "rb") as f:
-                f.readinto(data)
-            if hashlib.blake2b(data, digest_size=20).hexdigest() != digest:
+            if mapped:
+                import mmap
+                with open(path, "rb") as f:
+                    data = mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ) if size else b""
+            else:
+                data = bytearray(size)
+                with open(path, "rb") as f:
+                    f.readinto(data)
+            if verify and hashlib.blake2b(data, digest_size=20).hexdigest() != digest:
                 raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: buffer {digest} "
                                  "does not match its hash")
             views.append(memoryview(data))
-        if _unit_digest(hashlib.blake2b(stream, digest_size=20), index["buffers"]) != unit["hash"]:
+        if verify and _unit_digest(hashlib.blake2b(stream, digest_size=20), index["buffers"]) != unit["hash"]:
             raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: its stream does not "
                              "match its hash")
         values = pickle.loads(stream, buffers=views)
@@ -995,6 +1003,76 @@ class Helper:
                                   for m, v in (versions or {}).items()
                                   if m in sys.modules and getattr(sys.modules[m], "__version__", None) != v}
         return out
+
+    def _datasets(self) -> str:
+        root = os.environ.get("TALO_DATASETS")
+        if not root:
+            raise RuntimeError("shared datasets need $TALO_DATASETS (set for workers started by Talo)")
+        return root
+
+    def publish(self, name: str, value) -> int:
+        """Publish ``value`` as a new, immutable version of the shared dataset ``name`` (``talo.get(name)`` in any
+        session maps it without copying); returns the version number. Unchanged buffers are shared with earlier
+        versions."""
+        import fcntl
+        import json as _json
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise ValueError(f"dataset name {name!r}: letters, digits, '.', '-' and '_' only")
+        root = self._datasets()
+        out = save_units({name: value}, [name], os.path.join(root, "store"))
+        if out["skipped"]:
+            raise ValueError(f"cannot publish {name}: {out['skipped'][0]['reason']}")
+        unit = out["units"][0]
+        folder = os.path.join(root, "datasets", name)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, ".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # versions are numbered in order, whoever publishes
+            versions = [int(f[1:-5]) for f in os.listdir(folder) if re.fullmatch(r"v\d+\.json", f)]
+            version = max(versions, default=0) + 1
+            manifest = {"format": CHECKPOINT_FORMAT, "dataset": name, "version": version, "created": time.time(),
+                        "unit": unit, "type": type(value).__name__, "shape": list(getattr(value, "shape", []) or []),
+                        "job": (self._worker.parent or {}).get("metadata", {}).get("talo_job"),
+                        "pid": os.getpid()}
+            for fname, content in ((f"v{version}.json", _json.dumps(manifest, indent=1)), ("latest", str(version))):
+                tmp = os.path.join(folder, f".{fname}.tmp")
+                with open(tmp, "w") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, os.path.join(folder, fname))  # the version file first, then the pointer to it
+            _fsync_dir(folder)
+        if self._worker.parent is not None:
+            self._worker.send("talo_dataset", {"name": name, "version": version, "action": "published",
+                                               "bytes": unit["bytes"], "new_bytes": unit["new_bytes"]},
+                              self._worker.parent)
+        return version
+
+    def get(self, name: str, version: int | None = None, copy: bool = False, verify: bool = False):
+        """The shared dataset ``name`` (the latest version, resolved now, or ``version``): its buffers mapped
+        read-only, shared with every other reader; ``copy=True`` gives private writable memory."""
+        import json as _json
+        folder = os.path.join(self._datasets(), "datasets", name)
+        if version is None:
+            try:
+                version = int(open(os.path.join(folder, "latest")).read())
+            except FileNotFoundError:
+                raise LookupError(f"no dataset {name!r} (`talo datasets` lists them)") from None
+        try:
+            manifest = _json.loads(open(os.path.join(folder, f"v{int(version)}.json")).read())
+        except FileNotFoundError:
+            raise LookupError(f"dataset {name!r} has no version {version}") from None
+        box: dict = {}
+        load_units(box, os.path.join(self._datasets(), "store"), [manifest["unit"]], mapped=not copy, verify=verify)
+        if self._worker.parent is not None:
+            self._worker.send("talo_dataset", {"name": name, "version": int(version), "action": "read",
+                                               "copy": copy}, self._worker.parent)
+        value = box[name]
+        if not copy and type(value).__module__.startswith("pandas") and hasattr(value, "copy"):
+            # pandas copies a block on write only when another object shares it: keep the mapped original alive and
+            # hand out a shallow copy, so editing the table copies the edited block instead of failing
+            _MAPPED.append(value)
+            value = value.copy(deep=False)
+        return value
 
     def _serve_call(self, name: str, kwargs: dict):
         """Run a service function (in a fork of a service version)."""

@@ -43,3 +43,12 @@ def entry(module: str) -> list[str]:
     code = ("import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; "
             f"from {module} import main; sys.exit(main())")
     return [sys.executable, "-c", code]
+
+
+def datasets_root() -> Path:
+    """Where shared datasets live: memory (``/dev/shm``) when there is one, one directory per ``TALO_HOME``."""
+    digest = hashlib.sha256(str(home().resolve()).encode()).hexdigest()[:12]
+    shm = Path("/dev/shm")
+    if shm.is_dir() and os.access(shm, os.W_OK):
+        return shm / f"talo-{os.getuid()}-{digest}"
+    return home() / "datasets"

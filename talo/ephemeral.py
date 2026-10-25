@@ -52,7 +52,7 @@ async def run(socket_path: str, code: str, output: str, *, bind: dict | None = N
                 continue
             kind = wire.msg_type(got)
             content = got["content"]
-            if kind in ("talo_record", "talo_progress") and on_message is not None:
+            if kind in ("talo_record", "talo_progress", "talo_dataset") and on_message is not None:
                 on_message(kind, content)
             elif kind == "execute_result":
                 meta = content.get("metadata", {})

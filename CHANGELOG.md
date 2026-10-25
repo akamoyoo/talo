@@ -11,6 +11,8 @@
 
 ### Added
 
+- M6: shared datasets (`talo publish`, `talo.publish`, `talo.get`, `datasets`, `dataset drop|gc`): immutable
+  versions on `/dev/shm` in the checkpoint format, mapped read-only by readers, versions recorded on jobs.
 - M9: `save` / `restore` (content-addressed checkpoints written from a fork, aliasing and NumPy views kept,
   verified on reading), `checkpoints`, `checkpoint drop`, `store gc`, `recover` after a restart, `autosave`.
 - M8: `verify` (hot / cold replay agreement), `run --trial` with `review` / `adopt` / `reject`, `new --limit`

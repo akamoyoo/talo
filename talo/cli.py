@@ -1086,6 +1086,45 @@ def cmd_autosave(args):
         else "off")))
 
 
+def cmd_publish(args):
+    d = call("publish", session=session_name(args), name=args.name, var=args.var, expect_rev=args.expect_rev,
+             timeout=args.timeout)
+    if args.json:
+        print(json.dumps({"job": d}, ensure_ascii=False, default=str))
+    elif d["status"] == "ok":
+        r = d["result"]
+        print(f"dataset {r['dataset']} v{r['version']}: {human_bytes(r['bytes'])} ({human_bytes(r['new_bytes'])} new), "
+              f"from {d['session']} rev {r['rev']}; read it with talo.get({r['dataset']!r})")
+    else:
+        show_job(args, d)
+    return exit_code(d)
+
+
+def cmd_datasets(args):
+    def human(d):
+        where = "memory (/dev/shm)" if d["in_memory"] else d["root"]
+        if not d["datasets"]:
+            print("(no datasets; `talo publish NAME` or talo.publish(name, value) creates one)")
+        for ds in d["datasets"]:
+            for v in ds["versions"]:
+                latest = "  (latest)" if v["version"] == ds["latest"] else ""
+                shape = f" {tuple(v['shape'])}" if v["shape"] else ""
+                print(f"{ds['name']:20s} v{v['version']:<3} {v['type']}{shape}  {human_bytes(v['bytes'])} "
+                      f"({human_bytes(v['new_bytes'])} new){latest}")
+        print(f"({human_bytes(d['stored_bytes'])} stored in {where})", file=sys.stderr)
+    emit(args, call("datasets"), human)
+
+
+def cmd_dataset(args):
+    if args.action == "drop":
+        emit(args, call("dataset_drop", name=args.name, version=args.version),
+             lambda d: print(f"dropped {', '.join(d['dropped'])}; {d['note']}"))
+    else:
+        emit(args, call("dataset_gc", dry_run=args.dry_run),
+             lambda d: print(f"{'would remove' if d['dry_run'] else 'removed'} {d['removed']} files, "
+                             f"{human_bytes(d['freed_bytes'])}"))
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -1450,6 +1489,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("state", nargs="?", choices=("on", "off"))
     p.add_argument("--every", default="30m")
     p.add_argument("--keep", type=int, default=3)
+    p = add("publish", cmd_publish, "publish a variable as a new version of a shared dataset (talo.get reads it)")
+    p.add_argument("name", help="dataset name")
+    p.add_argument("var", nargs="?", help="the variable (default: the dataset's name)")
+    p.add_argument("--expect-rev", type=int, metavar="N")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
+    add("datasets", cmd_datasets, "shared datasets and their versions", session=False)
+    p = add("dataset", cmd_dataset, "drop a dataset (or one version), or gc its storage", session=False)
+    p.add_argument("action", choices=("drop", "gc"))
+    p.add_argument("name", nargs="?")
+    p.add_argument("--version", type=int)
+    p.add_argument("--dry-run", action="store_true")
     p = add("verify", cmd_verify, "replay the lineage of the current state and check it gives the same variables")
     p.add_argument("--cold", action="store_true", help="replay from the start in a fresh interpreter")
     p.add_argument("--from", dest="from_", metavar="SNAPSHOT", help="hot: replay from this snapshot on the lineage")

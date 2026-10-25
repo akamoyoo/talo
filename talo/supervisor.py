@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from talo import ephemeral, wire
-from talo.paths import home, shared_socket_path, socket_for, socket_path
+from talo.paths import datasets_root, home, shared_socket_path, socket_for, socket_path
 
 log = logging.getLogger("talo")
 WORKER = Path(__file__).with_name("worker.py")
@@ -265,6 +265,7 @@ class Job:
     autosnap: dict | None = None               # the snapshot taken after it by talo autosnap
     user_expressions: dict | None = None       # Jupyter user_expressions evaluated after the code
     retained: dict | None = None               # run --retain-error: the snapshot of the failed state
+    datasets: list = field(default_factory=list)  # dataset versions the job published or read
     progress: dict | None = None               # the last talo.progress() of a running job
     progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
@@ -275,7 +276,7 @@ class Job:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "displays", "owner", "key",
                                             "rev", "atomic", "termination", "phase", "published", "autosnap",
-                                            "user_expressions", "retained")}
+                                            "user_expressions", "retained", "datasets")}
         out["progress"] = self.progress
         if self.status == "running":
             out["last_progress_age_s"] = round(time.monotonic() - self.progress_at, 1) if self.progress_at else None
@@ -403,7 +404,8 @@ SHARE_READ = {"brief", "vars", "snaps", "history", "notes", "job", "output", "re
 SHARE_CALL = SHARE_READ | {"call"}
 SHARE_RUN = SHARE_CALL | {"run", "interrupt", "snap", "checkout", "drop", "reload", "map", "note", "record", "handoff",
                           "export", "expose", "unexpose", "show", "diff", "complete", "diagnose", "queue", "lease",
-                          "verify", "review", "adopt", "reject", "memory", "autosnap", "undo", "save", "autosave"}
+                          "verify", "review", "adopt", "reject", "memory", "autosnap", "undo", "save", "autosave",
+                          "publish"}
 SHARE_LEVELS = ("read", "call", "run")
 SHARE_STATE_PARAMS = {"diff": ("a", "b"), "map": ("from",), "checkout": ("name",), "handoff": ("snap",),
                       "export": ("snap",)}
@@ -475,7 +477,8 @@ class Session:
         """Start a fresh worker process."""
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         env = {"MPLBACKEND": "Agg", **os.environ, **self.env, "PYTHONUNBUFFERED": "1",  # figures become files
-               "TALO_SOCKET": str(socket_path())}                                  # talo.call reaches us here
+               "TALO_SOCKET": str(socket_path()),                                  # talo.call reaches us here
+               "TALO_DATASETS": str(datasets_root())}                              # talo.publish / talo.get
         prefix = []
         if self.limits:  # the worker, its snapshots and all their forks live in one cgroup the kernel enforces
             self.scope = f"talo-{self.name}-{wire.new_id()[:8]}.scope"
@@ -766,6 +769,11 @@ class Session:
                     job.progress, job.progress_at = dict(got["content"]), time.monotonic()
                 elif kind == "talo_record":
                     self.on_record(job, got["content"])
+                elif kind == "talo_dataset":
+                    job.datasets.append(dict(got["content"]))
+                    if got["content"]["action"] == "published":
+                        self.emit("dataset.published", session=self.name, dataset=got["content"]["name"],
+                                  version=got["content"]["version"], job=job.id)
                 elif kind == "talo_expose":
                     if got["content"]["name"] not in job.staged:
                         job.staged.append(got["content"]["name"])
@@ -1884,6 +1892,7 @@ class Supervisor:
 
     async def _run_case(self, m: MapRun, index: int, case) -> dict:
         session = self.sessions[m.session]
+        case_datasets: list = []
         output = str(m.dir / f"{index}.out")
         Path(output).touch()
         peak = {"pss": 0}
@@ -1925,6 +1934,8 @@ class Supervisor:
             def on_message(kind: str, content: dict) -> None:
                 if kind == "talo_record":
                     self._add_record(content, session, m=m, index=index)
+                elif kind == "talo_dataset":
+                    case_datasets.append(dict(content))
 
             out = await ephemeral.run(m.snap.socket, m.code, output, bind={"case": case},
                                       case={"map": m.id, "index": index, "seed": case_seed(m.id, index)},
@@ -1948,7 +1959,7 @@ class Supervisor:
         return {"index": index, "case": case, "status": status, "result": out.get("result"),
                 "result_error": out.get("result_error"), "text": out.get("text"), "error": error,
                 "termination": stop["reason"], "elapsed_s": out.get("elapsed_s"), "sampled_peak_pss": peak["pss"] or None,
-                "output": output, "outputs": out.get("outputs", [])}
+                "output": output, "outputs": out.get("outputs", []), "datasets": case_datasets}
 
     # ---------------------------------------------------------------- ledger
 
@@ -3053,6 +3064,134 @@ class Supervisor:
                 freed, removed = freed + size, removed + 1
         return {"removed": removed, "freed_bytes": freed, "dry_run": bool(req.get("dry_run"))}
 
+    # ---------------------------------------------------------------- shared datasets
+
+    async def op_publish(self, req):
+        """Publish a variable of a session as a new version of a shared dataset, from a fork (like save)."""
+        session = self._session(req["session"])
+        name, var = req["name"], req.get("var") or req["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or not var.isidentifier():
+            raise ValueError("dataset names: letters, digits, '.', '-', '_'; the variable must be a name")
+        job = Job(self._new_job_id(), session.name, f"talo.publish({name!r}, {var})", "", kind="publish",
+                  params={"name": name, "var": var, "expect_rev": req.get("expect_rev")},
+                  owner=req.get("owner") or "user", session_id=session.id)
+        job.output = str(session.dir / "jobs" / f"{job.id}.out")
+        Path(job.output).touch()
+        self.jobs[job.id] = job
+        asyncio.create_task(self._run_publish(session, job))
+        return await self._wait(job, req.get("timeout", 30))
+
+    async def _run_publish(self, session: Session, job: Job) -> None:
+        fork = await self._submit(session, "fork", owner=job.owner, expect_rev=job.params.get("expect_rev"))
+        await fork.done.wait()
+        job.started = time.time()
+        if fork.status != "ok":
+            session._finish(job, "error", error={"ename": "PublishNotStarted",
+                                                 "evalue": str((fork.error or {}).get("evalue")), "traceback": []})
+            return
+        source = fork.handle
+        source.pins.add(f"publish {job.id}")
+        session.internal_snaps.append(source)
+        job.status, job.phase = "running", "executing"
+        channel = None
+        try:
+            channel = await ephemeral.Channel.from_snapshot(source.socket)
+            session.ephemeral[f"publish {job.id}"] = channel.pid
+            got = await channel.execute(job.code, job.output, silent=True, json_limit=4096)
+            for m in got["messages"]:
+                if m["header"]["msg_type"] == "talo_dataset":
+                    job.datasets.append(dict(m["content"]))
+            if got["status"] != "ok":
+                error = got.get("error") or {}
+                session._finish(job, "error", error={k: error.get(k) for k in ("ename", "evalue", "traceback")})
+                return
+            published = next(d for d in job.datasets if d["action"] == "published")
+            job.result = {"dataset": published["name"], "version": published["version"],
+                          "bytes": published["bytes"], "new_bytes": published["new_bytes"], "rev": fork.result["rev"]}
+            session._finish(job, "ok")
+            self.emit("dataset.published", session=session.name, dataset=published["name"],
+                      version=published["version"], job=job.id)
+        except Exception as error:  # noqa: BLE001
+            if not job.done.is_set():
+                session._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error), "traceback": []})
+        finally:
+            session.ephemeral.pop(f"publish {job.id}", None)
+            job.phase = None
+            if channel is not None:
+                await channel.close()
+            source.pins.discard(f"publish {job.id}")
+            if source in session.internal_snaps:
+                session.internal_snaps.remove(source)
+            session._release(source)
+
+    def _dataset_manifests(self) -> dict:
+        root = datasets_root() / "datasets"
+        out: dict = {}
+        for path in sorted(root.glob("*/v*.json")) if root.exists() else []:
+            try:
+                m = json.loads(path.read_text())
+            except ValueError:
+                continue
+            out.setdefault(m["dataset"], []).append(m)
+        return out
+
+    async def op_datasets(self, req):
+        root = datasets_root()
+        out = []
+        for name, versions in self._dataset_manifests().items():
+            latest_file = root / "datasets" / name / "latest"
+            latest = int(latest_file.read_text()) if latest_file.exists() else None
+            out.append({"name": name, "latest": latest, "versions": [
+                {k: v[k] for k in ("version", "created", "type", "shape", "job")} | {
+                    "bytes": v["unit"]["bytes"], "new_bytes": v["unit"]["new_bytes"]}
+                for v in sorted(versions, key=lambda v: v["version"])]})
+        used = 0
+        for folder in ("store/buffers", "store/units"):
+            d = root / folder
+            for f in d.rglob("*") if d.exists() else []:
+                if f.is_file():
+                    used += f.stat().st_blocks * 512
+        return {"root": str(root), "datasets": out, "stored_bytes": used, "in_memory": str(root).startswith("/dev/shm")}
+
+    async def op_dataset_drop(self, req):
+        folder = datasets_root() / "datasets" / req["name"]
+        if not folder.is_dir():
+            raise KeyError(f"no dataset {req['name']!r}")
+        versions = [req["version"]] if req.get("version") else [int(f.stem[1:]) for f in folder.glob("v*.json")]
+        for v in versions:
+            (folder / f"v{v}.json").unlink(missing_ok=True)
+        left = sorted(int(f.stem[1:]) for f in folder.glob("v*.json"))
+        if left:
+            tmp = folder / ".latest.tmp"
+            tmp.write_text(str(left[-1]))
+            os.replace(tmp, folder / "latest")
+        else:
+            (folder / "latest").unlink(missing_ok=True)
+        return {"dropped": [f"{req['name']} v{v}" for v in versions],
+                "note": "sessions holding a dropped version keep it until they let it go; `talo dataset gc` frees it"}
+
+    async def op_dataset_gc(self, req):
+        """Remove dataset buffers no version uses (files still mapped by a session stay in memory until unmapped)."""
+        import shutil
+        root = datasets_root() / "store"
+        used_units = {v["unit"]["hash"] for vs in self._dataset_manifests().values() for v in vs}
+        used_buffers = set()
+        for h in used_units:
+            index = root / "units" / h / "index.json"
+            if index.exists():
+                used_buffers |= {b for b, _ in json.loads(index.read_text())["buffers"]}
+        freed = removed = 0
+        for kind, used in (("units", used_units), ("buffers", used_buffers)):
+            folder = root / kind
+            for entry in folder.iterdir() if folder.exists() else []:
+                if entry.name in used or (entry.name.startswith(".tmp-") and time.time() - entry.lstat().st_mtime < 3600):
+                    continue
+                size = sum(f.stat().st_size for f in entry.iterdir()) if entry.is_dir() else entry.stat().st_size
+                if not req.get("dry_run"):
+                    shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink(missing_ok=True)
+                freed, removed = freed + size, removed + 1
+        return {"removed": removed, "freed_bytes": freed, "dry_run": bool(req.get("dry_run"))}
+
     # ---------------------------------------------------------------- verify
 
     async def op_verify(self, req):
@@ -3097,7 +3236,8 @@ class Supervisor:
                 report["source"] = {"snapshot": source.ref, "name": source.name}
                 channel = await ephemeral.Channel.from_snapshot(source.socket)
             else:
-                env = {"MPLBACKEND": "Agg", **os.environ, **session.env, "PYTHONUNBUFFERED": "1"}
+                env = {"MPLBACKEND": "Agg", **os.environ, **session.env, "PYTHONUNBUFFERED": "1",
+                       "TALO_DATASETS": str(datasets_root())}
                 prefix = scope_command(session.limits, f"talo-verify-{job.id}-{wire.new_id()[:6]}") \
                     if session.limits else None  # the session's limits apply to the replay too
                 channel = await ephemeral.Channel.fresh(session.python, str(WORKER), session.cwd, env, prefix)
