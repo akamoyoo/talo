@@ -754,6 +754,137 @@ across separately saved units. Writing speed is that of the disk; buffers are wr
 them shares the session's memory copy-on-write, so a session that keeps changing large arrays during a save pays
 for the pages it changes; restoring needs the memory of the restored values.
 
+## Bounded snapshots (M10)
+
+A snapshot costs nothing when it is taken, but its private memory grows afterwards: every page the live worker
+writes is copied, and Python writes far more pages than the user's code changes (reference counts and the garbage
+collector write the header of every object they touch; NumPy and pandas buffers stay shared). Measured on a
+research session: a snapshot taken at 1.7 GB held 619 MB of private memory after an hour of work that changed none of
+its data. Today named snapshots are kept until dropped; `--memory-budget` only refuses new ones and autosnap keeps
+the last N. M10 lets a session keep many snapshots without holding them all in memory, by moving some of them to
+disk as checkpoints (M9) and bringing them back when they are checked out.
+
+### Two kinds of rollback
+
+A **hot** snapshot is a suspended process: checking it out gives the exact process state. A **cold** snapshot is a
+checkpoint: checking it out gives, in a new worker, the snapshot's variables with equal **values** (imports run
+again; threads, open files and sockets, identities across separately saved units and whatever else M9 cannot save
+are not restored), its execution count and its input history `In`. `Out` and `_` are not kept: they start empty,
+as after a restart. Moving a snapshot to disk therefore changes what its rollback guarantees, and Talo does it only
+with the owner's consent: explicitly for one snapshot, or for every eligible snapshot of a session that opted in.
+
+### Moving a snapshot to disk: `talo snapshot demote`
+
+```console
+$ talo snapshot demote loaded
+snapshot loaded (research:s1): on disk, 14 variables, 2.4 GB (312 MB new)
+  session memory 9.8 GB -> 9.1 GB pss (measured before and after)
+```
+
+- Demotion is a control job of the session (an id, `wait`, `interrupt`, `--key`), one at a time per session; it does
+  not change the session's revision and does not wait for running executions.
+- **Eligibility** is decided under a transition lease on the snapshot that lasts until the end: not eligible while
+  anything pins it (the generic pins: a submitted map, a service version, a handoff, a `verify` run, a trial's
+  source or result), while it is the base of a live worker (the session's, a branch's), or when it is an atomic
+  run's checkpoint or a retained error. An operation that wants a hot snapshot while its lease is held waits for the
+  demotion to finish and then resolves the snapshot again (and finds it cold).
+- The variables, execution count and `In` are written from a fork of **the snapshot**, not the live worker, into the M9
+  store, as a manifest owned by the snapshot (`checkpoints/SESSION/.snapshots/INCARNATION-ID.json`). The demotion
+  is registered like a save, so `store gc` does not run during it. It **fails closed**: if any variable would be
+  skipped (a generator, a socket, a lambda defined in a cell), or on a storage error, a timeout, the death of the
+  serializer or an interrupt, the snapshot stays hot and usable, and the reply lists what blocked it; units already
+  written and not referenced by a manifest are left for `store gc`. The snapshot process is ended only after the
+  complete manifest is on disk and the cold reference is recorded.
+- The snapshot keeps its name, id, place in the tree, lineage and notes. `snaps`, `tree` and `brief` show `on disk`
+  with the logical size and the size stored instead of private memory; the variables' summaries and content
+  fingerprints recorded when it was demoted are kept with it, so `diff` against a cold snapshot works without
+  restoring anything.
+- `--dry-run` reports eligibility and the snapshot's private memory (an estimate of what demotion releases: pages it
+  shares with other processes may become private elsewhere); it does not serialize, so it cannot tell whether
+  every variable can be saved.
+
+### What a cold snapshot supports
+
+| Operation | Cold snapshot |
+|---|---|
+| `checkout NAME`, `new S --from NAME`, `undo` and `checkout @N` to an autosnap | restore into a new worker (below) |
+| `diff`, `snaps`, `tree`, `brief` | from the recorded summaries and fingerprints |
+| `drop NAME` | removes the snapshot and its manifest |
+| `map --from`, `call` of a service version, `verify` from it, `handoff` naming it | refused with a hint: check it out (or branch from it) and snapshot the result |
+| trials, maps and verify of the **current** state | unaffected: they fork the live worker |
+
+### Checking out a cold snapshot
+
+`talo checkout NAME` on a cold snapshot is one checkout operation, with checkout's rules: the dirty-state check
+(`--discard`, `--snap NAME`), `--expect-rev` and `--key`, one revision, and the lineage of the snapshot (the old
+worker's lineage is not extended; the reply and the lineage say `restored from disk: values`). It starts a new worker
+with the snapshot's interpreter and working directory, in the session's resource scope (the cgroup limits of the
+session apply, as for hot checkouts and branches), restores the manifest into it, installs the execution count and
+`In`, and switches the session only once all of that succeeded; on any failure Talo does not retire the current
+worker (a kernel OOM kill under a hard limit can still end either process). The snapshot stays cold; `snap` takes a
+new hot one. `new S --from NAME` does the same for a new session.
+
+Admission is an estimate: restoring needs about the logical size of the values (plus what their imports allocate)
+while the old worker still exists. With `--memory-budget`, checkout is refused when the measured session memory plus
+that size exceeds the budget; without one, it is not checked. Only a hard limit (`--limit memory=`) enforces.
+
+Cold checkout restores pickles, like `restore`, which is not offered on the shared socket (M9); for the same reason
+`checkout` of a cold snapshot, `snapshot demote` and `snapshot policy` are refused for share clients in this
+version, whatever their level.
+
+### Automatic: `--snapshot-policy demote`
+
+```console
+$ talo new research --memory-budget 32G --snapshot-policy demote
+$ talo snapshot policy demote -s research [--memory-budget 32G]      # on an existing session; `retain` turns it off
+```
+
+- `retain` (the default) keeps today's behaviour. `demote` is the owner's consent for every eligible snapshot of the
+  session, present and future, to become cold. Switching back to `retain` lets a running demotion finish.
+- Measurement: the session's memory as `talo memory` measures it (PSS of the worker, its snapshots and every helper
+  the session owns: map cases, calls, trials, saves), every 30 seconds while the session has hot snapshots, and
+  before a new snapshot is admitted. A process whose memory cannot be read counts as unknown, and the controller
+  does not act on unknown readings.
+- Above 90% of the budget the controller demotes one snapshot, measures again, and continues until the session is
+  below 80% or no candidate is left. Candidate: eligible, hot, and not checked out, branched from or diffed in the
+  last 10 minutes; the one with the largest private memory first. Reclamation only frees memory; the admission
+  rules of maps, trials and snapshots stay as they are.
+- A snapshot that cannot be saved (a skipped variable) is blocked permanently for the controller (a snapshot never
+  changes) and listed with the reason by `brief` and `snaps`; `snapshot demote` by hand still tries again. A
+  transient failure (storage, timeout) is retried after 5 minutes, then 15, 60. When the protected and blocked
+  snapshots alone keep the session above the budget, `brief` and an event say so; new snapshots are refused as
+  before. The controller never drops a snapshot.
+- Events: `snapshot.demoted`, `snapshot.demote_failed`, published once the final state is visible.
+
+### Lifetime of the manifests
+
+- A live snapshot's manifest cannot be dropped with `checkpoint drop`; it goes with the snapshot: `drop`, autosnap
+  expiry (cold autosnaps count towards `--keep N` like hot ones), `kill` of the session.
+- After a supervisor restart the tree is gone, and the manifests of cold snapshots become **archives**: listed by
+  `talo checkpoints --all` as `SESSION/snapshot:NAME@INCARNATION`, restorable with `talo restore`, removed with
+  `talo checkpoint drop`. They are never a recovery point (`recover` ignores them). The incarnation in the name
+  keeps a recreated session's snapshots from colliding with them.
+- `store gc` keeps the units of every manifest, live or archived.
+
+### Acceptance
+
+- A research session (a 2 GB panel, a dozen snapshots taken while working) stays under its `--memory-budget` with
+  `--snapshot-policy demote`; checking out a cold snapshot gives variables whose content fingerprints equal those
+  recorded at demotion, and the same `In` and execution count; variables absent from the snapshot are gone.
+- Demotion races map submission, handoff, verify, branching and checkout without any of them losing a hot snapshot;
+  failures injected at every write, the serializer's death, an interrupt and a concurrent `store gc` / `drop` leave
+  the snapshot hot and usable and never expose a cold reference without a complete manifest.
+- A failed cold checkout (a missing module, a corrupt unit) leaves the session on its current worker; a retry with
+  the same `--key` switches once.
+- Restart: archives are listed, restorable and never chosen by `recover`.
+- Share clients are refused cold checkout, demotion and policy changes.
+
+### Limits of M10
+
+A cold snapshot ends with the supervisor like a hot one (its manifest becomes an archive). Demotion writes at disk
+speed and serializing walks every object of the snapshot's fork, which dirties pages of that fork too; under acute
+memory pressure it may come too late, so leave headroom in the budget.
+
 ## Shared datasets (M6)
 
 One session prepares a table; other sessions, agents and map cases use it without loading it again and without
