@@ -1658,7 +1658,7 @@ class Supervisor:
     async def op_reload(self, req):
         session = self._session(req["session"])
         params = {"modules": list(req.get("modules") or []), "changed": bool(req.get("changed")),
-                  "root": req.get("root") or session.cwd}
+                  "root": req.get("root") or session.cwd, "in_place": bool(req.get("in_place"))}
         if req.get("dry_run"):  # only lists modules: not queued, does not change the revision
             return await self._ask_idle(session, "talo_reload_request", {**params, "dry_run": True})
         job = await self._submit_control(session, "reload", req.get("timeout", 300), req, **params)

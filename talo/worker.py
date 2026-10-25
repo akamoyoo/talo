@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import traceback
+import types
 import warnings
 from pathlib import Path
 
@@ -802,6 +803,48 @@ def _source_hash(path: str) -> str | None:
         return None
 
 
+def _patch_function(old, new) -> str | None:
+    """Give the old function the new one's code, so every reference to it runs the new code; None when done."""
+    if not isinstance(old, types.FunctionType) or not isinstance(new, types.FunctionType):
+        return "not a plain Python function in both versions"
+    if old.__code__.co_freevars != new.__code__.co_freevars:
+        return "its closure variables changed"
+    old.__code__ = new.__code__
+    old.__defaults__, old.__kwdefaults__ = new.__defaults__, new.__kwdefaults__
+    old.__annotations__, old.__doc__ = new.__annotations__, new.__doc__
+    old.__dict__.update(new.__dict__)
+    return None
+
+
+def _patch_in_place(old, new) -> str | None:
+    """``reload --in-place``: update a definition of the previous version of a module from the new version, so
+    references and instances made before the reload use the new code (``isinstance`` against the new class stays
+    false for old instances). Methods are patched function by function, which keeps zero-argument ``super()``
+    bound to the old class. Returns None when patched, else why not."""
+    if new is None:
+        return "removed from the new version"
+    if not isinstance(old, type):
+        return _patch_function(old, new)
+    if not isinstance(new, type):
+        return "no longer a class"
+    for key, value in new.__dict__.items():
+        if key in ("__dict__", "__weakref__", "__module__", "__qualname__"):
+            continue
+        current = old.__dict__.get(key)
+        if isinstance(value, (classmethod, staticmethod)) and type(current) is type(value) \
+                and _patch_function(current.__func__, value.__func__) is None:
+            continue
+        if _patch_function(current, value) is None:
+            continue
+        try:
+            setattr(old, key, value)
+        except (AttributeError, TypeError) as error:
+            return f"cannot set {key}: {error}"
+    for key in [k for k in old.__dict__ if k not in new.__dict__ and not (k.startswith("__") and k.endswith("__"))]:
+        delattr(old, key)
+    return None
+
+
 def _excluded(path: str) -> bool:
     """Files of installed packages and interpreters, which ``reload --changed`` never selects."""
     real = os.path.realpath(path)
@@ -847,8 +890,8 @@ class Reloader:
                 out.append(name)
         return out
 
-    def reload(self, namespace: dict, names: list[str]) -> dict:
-        report, previous = [], {}
+    def reload(self, namespace: dict, names: list[str], in_place: bool = False) -> dict:
+        report, previous, patched, skipped = [], {}, [], []
         for name in names:
             module = sys.modules.get(name)
             path = getattr(module, "__file__", None) if module else None
@@ -883,8 +926,18 @@ class Reloader:
             for attr, obj in previous[name].items():  # remember replaced definitions of every version
                 if (isinstance(obj, type) or callable(obj) and hasattr(obj, "__code__")) \
                         and current.get(attr) is not obj and getattr(obj, "__module__", None) == name:
+                    reason = _patch_in_place(obj, current.get(attr)) if in_place else "not requested"
+                    if reason is None:
+                        patched.append({"module": name, "attribute": attr,
+                                        "kind": "class" if isinstance(obj, type) else "function"})
+                        continue
+                    if in_place:
+                        skipped.append({"module": name, "attribute": attr, "reason": reason})
                     self.old_defs[id(obj)] = (name, attr, obj)  # the reference keeps the id from being reused
-        return {"modules": report, "stale_bindings": self.stale(namespace), "scan_scope": "direct_namespace"}
+        out = {"modules": report, "stale_bindings": self.stale(namespace), "scan_scope": "direct_namespace"}
+        if in_place:
+            out.update(patched=patched, skipped_in_place=skipped)
+        return out
 
     def stale(self, namespace: dict) -> list:
         """Names bound directly to a function or class of any earlier version of a reloaded module, or to an
@@ -1528,7 +1581,8 @@ class Worker:
                 self.send("talo_reload_reply", {"status": "ok", "selected": names, "dry_run": True}, msg)
             else:
                 self.send("talo_reload_reply", {"status": "ok", "selected": names,
-                                                **self.reloader.reload(self.namespace, names)}, msg)
+                                                **self.reloader.reload(self.namespace, names,
+                                                                       in_place=bool(c.get("in_place")))}, msg)
         elif kind == "talo_fingerprint_request":
             self.send("talo_fingerprint_reply", {"status": "ok", "fingerprints": fingerprints(
                 self.namespace, msg["content"].get("names", []))}, msg)

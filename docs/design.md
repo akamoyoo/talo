@@ -335,6 +335,13 @@ without condensing (the size limits still apply).
   previous version, or to an instance of such a class (`from factors import f` keeps the old `f`). Only the namespace
   itself is scanned (`scan_scope: "direct_namespace"`); references inside containers, closures and other objects are
   not followed. Talo does not rebind anything automatically.
+- `talo reload --in-place` also updates the previous version's functions and classes in place, for references that
+  the namespace scan cannot reach (an instance inside a dict, a function held by another object): a function gets
+  the new code, defaults and attributes (not when its closure variables changed); a class gets the new attributes,
+  its methods patched function by function so that zero-argument `super()` keeps working, and loses attributes the
+  new version dropped. The report lists `patched` and `skipped_in_place` (with the reason); patched definitions are
+  not stale. Old instances still fail `isinstance` against the new class, and state computed at import time (module
+  constants captured elsewhere, registries) is not revisited, so in-place reloading is an explicit choice.
 - Extension modules cannot be reloaded and are reported as such.
 
 ## Across sessions (M5)

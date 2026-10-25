@@ -402,3 +402,24 @@ def test_review_fixes_for_m8(talo, tmp_path):
     # diagnose refuses outside the executing phase instead of signalling
     rc, out = run_json(talo, "diagnose", "1")
     assert rc == 2
+
+
+def test_reload_in_place_updates_old_references_and_instances(talo, tmp_path):
+    import os
+    import time
+    src = ("def f():\n    return 1\n\nclass Base:\n    def who(self):\n        return 'base'\n\n"
+           "class Model(Base):\n    k = 1\n    def who(self):\n        return 'm1/' + super().who()\n"
+           "    @classmethod\n    def make(cls):\n        return 'c1'\n    def gone(self):\n        return 0\n")
+    (tmp_path / "lib.py").write_text(src)
+    os.utime(tmp_path / "lib.py", (time.time() - 60, time.time() - 60))
+    talo("new", "ip", "--cwd", str(tmp_path))
+    talo("run", "-s", "ip", "import lib\nfrom lib import f\nbox = {'m': lib.Model()}")
+    (tmp_path / "lib.py").write_text(src.replace("return 1", "return 2").replace("'m1/'", "'m2/'")
+                                     .replace("'c1'", "'c2'").replace("k = 1", "k = 2")
+                                     .replace("    def gone(self):\n        return 0\n", ""))
+    rc, d = run_json(talo, "reload", "-s", "ip", "lib", "--in-place")
+    result = d["job"]["result"]
+    assert rc == 0 and {p["attribute"] for p in result["patched"]} == {"f", "Base", "Model"}
+    assert result["stale_bindings"] == [] and result["skipped_in_place"] == []
+    rc, out = run_json(talo, "run", "-s", "ip", "m = box['m']\n(f(), m.who(), m.make(), m.k, hasattr(m, 'gone'))")
+    assert out["job"]["result"]["data"]["text/plain"] == "(2, 'm2/base', 'c2', 2, False)"

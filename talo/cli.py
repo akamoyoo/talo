@@ -768,7 +768,7 @@ def cmd_reload(args):
     if not args.modules and not args.changed:
         raise TaloError("BadArgument", "name the modules to reload, or use --changed")
     d = call("reload", session=session_name(args), modules=args.modules, changed=args.changed, root=args.root,
-             dry_run=args.dry_run, timeout=args.timeout, expect_rev=args.expect_rev, key=args.key)
+             in_place=args.in_place, dry_run=args.dry_run, timeout=args.timeout, expect_rev=args.expect_rev, key=args.key)
     if args.dry_run:
         emit(args, d, lambda x: print("would reload: " + (", ".join(x["selected"]) or "(nothing changed)")))
         return
@@ -784,6 +784,10 @@ def cmd_reload(args):
         print("nothing to reload")
     for m in result.get("modules", []):
         print(f"{m['module']:30s} {m['status']}" + (f": {m['error']}" if m.get("error") else ""))
+    for p in result.get("patched", []):
+        print(f"patched in place: {p['module']}.{p['attribute']} ({p['kind']})")
+    for s in result.get("skipped_in_place", []):
+        print(f"not patched: {s['module']}.{s['attribute']}: {s['reason']}")
     for s in result.get("stale_bindings", []):
         print(f"stale: {s['name']} ({s['kind']} from the old {s['module']}.{s['attribute']}) -> {s['rebind']}")
     if job.get("error") and not result:
@@ -1377,6 +1381,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--changed", action="store_true",
                    help="also every imported module under --root whose source changed since it was loaded")
     p.add_argument("--root", help="directory for --changed (default: the session's working directory)")
+    p.add_argument("--in-place", action="store_true",
+                   help="also update the old functions and classes in place, so references and instances made "
+                        "before the reload use the new code")
     p.add_argument("--dry-run", action="store_true", help="only list the modules that would be reloaded")
     p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
     p.add_argument("--expect-rev", type=int, metavar="N", help="refuse unless the session is at revision N")

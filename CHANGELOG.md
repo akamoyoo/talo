@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `reload --in-place` updates the old functions and classes in place, so instances and references made before the
+  reload (also inside containers) run the new code.
 - `import talo` inside a session (in a cell or in a module it imports) gives the session's `talo` helper, also in
   interpreters without the talo package.
 - `map --cases` also accepts JSON Lines, and reports malformed cases as a usage error.
