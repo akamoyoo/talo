@@ -335,6 +335,110 @@ without condensing (the size limits still apply).
   not followed. Talo does not rebind anything automatically.
 - Extension modules cannot be reloaded and are reported as such.
 
+## Across sessions (M5)
+
+The expensive part of agent research is usually preparation: loading data, warming a model, reproducing a bug.
+M5 lets many agents and tasks reuse one prepared state at once, keeps the evidence they produce tied to the state it
+came from, and lets them wait for each other without polling.
+
+### Ephemeral workers
+
+The building block: a worker forked from a snapshot that is *not* a session's worker. It runs one piece of code,
+returns a bounded result, and exits; the snapshot is unchanged and the session it came from keeps working. Ephemeral
+workers start in milliseconds and share all unmodified memory with the snapshot. They are listed by `talo jobs` with
+their parent operation (`map` or `call`) and their memory is counted with the session's.
+
+### Fan-out: `talo map`
+
+```console
+$ talo map --from loaded -f evaluate.py --cases ideas.json --parallel 8
+map m3: 24 cases from default:loaded, 8 at a time
+ #  status  time   result
+ 0  ok      41.2s  {"ic": 0.012, "rank_ic": 0.015}
+ 1  error   0.3s   KeyError: 'sector'
+ ...
+(24 cases: 22 ok, 2 error; results in sessions/default/maps/m3.jsonl)
+```
+
+- `--from SNAPSHOT` (default: the current state, through an internal checkpoint taken first) is forked once per case.
+  Each case runs the code with `case` bound to its element of the `--cases` JSON list (or `--range N` for
+  `case = 0 .. N-1`) and `talo.case` giving `{map, index}`.
+- A case's **result** is the value of its last expression; it must be JSON-serializable (after conversion of NumPy
+  scalars) and is cut to `--max-result` bytes, otherwise its `repr` is kept. Output goes to a file per case. Each
+  result row has `index`, `case`, `status`, `result`, `error`, `elapsed_s`, `peak_pss` and its output path.
+- Concurrency: at most `--parallel` cases run at once, and none is started while the session's memory (PSS of worker,
+  snapshots and running cases) is above `--memory-limit` (default: the session's limit); a case over
+  `--case-memory-limit` is stopped like a job over the memory limit.
+- `map` returns after `-t` seconds like `run`, with a map id; `talo map-status ID` (and `wait`, `interrupt`) work on it.
+  Interrupting a map cancels pending cases and interrupts running ones.
+- Cases never change the session: there is nothing to roll back. A case that should be kept is re-run in the session.
+
+### Sessions as services: `talo.expose` and `talo call`
+
+```python
+# in the host session, after loading data
+def evaluate(expr: str, horizon: int = 30) -> dict: ...
+talo.expose(evaluate)                      # service "default.evaluate", version 1
+```
+```console
+$ talo call default.evaluate '{"expr": "ret_5 - ret_30", "horizon": 60}'
+{"ic": 0.009, "rank_ic": 0.011}  [call c17, version 1, 3.1s]
+```
+```python
+# in another session
+r = talo.call("default.evaluate", expr="ret_5 - ret_30")
+```
+
+- `talo.expose(fn, name=None, mode="fork")` registers a function of the host session. Exposing takes an internal
+  snapshot of the host: that is the **service version**. Calls fork ephemeral workers from it, so they run in
+  parallel, never see later edits of the host, and cannot change the host or each other. Exposing again (after a
+  fix or new data) makes a new version; running calls finish on their own version, and old versions are released
+  when no call uses them. `talo services` lists services, versions, memory and calls in flight.
+- `mode="queue"` instead runs each call as a job in the host's queue, for stateful services (a cache that should
+  fill up, a model that learns); such calls change the host and count as revisions.
+- Arguments and results are JSON. From Python, `talo.call` also accepts and returns picklable objects up to
+  `max_bytes` (default 256 MB), passed through a file, so a session can fetch a computed table from a service.
+- Calls accept `--key` (retry-safe) and `-t`; a call that does not finish in time returns its id like `run`.
+- `talo.call` and the ledger functions reach the supervisor from user code through the socket named in
+  `$TALO_SOCKET`; a call to a service of the same session is refused (it would wait for itself).
+
+### The experiment ledger: `talo.record`
+
+```python
+talo.record(ic=0.012, rank_ic=0.015, factor="gap_mom", hypothesis="gap momentum survives a 5-minute delay")
+```
+```console
+$ talo ledger --metric ic --sort -ic --last 5
+r41  0.0150  map m3 case 7   default:loaded  agent-a  gap_mom_sector  (state: snapshot kept)
+r38  0.0120  job 211         default:s4      agent-b  gap_mom         (state: dropped)
+```
+
+- `talo.record(**fields)` (and `talo record KEY=VALUE ...` from the shell) appends a record to the ledger shared by all
+  sessions (`ledger.jsonl` in `TALO_HOME`): its fields (JSON scalars and short strings), id, time, owner, and where it
+  came from — session, job, map case or call, revision, base snapshot, hashes of the job's code and of the reloaded
+  modules' sources.
+- `talo ledger` filters (`--session`, `--owner`, `--where KEY=VALUE`, `--has KEY`), sorts and bounds the records and
+  says whether the state that produced each one still exists. `talo compare ID ID` shows two records side by side
+  with the difference of their code and lineage.
+- Records are facts reported by code; agents' interpretations belong in notes, which can cite record ids.
+
+### Events: `talo events`
+
+Everything that agents may wait for is appended to an event journal (`events.jsonl`): `job.finished`, `map.finished`,
+`case.finished`, `call.finished`, `snapshot.created`, `snapshot.dropped`, `session.created`, `session.died`,
+`service.exposed`, `record.added`, `note.added`, `handoff.created`. Each event has a sequence number.
+`talo events --after N --wait SECONDS [--session S] [--type T]` returns the events after `N`, waiting up to the given
+time for the first one; the reply's `next` is the cursor to pass back. Delivery is at least once; the journal is
+kept for the supervisor's lifetime and capped in size.
+
+### Handing over: `talo handoff`
+
+`talo handoff -m "MESSAGE" [--to OWNER]` takes a snapshot of the current state (or names an existing one with
+`--snap`) and writes a handoff: the brief, the notes and ledger records since the previous handoff, the running
+jobs, the message, and how to continue (`talo new NAME --from SNAPSHOT`, or `talo attach`). `talo handoffs` lists
+them and `talo resume ID` prints one, bounded, for the next agent or a human. The handoff's snapshot is pinned until
+the handoff is closed (`talo resume ID --close`).
+
 ## Known limitations
 
 - Linux only (relies on `fork`, `/proc`, Unix sockets).
