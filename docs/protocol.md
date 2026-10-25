@@ -43,6 +43,7 @@ provides `_repr_html_` / `_repr_markdown_`.
 |---|---|
 | `talo_vars_request` (`pattern`) | `variables`: list of `{name, type, nbytes, shape | len, dtype, columns, value}`; `rss` |
 | `talo_show_request` (`name`: variable or expression, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
+| `talo_fingerprint_request` (`names`) | `fingerprints`: `{name: {"hash": hex} \| {"error": text}}` (BLAKE2b of the pickled object; see "Diff" in [design.md](design.md)) |
 | `talo_snapshot_request` (`id`, `socket`: path to listen on, `strict`) | `pid` of the snapshot process, `threads`: names of the other threads present at fork time — or `status: error` (`strict` and other threads exist) |
 
 ### Snapshot sockets
@@ -54,6 +55,7 @@ one per connection:
 |---|---|
 | `{"op": "info"}` | `{"ok": true, "pid": …, "execution_count": …}` |
 | `{"op": "vars"}` | `{"ok": true, "variables": [...]}` (as `talo_vars_reply`; the snapshot's state is never modified) |
+| `{"op": "fingerprint", "names": [...]}` | `{"ok": true, "fingerprints": {...}}` (as `talo_fingerprint_reply`) |
 | `{"op": "spawn"}` | the snapshot forks; the child replies `{"ok": true, "pid": …}` and from then on speaks the kernel protocol on this connection as the session's new worker |
 | `{"op": "hold"}` | no reply; the supervisor keeps this connection open, and the snapshot exits when it closes |
 | `{"op": "exit"}` | the snapshot exits |
@@ -81,6 +83,8 @@ Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}
 | `snaps` | `session` | `snapshots`, `base`, `jobs_since_base` |
 | `checkout` | `session`, `name`, `discard`, `snap` (name to save the current state under first) | the session |
 | `drop` | `session`, `name` | `dropped` |
+| `tree` | – | `nodes`: snapshots (`kind: "snapshot"`, as below) and live workers (`kind: "worker"`, `session`, `state`, `base`, `jobs_since_base`), each with `parent` (a snapshot ref or null) |
+| `diff` | `session` (for `@` and bare names), `a`, `b` (default `@`), `max_bytes` (content limit, null for no limit) | `added`, `removed`: variable summaries; `changed`: `{name, a, b, fields}` (`fields` lists the differing summary keys, or `["content"]`); `unchanged`: count; `not_compared`: `{name, reason}` |
 | `shutdown` | – | `stopping` |
 
 A **session** is `{name, state (starting | idle | busy | dead), python, cwd, pid, rss, created, queued, current_job,

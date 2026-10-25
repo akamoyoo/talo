@@ -76,6 +76,41 @@ descriptors need to be passed. The snapshot reaps its children and records their
 pages that only this process holds). With `new --memory-budget SIZE`, `snap` is refused when the worker's resident
 memory plus all snapshots' private memory would exceed the budget, with a list of snapshots that could be dropped.
 
+**Tree.** `talo tree` draws every snapshot of every session as one tree, following each snapshot's parent across
+sessions (a branch made with `new --from` hangs under the snapshot it came from). Each session's live worker is a leaf
+under its base, marked with `*` and the number of jobs run since. A snapshot whose parent was dropped hangs under a
+`(dropped REF)` placeholder.
+
+```console
+$ talo tree
+(empty start: default)
+└─ loaded       default:s1   1.2 MB private   jobs 1,2
+   ├─ clean     default:s2   164 MB private   jobs 3
+   │  └─ * default           idle, 1 job since
+   └─ * idea2                idle, 0 jobs since
+```
+
+**Diff.** `talo diff A [B]` compares the variables of two states. A state is a snapshot (`[SESSION:]NAME`) or a
+session's live worker (`@` for the current session, `SESSION:@` for another one); `B` defaults to `@`. The result lists
+variables that were added, removed or changed, and how many are unchanged:
+
+```console
+$ talo diff loaded
++ mask          ndarray (1000000,) bool        976.6 KB
+~ df            DataFrame (1000000, 3) -> (998012, 3)
+~ prices        ndarray (1000000,) float64     content
+- tmp           list len=3
+(12 unchanged; 1 not compared by content: bars 31.4 GB > 256 MB, use --content)
+```
+
+Two variables are compared first by their summaries (type, shape or length, dtype, columns, value preview). When the
+summaries are equal, both sides compute a content fingerprint: a BLAKE2b hash of the object's pickle (protocol 5,
+with large buffers such as NumPy and pandas data hashed in place, without copying). Equal fingerprints mean equal
+pickled bytes. Hashing reads every byte (about 1 GB/s on each side, in parallel), so by default only variables up to
+256 MB are compared by content; `--content` compares all of them, `--max-bytes SIZE` changes the limit, and variables
+that were not compared are listed. Objects that cannot be pickled are reported as not comparable. Diffing a live
+worker needs it to be idle, as for `vars`.
+
 Costs measured in [spikes/README.md](../spikes/README.md):
 
 - taking a snapshot: milliseconds, growing with the page tables (12 ms with 16 GB resident);

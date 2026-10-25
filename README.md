@@ -141,6 +141,8 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo checkout NAME` | roll back: replace the worker with a fork of a snapshot (`--discard`, `--snap NAME`) |
 | `talo new NAME --from SNAPSHOT` | branch: a new session forked from a snapshot |
 | `talo snaps` / `drop NAME` | snapshots with their private memory; free one |
+| `talo tree` | all snapshots and workers of all sessions as one tree |
+| `talo diff A [B]` | variables added, removed or changed between two snapshots (or a snapshot and the live worker) |
 | `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
 
