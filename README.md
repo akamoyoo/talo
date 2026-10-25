@@ -165,6 +165,8 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo events --after CURSOR --wait 30` | wait for jobs, maps, calls, snapshots, notes without polling |
 | `talo handoff -m MSG` / `resume ID --branch NAME` | hand work over to another agent or a human |
 | `talo share --user NAME --level read/call/run` | share a session with another user on the machine |
+| `talo notebook -s NAME` / `kernelspec install` | open a session in JupyterLab / VS Code: a notebook of its code, attached to it |
+| `talo autosnap on` / `undo` | a snapshot after every execution; undo the last one (`%undo` in notebooks) |
 | `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
 

@@ -510,6 +510,11 @@ $ jupyter lab                              # open any .ipynb, pick the kernel "T
   count. `complete_request`, `inspect_request` (a `show` summary), `is_complete_request`, `history_request` (the
   session's history), `kernel_info_request` (`implementation: "talo"`) and `comm_info_request` (no comms) are
   answered. `interrupt_request` (control channel) interrupts the running job. `input()` is not supported.
+- **Attaching from a notebook** connects to the live state, not to its code: the notebook document belongs to the
+  front end, and the protocol has no way for a kernel to add cells to it. `talo notebook -s SESSION` writes the
+  session's lineage as a notebook (code, outputs, images, the matching execution counts) whose metadata names the
+  session's kernel, and installs that kernelspec: opening the file attaches to the session with the text matching
+  the state. `%history` shows the code from inside any notebook.
 - **Restarting the kernel** from the front end does not reset the session: the bridge reconnects to it and says so
   (`Talo kept session default (31 GB, rev 42); %checkout or talo kill resets it`). Data survives a front end restart,
   which is the point. `shutdown_request` likewise detaches; the session keeps running.

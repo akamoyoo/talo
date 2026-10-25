@@ -4,6 +4,8 @@ default output is for humans. See ``talo --help``."""
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -584,7 +586,10 @@ def cmd_export(args):
     to = args.to or ("ipynb" if args.output and args.output.endswith(".ipynb") else "py")
     notes = "".join(f"\nnote {note_line(n)}" for n in d.get("notes", []))
     what = "every job" if args.all else (f"the path to snapshot {args.snap}" if args.snap else "lineage of the current state")
-    text = (export.to_ipynb if to == "ipynb" else export.to_py)(d["jobs"], export.header(session, what) + notes)
+    if to == "ipynb":  # the notebook names the session's kernel, so opening it attaches to the live session
+        text = export.to_ipynb(d["jobs"], export.header(session, what) + notes, session=session)
+    else:
+        text = export.to_py(d["jobs"], export.header(session, what) + notes)
     if not args.output:
         if args.json:
             print(json.dumps({"format": to, "jobs": len(d["jobs"]), "text": text}, ensure_ascii=False))
@@ -595,6 +600,21 @@ def cmd_export(args):
         f.write(text)
     summary = {"path": os.path.abspath(args.output), "format": to, "jobs": len(d["jobs"])}
     emit(args, summary, lambda x: print(f"wrote {x['path']} ({x['jobs']} records, {x['format']})"))
+
+
+def cmd_notebook(args):
+    """A notebook of the session's lineage, attached to the live session when opened."""
+    from talo import kernel
+    session = session_name(args)
+    spec = kernel.install_kernelspec(session, prefix=args.prefix)
+    args.to, args.output, args.snap, args.all = "ipynb", args.output or f"{session}.ipynb", None, False
+    json_mode, args.json = args.json, False
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_export(args)
+    d = {"path": os.path.abspath(args.output), "kernelspec": spec.name, "session": session}
+    args.json = json_mode
+    emit(args, d, lambda x: print(f"wrote {x['path']}: open it in JupyterLab or VS Code; its kernel \"Talo: "
+                                  f"{session}\" attaches to the live session (its variables are in memory already)"))
 
 
 def cmd_note(args):
@@ -844,6 +864,19 @@ def cmd_diff(args):
     emit(args, d, human)
 
 
+def cmd_kernel(args):
+    from talo import kernel
+    return kernel.main(args.connection_file, session_name(args), args.python)
+
+
+def cmd_kernelspec(args):
+    from talo import kernel
+    path = kernel.install_kernelspec(session_name(args), name=args.name, python=args.python, prefix=args.prefix)
+    emit(args, {"path": str(path), "session": session_name(args)},
+         lambda d: print(f"installed kernelspec {path.name} at {d['path']}: pick \"Talo: {d['session']}\" in "
+                         "JupyterLab, VS Code or jupyter console"))
+
+
 def cmd_stop(args):
     try:
         call("shutdown", autostart=False)
@@ -1051,6 +1084,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("b", nargs="?", default="@", help="as A (default @: the session's live worker)")
     p.add_argument("--max-bytes", default="256M", help="compare content only for variables up to this size")
     p.add_argument("--content", action="store_true", help="compare the content of all variables, whatever their size")
+    p = add("notebook", cmd_notebook, "write the session's code as a notebook that opens attached to the session")
+    p.add_argument("-o", "--output", help="file to write (default SESSION.ipynb)")
+    p.add_argument("--prefix", help="install the kernelspec under PREFIX/share/jupyter/kernels")
+    p = add("kernel", cmd_kernel, "run as a Jupyter kernel bridged to a session (started by Jupyter)")
+    p.add_argument("-f", "--connection-file", required=True)
+    p.add_argument("--python", help="interpreter if the session has to be created")
+    p = add("kernelspec", cmd_kernelspec, "install a Jupyter kernelspec for a session")
+    p.add_argument("action", choices=("install",))
+    p.add_argument("--name", help="kernelspec name (default talo-SESSION)")
+    p.add_argument("--python", help="interpreter if the session has to be created")
+    p.add_argument("--prefix", help="install under PREFIX/share/jupyter/kernels (e.g. a virtualenv)")
     add("stop", cmd_stop, "stop the supervisor (closes all sessions)", session=False)
     add("daemon", cmd_daemon, "run the supervisor in the foreground (for debugging; normally started automatically)",
         session=False)

@@ -164,6 +164,8 @@ def complete(namespace: dict, code: str, cursor_pos: int) -> dict:
         return {"status": "ok", "matches": matches, "cursor_start": cursor_pos - len(m.group(3)),
                 "cursor_end": cursor_pos, "metadata": {}}
     token = _NAME.search(before).group(0)
+    if not token:  # nothing typed: listing every name would only flood the front end
+        return {"status": "ok", "matches": [], "cursor_start": cursor_pos, "cursor_end": cursor_pos, "metadata": {}}
     completer, matches = rlcompleter.Completer(namespace), []
     for i in range(1000):
         try:

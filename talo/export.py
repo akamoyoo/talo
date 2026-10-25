@@ -96,7 +96,7 @@ def _cell_id(n: int) -> str:
     return f"talo-{n}"
 
 
-def to_ipynb(jobs: list, header: str) -> str:
+def to_ipynb(jobs: list, header: str, session: str | None = None) -> str:
     cells = [{"cell_type": "markdown", "id": _cell_id(0), "metadata": {}, "source": header.splitlines(keepends=True)}]
     for rec in jobs:
         if rec["kind"] in ("snap", "checkout", "reload"):
@@ -118,7 +118,9 @@ def to_ipynb(jobs: list, header: str) -> str:
                       "metadata": {} if rec["status"] == "ok" else {"talo_status": rec["status"], "talo_hazard": HAZARD},
                       "source": rec["code"].rstrip("\n").splitlines(keepends=True), "outputs": outputs})
     notebook = {"nbformat": 4, "nbformat_minor": 5, "cells": cells,
-                "metadata": {"kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},
+                "metadata": {"kernelspec": ({"name": f"talo-{session}", "display_name": f"Talo: {session}",
+                                             "language": "python"} if session else
+                                            {"name": "python3", "display_name": "Python 3", "language": "python"}),
                              "language_info": {"name": "python"}}}
     return json.dumps(notebook, ensure_ascii=False, indent=1) + "\n"
 
