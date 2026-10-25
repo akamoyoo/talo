@@ -88,6 +88,14 @@ TOOLS = {
              _obj({"name": S, "message": S, "session": SESSION, "key": S})),
     "checkout": ("Roll the session back to a snapshot. `discard` drops the state of jobs since the current base.",
                  _obj({"name": S, "discard": B, "snap": S, "session": SESSION, "expect_rev": I, "key": S}, ["name"])),
+    "snaps": ("The session's snapshots: parent, jobs, private memory or `storage: disk`, and why one cannot move "
+              "to disk.", _obj({"session": SESSION})),
+    "memory": ("Where the session's memory is: measured per process (worker, snapshots, helpers) and the largest "
+               "variables (estimated).", _obj({"session": SESSION})),
+    "snapshot_demote": ("Move a snapshot to disk to free its memory (fails closed if a value cannot be saved); "
+                        "checking it out later restores its values in a new worker. `dry_run` only says whether "
+                        "it can and how much it frees.",
+                        _obj({"name": S, "dry_run": B, "session": SESSION, "timeout": N, "key": S}, ["name"])),
     "undo": ("Go back to the state before the last execution (needs autosnap or a snapshot).",
              _obj({"session": SESSION})),
     "diff": ("Variables added, removed or changed between two states: snapshots, or '@' for the live worker.",
@@ -147,7 +155,10 @@ class Server:
             return self._job_with_output(j), False
         if name == "interrupt":
             return call("interrupt", id=a["id"]), False
-        if name in ("brief", "vars", "undo"):
+        if name == "snapshot_demote":
+            return call("snapshot_demote", session=s, name=a["name"], dry_run=a.get("dry_run"),
+                        timeout=a.get("timeout", 30), key=a.get("key")), False
+        if name in ("brief", "vars", "undo", "snaps", "memory"):
             return call(name, session=s, **{k: v for k, v in a.items() if k != "session"}), False
         if name == "show":
             return call("show", session=s, name=a["name"], rows=a.get("rows", 10)), False

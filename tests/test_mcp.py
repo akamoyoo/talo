@@ -35,7 +35,8 @@ def test_mcp_lifecycle_tools_and_concurrency(talo_home):
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in reply(2)["result"]["tools"]}
-        assert {"run", "wait", "interrupt", "brief", "snap", "checkout", "map", "call", "ledger"} <= names
+        assert {"run", "wait", "interrupt", "brief", "snap", "snaps", "memory", "snapshot_demote", "checkout", "map", "call",
+                "ledger"} <= names
         send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
               "params": {"name": "run", "arguments": {"code": "import time\nx = 41\nprint('hi')\nx + 1"}}})
         r = reply(3)["result"]

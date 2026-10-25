@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- MCP: `snaps`, `memory` and `snapshot_demote` tools.
 - Snapshots stay small: before every fork the worker collects garbage and returns free heap pages to the kernel
   (`malloc_trim`); measured on a research session, a snapshot's private memory after the same work fell from 475 MB
   to 67 MB (11 MB with the opt-in `freeze`). `new --snapshot-prep` sets it per session.
