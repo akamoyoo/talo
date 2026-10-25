@@ -463,10 +463,11 @@ consumer always knows when it may have missed something.
   | `call` | `read`, plus calling the functions the owner exposed (`talo call`, JSON arguments only) |
   | `run` | everything, including running arbitrary code (equivalent to the owner's account; stated when granted) |
 
-  `talo share SESSION --user NAME --level LEVEL` creates a socket for that user (`$TALO_HOME/shared/NAME.sock`, owned by
-  the owner and readable only by the given user through a POSIX ACL or a shared group), and the supervisor checks
-  every request on it against the level; the peer's uid is verified with `SO_PEERCRED`. `talo share --list` and
-  `talo unshare` manage grants; every grant and every request on a shared socket is recorded in the event journal.
+  `talo share -s SESSION --user NAME --level LEVEL` opens a shared socket (`/tmp/talo-shared-UID/…`, in a directory
+  others can traverse). Anyone may connect to it, but every connection is identified by its uid (`SO_PEERCRED`) and
+  every request is checked against that uid's grants, so the file's permissions are not what protects it. Listings
+  only show granted sessions; `run` excludes managing sessions, shares and the supervisor. `talo share --list` and
+  `talo unshare --user NAME` manage grants; every grant and every request on a shared socket is recorded in the event journal.
   The other user connects with `talo --connect PATH ...`.
 - **Other machines** are out of scope for M5: forward the socket over SSH, or (M7) use a Jupyter remote kernel.
 

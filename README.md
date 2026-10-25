@@ -69,7 +69,16 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
 
 ## Status
 
-**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches / `tree` / `diff` (M2) and the interactive prompt, images as files and export (M3) and the tools for agents at scale (M4) work: `brief`, notes, atomic runs, retries, revisions, progress, memory limits, `reload`; next is work across sessions (M5: fan-out, sessions as services, an experiment ledger), shared datasets (M6) and Jupyter front ends (M7). Interfaces will change.
+**Pre-alpha.** Interfaces will change. Working today:
+
+- resident sessions and background jobs (M1);
+- snapshots, rollback, branches, `tree`, `diff` (M2);
+- an interactive prompt, images as files, export to `.py` / `.ipynb` (M3);
+- tools for agents at scale: `brief`, notes, atomic runs, safe retries, revisions, progress, memory limits,
+  `reload` (M4);
+- work across sessions: `map`, services, the experiment ledger, events, handoffs, sharing (M5).
+
+Next: shared datasets (M6) and Jupyter front ends (M7).
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
@@ -150,6 +159,12 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo run --atomic` / `--key K` / `--expect-rev N` | restore on failure; safe retries; refuse if the state changed |
 | `talo resources` | memory (PSS) of every worker and snapshot; `new --memory-limit` sets a soft limit |
 | `talo reload [MODULE] [--changed]` | reload edited modules, report names still bound to old code |
+| `talo map --from SNAP --cases FILE -f code.py -j 8` | run code once per case, each in a fork of one snapshot, in parallel |
+| `talo.expose(fn)` / `talo call SESSION.FN '{...}'` | a session as a service: calls run in forks of a pinned version |
+| `talo.record(...)` / `talo ledger` | an experiment ledger tied to the job, case and snapshot that produced each record |
+| `talo events --after CURSOR --wait 30` | wait for jobs, maps, calls, snapshots, notes without polling |
+| `talo handoff -m MSG` / `resume ID --branch NAME` | hand work over to another agent or a human |
+| `talo share --user NAME --level read/call/run` | share a session with another user on the machine |
 | `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
 

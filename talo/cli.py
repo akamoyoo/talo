@@ -378,6 +378,34 @@ def cmd_resume(args):
     emit(args, d, human)
 
 
+def cmd_share(args):
+    if args.list:
+        def human(d):
+            if not d["shares"]:
+                print("(nothing shared)")
+            for s in d["shares"]:
+                print(f"{s['user']:12s} {s['session']:16s} {s['level']}")
+            if d["connect"]:
+                print(f"(they connect with `talo --connect {d['connect']} ...`)")
+        emit(args, call("shares"), human)
+        return
+    if not args.user:
+        raise TaloError("BadArgument", "share needs --user NAME (or --list)")
+    d = call("share", session=session_name(args), user=args.user, level=args.level)
+
+    def human(x):
+        print(f"shared session {x['session']} with {x['user']} at level {x['level']}")
+        if x.get("warning"):
+            print(f"warning: {x['warning']}")
+        print(f"they connect with: talo --connect {x['connect']} brief -s {x['session']}")
+    emit(args, d, human)
+
+
+def cmd_unshare(args):
+    d = call("unshare", user=args.user, session=args.session)
+    emit(args, d, lambda x: print("revoked: " + (", ".join(x["revoked"]) or "nothing")))
+
+
 def cmd_map(args):
     code = read_code(args)
     cases = None
@@ -823,6 +851,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="talo", description="A resident in-memory Python session: load data once, "
                                                           "keep it in memory, drive it from the terminal.")
     ap.add_argument("--version", action="version", version=f"talo {__version__}")
+    ap.add_argument("--connect", metavar="PATH", help="use a session shared by another user (the path `talo share` gave)")
     sub = ap.add_subparsers(dest="command", required=True)
 
     def add(name, fn, help_, session=True):
@@ -932,6 +961,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key", help="idempotency key")
     p.add_argument("--expect-rev", type=int, metavar="N", help="without --from: refuse unless the session is at revision N")
     add("maps", cmd_maps, "fan-outs and their progress")
+    p = add("share", cmd_share, "let another user on this machine read, call or run in a session")
+    p.add_argument("--user", help="the user to share with")
+    p.add_argument("--level", choices=("read", "call", "run"), default="read",
+                   help="read: inspect; call: also call exposed services; run: also run any code (as you)")
+    p.add_argument("--list", action="store_true", help="list what is shared")
+    p = add("unshare", cmd_unshare, "revoke a share")
+    p.add_argument("--user", required=True)
     p = add("handoff", cmd_handoff, "hand the session's work over: snapshot, notes, records, running jobs, message")
     p.add_argument("-m", "--message", help="what was done, what is open, what to do next")
     p.add_argument("--to", help="who it is for (attribution only)")
@@ -1003,6 +1039,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.connect:
+        os.environ["TALO_CONNECT"] = args.connect
     if getattr(args, "owner", None):
         os.environ["TALO_AGENT"] = args.owner  # read by every request (client.call)
     try:

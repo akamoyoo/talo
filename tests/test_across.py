@@ -162,3 +162,42 @@ def test_handoff_and_resume(talo):
     rc, d = run_json(talo, "handoff", "-m", "second")
     assert d["handoff"]["notes"]["count"] == 0             # only what happened since the previous handoff
     assert run_json(talo, "drop", h["snapshot_name"])[0] == 0   # no longer pinned
+
+
+def test_sharing_levels_on_the_shared_socket(talo, monkeypatch):
+    import getpass
+    import os
+    import subprocess
+    import sys
+    me = getpass.getuser()
+    talo("run", "x = 1\ndef f():\n    return 7\ntalo.expose(f)")
+    talo("new", "private")
+    rc, d = run_json(talo, "share", "--user", me, "--level", "read")
+    path = d["connect"]
+    assert os.stat(path).st_mode & 0o777 == 0o666
+
+    def shared(*args):
+        out = subprocess.run([sys.executable, "-m", "talo.cli", "--connect", path, *args, "--json"],
+                             capture_output=True, text=True, timeout=60)
+        return out.returncode, json.loads(out.stdout)
+
+    rc, d = shared("brief", "-s", "default")
+    assert rc == 0 and d["session"]["name"] == "default"
+    assert [s["name"] for s in shared("ls")[1]["sessions"]] == ["default"]       # private is not listed
+    rc, d = shared("run", "-s", "default", "x = 2")
+    assert rc == 2 and d["error"]["type"] == "Forbidden"
+    rc, d = shared("call", "default.f")
+    assert rc == 2 and d["error"]["type"] == "Forbidden"
+    rc, d = shared("brief", "-s", "private")
+    assert rc == 2 and d["error"]["type"] == "Forbidden"
+    talo("share", "--user", me, "--level", "call")
+    assert shared("call", "default.f")[1]["call"]["result"] == 7
+    talo("share", "--user", me, "--level", "run")
+    rc, d = shared("run", "-s", "default", "x + 1")
+    assert rc == 0 and d["job"]["owner"] == f"{me}@shared"
+    rc, d = shared("stop")
+    assert rc == 2
+    talo("unshare", "--user", me)
+    assert shared("brief", "-s", "default")[1]["error"]["type"] == "Forbidden"
+    kinds = {e["type"] for e in run_json(talo, "events", "--all", "--limit", "500")[1]["events"]}
+    assert {"share.granted", "share.request", "share.denied", "share.revoked"} <= kinds

@@ -71,6 +71,11 @@ one per connection:
 
 ## Control requests
 
+Requests on the **shared socket** (see "Sharing a session" in [design.md](design.md)) are checked against the peer's
+uid (`SO_PEERCRED`) and its grants; `owner` is replaced by `USER@shared`, listings are narrowed to the granted
+sessions, and a refused request fails with `Forbidden`. Every request is recorded as a `share.request` or
+`share.denied` event.
+
 Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` defaults to `user`; the CLI sends `$TALO_AGENT`). Reply: `{"ok": true, ...result}` or
 `{"ok": false, "error": {"type": "...", "message": "..."}}`.
 
@@ -110,6 +115,9 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `handoff` | `session`, `message`, `to`, `snap`, `key`, `expect_rev`; or `close` (a handoff id) | `handoff`: `{id, session, owner, to, message, snapshot, snapshot_name, snapshot_available, rev, status, notes, records, active_jobs, variables, recent_jobs, continue}` |
 | `handoffs` | `session` | `handoffs` |
 | `resume` | `id`, `branch` (a new session name) | `handoff`, and `session` when branched |
+| `share` | `session`, `user`, `level` (`read` / `call` / `run`) | `user`, `uid`, `session`, `level`, `connect` (the shared socket's path), `warning` |
+| `unshare` | `user`, `session` (optional) | `revoked` |
+| `shares` | – | `shares`, `connect` |
 | `record` | `session`, `fields`, `key` | `record` |
 | `ledger` | `session`, `owner`, `outcome`, `has` (list), `where` (list of `KEY=VALUE`), `sort` (`KEY` or `-KEY`), `last` | `records`: `{id, key, time, owner, session, session_id, producer ({kind: job / case / shell, ...}), rev, source_snapshot, source_state (kept / gone / none), code_hash, modules, fields, outcome}`, `total` |
 | `events` | `after` (cursor `EPOCH:SEQ`; default: now), `all`, `wait` (seconds), `session`, `type` (comma-separated), `limit` | `events`, `next` (cursor), `has_more`, `oldest`; `CursorExpired` for a cursor of another epoch or older than the journal |

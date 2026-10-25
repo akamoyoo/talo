@@ -26,3 +26,10 @@ def socket_for(path: Path) -> Path:
 def socket_path() -> Path:
     """The supervisor's socket: ``$TALO_HOME/supervisor.sock`` (shortened when necessary)."""
     return socket_for(home() / "supervisor.sock")
+
+
+def shared_socket_path() -> Path:
+    """The socket other users connect to when sessions are shared with them: in a directory they can traverse
+    (``/tmp/talo-shared-UID``, mode 0711), one per ``TALO_HOME``. Access is checked per connection (``SO_PEERCRED``)."""
+    digest = hashlib.sha256(str(home().resolve()).encode()).hexdigest()[:12]
+    return Path("/tmp") / f"talo-shared-{os.getuid()}" / f"{digest}.sock"

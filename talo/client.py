@@ -22,8 +22,9 @@ class TaloError(RuntimeError):
 
 
 def _connect() -> socket.socket:
+    """The supervisor's socket, or a shared one named by ``$TALO_CONNECT`` (``talo --connect PATH``)."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(str(socket_path()))
+    s.connect(os.environ.get("TALO_CONNECT") or str(socket_path()))
     return s
 
 
@@ -48,6 +49,8 @@ def call(op: str, *, autostart: bool = True, **params) -> dict:
     try:
         s = _connect()
     except OSError:
+        if os.environ.get("TALO_CONNECT"):
+            raise TaloError("NotRunning", f"cannot connect to {os.environ['TALO_CONNECT']}") from None
         if not autostart:
             raise TaloError("NotRunning", "the supervisor is not running") from None
         start_supervisor()

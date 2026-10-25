@@ -11,6 +11,9 @@
 
 ### Added
 
+- M5, across sessions: ephemeral workers and `map` (fan-out of a snapshot under memory limits); services
+  (`talo.expose`, `talo call`, versions pinned to snapshots); the experiment ledger (`talo.record`, `ledger`) with
+  provenance and outcomes; the event journal (`events`); `handoff` / `resume`; `share` with read / call / run levels.
 - M4, agents at scale: `brief`, `note` / `notes`; owners on every request (`--owner`, `$TALO_AGENT`); session
   revisions and `--expect-rev`; idempotency keys (`--key`) for `run`, `snap`, `checkout`, `reload`; `run --atomic`
   (internal checkpoint, restored on failure); `talo.progress()` and activity ages; condensed output and bounded

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from talo import ephemeral, wire
-from talo.paths import home, socket_for, socket_path
+from talo.paths import home, shared_socket_path, socket_for, socket_path
 
 log = logging.getLogger("talo")
 WORKER = Path(__file__).with_name("worker.py")
@@ -246,6 +246,37 @@ class StaleRevision(RuntimeError):
 
 class CursorExpired(RuntimeError):
     pass
+
+
+class Forbidden(RuntimeError):
+    pass
+
+
+def visible_only(reply: dict, sessions: set) -> dict:
+    """A listing narrowed to the sessions a shared user was granted."""
+    def keep(item) -> bool:
+        if not isinstance(item, dict):
+            return True
+        name = item.get("session", item.get("name"))
+        if isinstance(name, str) and "." in name and "session" not in item:  # a service: "session.function"
+            name = name.split(".")[0]
+        return name in sessions
+    out = dict(reply)
+    for key in ("sessions", "nodes", "services", "handoffs", "maps", "records", "events", "jobs"):
+        if isinstance(out.get(key), list):
+            out[key] = [x for x in out[key] if keep(x)]
+    if "sessions" in out and isinstance(out["sessions"], int):
+        out["sessions"] = len(sessions)
+    return out
+
+
+# What each sharing level allows (see "Sharing a session" in docs/design.md). Operations that name a session are
+# checked against the grant; operations on ids are checked against the session that owns the job, map or call.
+SHARE_READ = {"ping", "ls", "vars", "show", "brief", "tree", "diff", "snaps", "jobs", "job", "output", "history",
+              "ledger", "events", "notes", "services", "maps", "resources", "handoffs", "complete"}
+SHARE_CALL = SHARE_READ | {"call"}
+SHARE_RUN_EXCLUDED = {"shutdown", "share", "unshare", "shares", "kill", "new"}
+SHARE_LEVELS = ("read", "call", "run")
 
 
 class Session:
@@ -820,6 +851,8 @@ class Supervisor:
         self.services: dict[str, dict] = {}   # "session.name" -> {"versions": {n: version}, "latest": n}
         self.calls: dict[str, dict] = {}
         self.next_call = 1
+        self.grants: dict[int, dict] = {}   # uid -> {"user", "sessions": {name: level}}
+        self.shared_server = None
         self.handoffs: dict[str, dict] = {}
         self.next_handoff = 1   # record id -> record (shared by all sessions)
         self.last_rev: dict[str, int] = {}             # session name -> its revision when it was closed
@@ -1821,7 +1854,7 @@ class Supervisor:
 
     # ---------------------------------------------------------------- server
 
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, shared: bool = False) -> None:
         try:
             line = await reader.readline()
             if not line:
@@ -1832,7 +1865,13 @@ class Supervisor:
                 reply = {"ok": False, "error": {"type": "UnknownOp", "message": f"unknown operation {req.get('op')!r}"}}
             else:
                 try:
+                    visible = None
+                    if shared:
+                        req = self._authorize(writer, req)
+                        visible = req.pop("_visible", None)
                     reply = {"ok": True, **await fn(req)}
+                    if visible is not None:
+                        reply = visible_only(reply, set(visible))
                 except Exception as error:  # noqa: BLE001 - report to the client; the supervisor keeps running
                     msg = error.args[0] if isinstance(error, KeyError) and error.args else str(error)
                     reply = {"ok": False, "error": {"type": type(error).__name__, "message": msg}}
@@ -1842,6 +1881,102 @@ class Supervisor:
             pass
         finally:
             writer.close()
+
+    # ---------------------------------------------------------------- sharing
+
+    def _peer_uid(self, writer: asyncio.StreamWriter) -> int:
+        import struct
+        sock = writer.get_extra_info("socket")
+        pid, uid, gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        return uid
+
+    def _authorize(self, writer: asyncio.StreamWriter, req: dict) -> dict:
+        """Check a request on the shared socket against the peer's grants; returns the request, possibly narrowed to
+        the sessions the peer may see. Every request is recorded in the event journal."""
+        uid = self._peer_uid(writer)
+        grant = self.grants.get(uid)
+        op = req.get("op")
+        if grant is None:
+            raise Forbidden(f"uid {uid} has no access to these sessions")
+        req = {**req, "owner": f"{grant['user']}@shared"}
+        sessions = grant["sessions"]
+
+        def level_of(name: str | None) -> str | None:
+            return sessions.get(name) if name else None
+
+        def allowed(level: str | None) -> bool:
+            if level is None:
+                return False
+            if level == "run":
+                return op not in SHARE_RUN_EXCLUDED
+            return op in (SHARE_CALL if level == "call" else SHARE_READ)
+
+        target = req.get("session")
+        if op in ("job", "output", "interrupt"):
+            ident = str(req.get("id"))
+            target = (self.calls[ident]["service"].split(".")[0] if ident in self.calls else
+                      self.maps[ident].session if ident in self.maps else
+                      self.jobs[ident].session if ident in self.jobs else None)
+        elif op == "call":
+            target = str(req.get("service", "")).split(".")[0]
+        elif op in ("diff",):
+            target = req.get("session")
+        if target is None and op in SHARE_READ and op not in ("job", "output"):
+            # listings without a session: only granted sessions are shown
+            if op in ("ls", "tree", "services", "handoffs", "maps", "ledger", "events", "jobs", "resources", "ping"):
+                req["_visible"] = sorted(sessions)
+                self.emit("share.request", user=grant["user"], op=op)
+                return req
+        if not allowed(level_of(target)):
+            self.emit("share.denied", user=grant["user"], op=op, session=target)
+            raise Forbidden(f"{grant['user']} may not {op} " + (f"in session {target}" if target else "here") +
+                            f" (level {level_of(target) or 'none'})")
+        self.emit("share.request", user=grant["user"], op=op, session=target)
+        return req
+
+    async def op_share(self, req):
+        import pwd
+        user, level, name = req["user"], req.get("level", "read"), req["session"]
+        if level not in SHARE_LEVELS:
+            raise ValueError(f"level must be one of {', '.join(SHARE_LEVELS)}")
+        self._session(name)
+        uid = pwd.getpwnam(user).pw_uid
+        grant = self.grants.setdefault(uid, {"user": user, "sessions": {}})
+        grant["sessions"][name] = level
+        await self._start_shared()
+        self.emit("share.granted", user=user, session=name, level=level)
+        warning = ("run lets them execute any code as you, with all of your account's access" if level == "run"
+                   else None)
+        return {"user": user, "uid": uid, "session": name, "level": level, "connect": str(shared_socket_path()),
+                "warning": warning}
+
+    async def op_unshare(self, req):
+        import pwd
+        uid = pwd.getpwnam(req["user"]).pw_uid
+        grant = self.grants.get(uid, {"sessions": {}})
+        removed = [s for s in list(grant["sessions"]) if not req.get("session") or s == req["session"]]
+        for s in removed:
+            del grant["sessions"][s]
+        if not grant["sessions"]:
+            self.grants.pop(uid, None)
+        self.emit("share.revoked", user=req["user"], sessions=removed)
+        return {"revoked": removed}
+
+    async def op_shares(self, req):
+        return {"shares": [{"user": g["user"], "uid": uid, "session": s, "level": lvl}
+                           for uid, g in self.grants.items() for s, lvl in g["sessions"].items()],
+                "connect": str(shared_socket_path()) if self.shared_server else None}
+
+    async def _start_shared(self) -> None:
+        if self.shared_server is not None:
+            return
+        path = shared_socket_path()
+        path.parent.mkdir(mode=0o711, exist_ok=True)
+        os.chmod(path.parent, 0o711)
+        path.unlink(missing_ok=True)
+        self.shared_server = await asyncio.start_unix_server(lambda r, w: self.handle(r, w, shared=True),
+                                                             path=str(path), limit=wire.MAX_LINE)
+        os.chmod(path, 0o666)  # anyone may connect; every connection is checked by its uid (SO_PEERCRED)
 
     async def serve(self) -> None:
         path = socket_path()
@@ -1853,6 +1988,9 @@ class Supervisor:
         async with server:
             await self.stopping.wait()
         self._kill_maps()
+        if self.shared_server is not None:
+            self.shared_server.close()
+            shared_socket_path().unlink(missing_ok=True)
         for s in list(self.sessions.values()):
             await s.stop()
         path.unlink(missing_ok=True)
