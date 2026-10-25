@@ -32,7 +32,7 @@ Python 3.12, numpy 2.5, pandas 3.0 / 3.1.
   fork time may never be released. Snapshots must be taken at idle points, after checking which threads exist
   (`/proc/self/task/*/comm`), with warnings or refusals for threads not known to be safe.
 - Libraries that keep their own thread pools either break or refuse to run after a rollback unless they rebuild the
-  pool in the child (for example in a `pthread_atfork` handler). talo must detect and report this rather than hang.
+  pool in the child (for example in a `pthread_atfork` handler). Talo must detect and report this rather than hang.
 
 ## An incident during the measurements
 

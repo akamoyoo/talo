@@ -1,5 +1,13 @@
 <p align="center">
-  <strong>talo</strong><br>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo.svg" alt="Talo" width="128" height="128">
+  </picture>
+</p>
+
+<h1 align="center">Talo</h1>
+
+<p align="center">
   <em>A resident Python session you drive from the terminal.<br>
   Load your data once. Keep it in memory. Snapshot, roll back, branch.</em>
 </p>
@@ -9,12 +17,13 @@
   <a href="docs/design.md">Design</a> ·
   <a href="docs/protocol.md">Protocol</a> ·
   <a href="docs/roadmap.md">Roadmap</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a>
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="LICENSE">Apache-2.0</a>
 </p>
 
 ---
 
-**talo** (Finnish for *house*) is a long-lived Python process that keeps your variables in memory while you —
+**Talo** (Finnish for *house*) is a long-lived Python process that keeps your variables in memory while you —
 or your coding agent — send it code from the terminal, one command at a time. Think of it as a Jupyter kernel without
 the notebook UI, built for workflows where the expensive part is getting the data into memory (illustrative session):
 
@@ -33,17 +42,17 @@ Every command returns quickly: if the code is still running after the timeout, y
 keeps going in the background. Output is captured at the file-descriptor level (so prints from C extensions show up
 too), truncated sensibly for humans and agents alike, and kept in full on disk.
 
-## Why talo?
+## Why Talo?
 
 Data analysis by trial and error — and that is exactly how coding agents work — keeps paying two costs over and over:
 
 1. **Reloading.** Every new idea becomes a new script that loads the same gigabytes again.
 2. **No way back.** Once a step mutates a DataFrame in place, the only way to recover is to reload and redo.
 
-Jupyter solves the first one for humans in a browser. talo aims to be a superset of what a Jupyter kernel gives you,
+Jupyter solves the first one for humans in a browser. Talo aims to be a superset of what a Jupyter kernel gives you,
 driven from the shell, plus what Jupyter does not have:
 
-| | Jupyter kernel | talo |
+| | Jupyter kernel | Talo |
 |---|---|---|
 | Variables stay in memory between executions | ✓ | ✓ |
 | Rich outputs (HTML, images), `.ipynb` | ✓ | ✓ (M3) |
@@ -64,7 +73,7 @@ Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
 
-talo has no runtime dependencies and needs Python ≥ 3.10.
+Talo has no runtime dependencies and needs Python ≥ 3.10.
 
 ```console
 $ pip install -e .            # from a checkout; a PyPI release will follow
@@ -72,7 +81,7 @@ $ talo --version
 ```
 
 The session's code runs in whichever interpreter you choose (`--python`), so your project's virtualenv does not need
-talo installed in it.
+Talo installed in it.
 
 ## Quick start
 
@@ -113,7 +122,7 @@ $ talo run --json 'df.shape'
  "output": {"text": "", "lines_cut": 0, ...}}
 ```
 
-Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` talo itself failed, `3` still running
+Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo itself failed, `3` still running
 (use `talo wait ID`). A typical agent loop never blocks for more than the timeout it chose.
 
 ## Commands
@@ -154,7 +163,7 @@ talo CLI (humans, agents)        JupyterLab / VS Code (M4)
 - Each session's **worker** is a single-threaded process running in your chosen interpreter. It is a single
   standard-library-only file executed by path.
 - Messages use the structure of the **Jupyter messaging protocol** (`execute_request`, `execute_result`, `error`,
-  `status`, ...), with talo's own extensions prefixed `talo_`. See [docs/protocol.md](docs/protocol.md).
+  `status`, ...), with Talo's own extensions prefixed `talo_`. See [docs/protocol.md](docs/protocol.md).
 
 Details, trade-offs and known limitations are in [docs/design.md](docs/design.md).
 
@@ -169,4 +178,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHA
 
 ## License
 
-[Apache License 2.0](LICENSE). The talo name and logo are not covered by the license.
+[Apache License 2.0](LICENSE). The Talo name and logo are not covered by the license.

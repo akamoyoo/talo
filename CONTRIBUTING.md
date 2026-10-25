@@ -1,6 +1,6 @@
-# Contributing to talo
+# Contributing to Talo
 
-talo is pre-alpha: interfaces change, and design discussions come before code. Please open an issue describing the
+Talo is pre-alpha: interfaces change, and design discussions come before code. Please open an issue describing the
 problem or the idea before sending a large change.
 
 ## Development setup
@@ -16,7 +16,7 @@ Tests start their own supervisor under a temporary `TALO_HOME`, so they never to
 ## Ground rules
 
 - **The worker and `wire.py` use the standard library only.** They run inside users' interpreters.
-- **Messages follow the Jupyter messaging protocol.** New standard-looking fields go into talo extensions
+- **Messages follow the Jupyter messaging protocol.** New standard-looking fields go into Talo extensions
   (`talo_*` message types or metadata keys), never into redefined Jupyter fields. Update
   [docs/protocol.md](docs/protocol.md) together with the code.
 - **Every command must return.** No CLI command may block longer than its timeout.

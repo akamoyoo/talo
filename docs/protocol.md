@@ -1,6 +1,6 @@
-# talo protocol
+# Talo protocol
 
-talo has two message channels. Both carry newline-delimited JSON over Unix sockets.
+Talo has two message channels. Both carry newline-delimited JSON over Unix sockets.
 
 | Channel | Between | Shape |
 |---|---|---|
@@ -37,7 +37,7 @@ front ends.
 `metadata.talo_truncated` set to the number of characters cut), plus `text/html` / `text/markdown` when the object
 provides `_repr_html_` / `_repr_markdown_`.
 
-### talo extensions
+### Talo extensions
 
 | Request | Reply content |
 |---|---|
@@ -88,5 +88,5 @@ death, base, memory_budget}`. A **snapshot** is `{id, name, session, parent, pid
 jobs (ids run between its parent and itself), private_bytes, threads}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
 started, finished, elapsed_s, execution_count, result, error, metrics, output}`.
 
-The control protocol is versioned together with talo while it is pre-alpha; it will be frozen and versioned
+The control protocol is versioned together with Talo while it is pre-alpha; it will be frozen and versioned
 separately at 1.0.

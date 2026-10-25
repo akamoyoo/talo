@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Talo">
+  <title>Talo</title>
+  <defs>
+    <radialGradient id="glow" cx="0.3" cy="0.25" r="0.95">
+      <stop offset="0" stop-color="#FDE68A"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </radialGradient>
+  </defs>
+  <!-- smoke: something is running inside -->
+  <circle cx="92" cy="15" r="4" fill="#6B7280"/>
+  <circle cx="99" cy="6" r="2.6" fill="#6B7280"/>
+  <!-- chimney and house -->
+  <rect x="84" y="22" width="13" height="24" rx="2" fill="#E5E7EB"/>
+  <path d="M64 16 L115 57 Q119 61 114 61 L105 61 L105 106 Q105 113 98 113 L30 113 Q23 113 23 106 L23 61 L14 61 Q9 61 13 57 Z"
+        fill="#E5E7EB"/>
+  <!-- the lit window, showing a prompt -->
+  <rect x="37" y="63" width="54" height="36" rx="6" fill="url(#glow)"/>
+  <path d="M47 71.5 L56 81 L47 90.5" fill="none" stroke="#1F2937" stroke-width="5" stroke-linecap="round"
+        stroke-linejoin="round"/>
+  <rect x="61" y="85.5" width="16" height="5" rx="1.5" fill="#1F2937"/>
+</svg>

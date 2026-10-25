@@ -1,6 +1,6 @@
-# talo design
+# Talo design
 
-talo is a resident, in-memory Python session driven from the terminal: data is loaded once and stays in memory,
+Talo is a resident, in-memory Python session driven from the terminal: data is loaded once and stays in memory,
 and the state can be snapshotted, rolled back and branched. Its first users are coding agents (Claude Code, Codex and
 similar tools that run shell commands); its second users are people at a terminal. The goal is to be **an upgrade
 of Jupyter**: everything a Jupyter kernel does, plus what Jupyter does not have — snapshots, rollback and branches of
@@ -32,7 +32,7 @@ talo CLI (humans, agents)       JupyterLab / VS Code (M4)     MCP (M4)
 - **The supervisor holds no user data.** It routes, queues and records. When a worker dies, the supervisor is still
   there to say what happened (signal, likely OOM kill).
 - **Workers are single-threaded** and run in any interpreter the user chooses (for example a project's virtualenv).
-  The worker is a standard-library-only file executed by path, so the target environment does not need talo installed,
+  The worker is a standard-library-only file executed by path, so the target environment does not need Talo installed,
   and nothing is added to the user's `sys.path`.
 - **Output is captured at the file-descriptor level.** While a job runs, fds 1 and 2 point to the job's output file;
   output written by C extensions is captured, and it can be read while the job is still running.
@@ -100,7 +100,7 @@ by a rollback.
 
 All messages — CLI to supervisor and supervisor to worker — use the structure of the Jupyter messaging protocol
 (5.3): `header` (`msg_id`, `msg_type`, `session`, `date`, `version`), `parent_header`, `metadata`, `content`.
-Execution-related message types and fields follow the specification; talo's own features are extension messages
+Execution-related message types and fields follow the specification; Talo's own features are extension messages
 prefixed `talo_`. The transport is newline-delimited JSON over Unix sockets; M4 adds a ZMQ bridge and a standard
 kernel connection file so that Jupyter front ends can attach. See [protocol.md](protocol.md).
 
@@ -113,7 +113,7 @@ kernel connection file so that Jupyter front ends can attach. See [protocol.md](
   the full output stays in the job's file and can be read by offset.
 - One session runs one execution at a time; further execution requests queue. Inspection requests (`vars`, `show`)
   are answered only while the session is idle, never by touching the heap of a running computation.
-- Exit codes: `0` ok, `1` the code failed, `2` talo failed, `3` still running.
+- Exit codes: `0` ok, `1` the code failed, `2` Talo failed, `3` still running.
 
 ## Execution history
 
