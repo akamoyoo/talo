@@ -16,6 +16,9 @@ def talo_home(tmp_path, monkeypatch):
         call("shutdown", autostart=False)
     except TaloError:
         pass
+    import shutil
+    from talo.paths import datasets_root
+    shutil.rmtree(datasets_root(), ignore_errors=True)  # shared datasets live in /dev/shm: memory, not disk
 
 
 @pytest.fixture
