@@ -81,3 +81,29 @@ def test_dataset_names_versions_never_reused(talo):
     assert result(talo, "talo.publish('prices.v1-raw', np.full(3, 7.0))") == "3"      # not 2 again
     assert result(talo, "float(talo.get('prices.v1-raw').sum())") == "21.0"
     assert result(talo, "float(talo.get('prices.v1-raw', version=1).sum())") == "3.0"
+
+
+def test_what_is_shared_by_type(talo):
+    """Arrow-backed strings and pyarrow tables are shared; object columns, polars frames and time zone-aware indexes
+    are rebuilt by each reader, and publishing says so."""
+    import pytest
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("polars")
+    talo("run", "import numpy as np, pandas as pd, pyarrow as pa, polars as pl\nn = 200_000\n"
+                "strs = [str(i) for i in range(n)]\n"
+                "arrowy = pd.DataFrame({'x': np.ones(n), 's': strs})\n"
+                "objecty = pd.DataFrame({'x': np.ones(n), 's': pd.Series(strs, dtype=object)})\n"
+                "tab = pa.table({'x': np.ones(n), 's': strs})\npolar = pl.DataFrame({'x': np.ones(n), 's': strs})\n"
+                "tz = pd.Series(np.ones(n), index=pd.date_range('2024', periods=n, freq='s', tz='UTC'))")
+    shares = {}
+    for name in ("arrowy", "objecty", "tab", "polar", "tz"):
+        rc, out = run_json(talo, "publish", name)
+        r = out["job"]["result"]
+        shares[name] = (r["private_bytes"] < 100_000, " ".join(r["hints"]))
+    assert shares["arrowy"][0] and shares["tab"][0]
+    assert not shares["objecty"][0] and "object columns s" in shares["objecty"][1]
+    assert not shares["polar"][0] and "to_arrow" in shares["polar"][1]
+    assert not shares["tz"][0] and "time zone" in shares["tz"][1]
+    talo("new", "r")
+    assert result(talo, "a = talo.get('arrowy')\nt = talo.get('tab')\n(a['s'].iloc[7], t.column('s')[9].as_py())",
+                  "-s", "r") == "('7', '9')"

@@ -1100,9 +1100,42 @@ class Helper:
                     os.fsync(f.fileno())
                 os.replace(tmp, os.path.join(folder, fname))  # counter, the version, then the pointer to it
             _fsync_dir(folder)
+        hints = self._sharing_hints(value, unit["stream_bytes"], unit["bytes"])
         self._dataset_message(name, version, "published", bytes=unit["bytes"], new_bytes=unit["new_bytes"],
-                              mapped_bytes=unit["buffer_bytes"], private_bytes=unit["stream_bytes"])
+                              mapped_bytes=unit["buffer_bytes"], private_bytes=unit["stream_bytes"], hints=hints)
+        if hints:
+            print(f"talo.publish({name!r}): {unit['stream_bytes'] >> 10} KB of it is rebuilt by every reader; "
+                  + "; ".join(hints), file=sys.stderr)
         return version
+
+    @staticmethod
+    def _sharing_hints(value, private: int, total: int) -> list:
+        """Why part of a published value cannot be shared by mapping, and what to do about it."""
+        if private < (1 << 20) or private < total * 0.05:
+            return []
+        kind = type(value).__module__.split(".")[0]
+        hints = []
+        if kind == "pandas":
+            frame = value.to_frame() if hasattr(value, "to_frame") and not hasattr(value, "columns") else value
+            objects = [str(c) for c, d in getattr(frame, "dtypes", {}).items() if str(d) == "object"]
+            if objects:
+                hints.append(f"object columns {', '.join(objects[:10])} are rebuilt by every reader: store strings as "
+                             "'str' / 'string[pyarrow]' (pyarrow installed) and other values as typed columns")
+            index = getattr(value, "index", None)
+            if index is not None and getattr(index, "tz", None) is not None:
+                hints.append("a time zone-aware index is rebuilt by every reader: keep the times as a column, or "
+                             "an index without time zone (tz_convert(None)) plus a note of the zone")
+            elif index is not None and str(getattr(index, "dtype", "")) == "object":
+                hints.append("an object index is rebuilt by every reader: use a typed index or reset_index()")
+        elif kind == "polars":
+            hints.append("polars frames are pickled whole: publish value.to_arrow() and read with pl.from_arrow(), "
+                         "both without copying")
+        elif kind == "torch":
+            hints.append("torch tensors are pickled whole: publish tensor.numpy() and read with torch.from_numpy()")
+        if not hints:
+            hints.append("Python objects (lists, dicts, strings, object arrays) are rebuilt by every reader; "
+                         "NumPy arrays, numeric and Arrow-backed pandas columns and pyarrow tables are shared")
+        return hints
 
     def _dataset_message(self, name: str, version: int, action: str, **extra) -> None:
         if self._worker.parent is not None:

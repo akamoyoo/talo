@@ -775,6 +775,22 @@ panel = talo.get("panel", copy=True)        # a private, writable copy
   copy-on-write enabled; pandas 3 always does it). Objects that are not buffers (indexes of Python
   objects, small metadata) are unpickled privately in each reader. Sizes are checked on every read; content hashes
   are checked when the version is published and with `talo.get(..., verify=True)`.
+- **What is shared.** Sharing follows the buffers an object's own pickling exposes (pickle protocol 5); everything
+  else is in the pickle stream and rebuilt by every reader. Measured with pandas 3.1, pyarrow 26 and polars 2.0:
+
+  | Value | Shared by mapping | Rebuilt by every reader |
+  |---|---|---|
+  | NumPy arrays (numeric, contiguous) | the data | – |
+  | pandas numeric, datetime, categorical columns | the data, per block (columns of one dtype share a block) | – |
+  | pandas string columns with pyarrow installed (`str` / `string[pyarrow]`) | the data | – |
+  | pandas object columns (strings without pyarrow, mixed values) | – | the column |
+  | pandas time zone-aware `DatetimeIndex` | – | the index |
+  | pyarrow tables and arrays | the data | – |
+  | polars frames | – | the whole frame: publish `df.to_arrow()`, read with `pl.from_arrow()` (both zero-copy) |
+  | torch tensors | – | the whole tensor: publish `t.numpy()`, read with `torch.from_numpy()` |
+  | lists, dicts, other Python objects | – | the object |
+
+  Publishing reports how much each reader rebuilds and, when that is large, why and what to change (`hint:`).
 - **Publishing.** `talo publish NAME [VAR] [-s SESSION]` writes from a fork of the session through the queue (like
   `save`); `talo.publish(name, value, key=None)` writes from running code; publishing takes
   effect at once and is not undone if the job later fails or is rolled back (`key` makes a retry return the version

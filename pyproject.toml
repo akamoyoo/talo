@@ -10,7 +10,7 @@ dependencies = []
 
 [project.optional-dependencies]
 jupyter = ["pyzmq>=25"]
-dev = ["pytest", "numpy", "pandas>=3", "matplotlib", "nbformat", "pyzmq>=25", "jupyter_client>=8", "nbclient"]
+dev = ["pytest", "numpy", "pandas>=3", "matplotlib", "nbformat", "pyzmq>=25", "jupyter_client>=8", "nbclient", "pyarrow", "polars"]
 
 [project.scripts]
 talo = "talo.cli:main"

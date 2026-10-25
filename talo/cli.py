@@ -1096,6 +1096,8 @@ def cmd_publish(args):
         print(f"dataset {r['dataset']} v{r['version']}: {human_bytes(r['bytes'])} ({human_bytes(r['new_bytes'])} new; "
               f"{human_bytes(r['mapped_bytes'])} shared by mapping, {human_bytes(r['private_bytes'])} rebuilt by each "
               f"reader), from {d['session']} rev {r['rev']}; read it with talo.get({r['dataset']!r})")
+        for h in r.get("hints") or []:
+            print(f"  hint: {h}")
     else:
         show_job(args, d)
     return exit_code(d)

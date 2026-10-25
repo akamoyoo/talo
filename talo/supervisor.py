@@ -3159,7 +3159,7 @@ class Supervisor:
             job.result = {"dataset": published["name"], "version": published["version"],
                           "bytes": published["bytes"], "new_bytes": published["new_bytes"],
                           "mapped_bytes": published["mapped_bytes"], "private_bytes": published["private_bytes"],
-                          "rev": fork.result["rev"]}
+                          "hints": published.get("hints", []), "rev": fork.result["rev"]}
             session._finish(job, "ok")
             self.emit("dataset.published", session=session.name, dataset=published["name"],
                       version=published["version"], job=job.id)
