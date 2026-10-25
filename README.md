@@ -68,7 +68,7 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
 
 ## Status
 
-**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches (M2) work; `diff` between snapshots and the remaining M2 items are next. Interfaces will change.
+**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches / `tree` / `diff` (M2) work; an interactive prompt for humans and export to `.py` / `.ipynb` (M3) are next. Interfaces will change.
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install

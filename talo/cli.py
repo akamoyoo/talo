@@ -261,6 +261,81 @@ def cmd_drop(args):
     emit(args, call("drop", session=session_name(args), name=args.name), lambda d: print(f"dropped {d['dropped']}"))
 
 
+def cmd_tree(args):
+    def human(d):
+        nodes = d["nodes"]
+        snaps = {n["ref"]: n for n in nodes if n["kind"] == "snapshot"}
+        children: dict = {}
+        roots: list = []  # (label, parent key) for the tops of the tree
+        for n in nodes:
+            parent = n["parent"]
+            if parent is None:
+                key = ("empty", n["session"])
+            elif parent in snaps:
+                key = parent
+            else:
+                key = ("dropped", parent)
+            children.setdefault(key, []).append(n)
+            if not isinstance(key, str) and key not in roots:
+                roots.append(key)
+
+        def label(n):
+            if n["kind"] == "worker":
+                k = len(n["jobs_since_base"])
+                return f"* {n['session']:24s} {n['state']}, {k} job{'s' if k != 1 else ''} since"
+            alive = "" if n["alive"] else "  (gone)"
+            msg = f"  {n['message']}" if n["message"] else ""
+            return (f"{n['name']:12s} {n['ref']:14s} {human_bytes(n['private_bytes'])} private"
+                    f"   jobs {','.join(n['jobs']) or '-'}{msg}{alive}")
+
+        def walk(key, prefix):
+            kids = sorted(children.get(key, []), key=lambda n: (n["kind"] == "worker", n.get("created", 0)))
+            for i, n in enumerate(kids):
+                last = i == len(kids) - 1
+                print(f"{prefix}{'└─ ' if last else '├─ '}{label(n)}")
+                if n["kind"] == "snapshot":
+                    walk(n["ref"], prefix + ("   " if last else "│  "))
+
+        for root in roots:
+            print(f"(empty start: {root[1]})" if root[0] == "empty" else f"(dropped {root[1]})")
+            walk(root, "")
+        if not nodes:
+            print("(no sessions)")
+    emit(args, call("tree"), human)
+
+
+def cmd_diff(args):
+    limit = None if args.content else parse_size(args.max_bytes)
+    d = call("diff", session=session_name(args), a=args.a, b=args.b, max_bytes=limit)
+
+    def brief(v):
+        shape = f" {tuple(v['shape'])}" if "shape" in v else (f" len={v['len']}" if "len" in v else "")
+        return f"{v['type']}{shape}{' ' + v['dtype'] if 'dtype' in v else ''}"
+
+    def human(x):
+        print(f"--- {x['a']}\n+++ {x['b']}")
+        for v in x["added"]:
+            print(f"+ {v['name']:20s} {brief(v)}  {human_bytes(v.get('nbytes'))}")
+        for v in x["removed"]:
+            print(f"- {v['name']:20s} {brief(v)}")
+        for c in x["changed"]:
+            if c["fields"] == ["content"]:
+                what = f"{brief(c['b'])}  content"
+            else:
+                what = "; ".join(f"{k} {c['a'].get(k, '-')} -> {c['b'].get(k, '-')}" for k in c["fields"])
+            print(f"~ {c['name']:20s} {what}")
+        notes = f"{x['unchanged']} unchanged"
+        large = [f"{n['name']} {human_bytes(n['nbytes'])}" for n in x["not_compared"] if n["reason"] == "size"]
+        if large:
+            notes += (f"; not compared by content (over {human_bytes(x['max_bytes'])}, --content compares them): "
+                      + ", ".join(large))
+        other = [f"{n['name']} ({n['reason']})" for n in x["not_compared"] if n["reason"] != "size"]
+        if other:
+            notes += "; not comparable: " + ", ".join(other)
+        print(f"({notes})", file=sys.stderr)
+    emit(args, d, human)
+
+
 def cmd_stop(args):
     try:
         call("shutdown", autostart=False)
@@ -338,6 +413,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--snap", metavar="NAME", help="snapshot the current state under NAME before checking out")
     p = add("drop", cmd_drop, "free a snapshot")
     p.add_argument("name")
+    add("tree", cmd_tree, "all snapshots and live workers of all sessions, as a tree", session=False)
+    p = add("diff", cmd_diff, "variables added, removed or changed between two states")
+    p.add_argument("a", help="[SESSION:]SNAPSHOT, or @ / SESSION:@ for a live worker")
+    p.add_argument("b", nargs="?", default="@", help="as A (default @: the session's live worker)")
+    p.add_argument("--max-bytes", default="256M", help="compare content only for variables up to this size")
+    p.add_argument("--content", action="store_true", help="compare the content of all variables, whatever their size")
     add("stop", cmd_stop, "stop the supervisor (closes all sessions)", session=False)
     add("daemon", cmd_daemon, "run the supervisor in the foreground (for debugging; normally started automatically)",
         session=False)

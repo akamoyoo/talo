@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import importlib.util
 import json
 import linecache
 import os
+import pickle
 import select
 import signal
 import socket
@@ -223,6 +225,36 @@ def show(value, rows: int) -> str:
     return truncate(repr(value), 5000)[0]
 
 
+class _HashWriter:
+    """A file-like sink for ``pickle.Pickler`` that hashes what is written instead of keeping it."""
+
+    def __init__(self, h):
+        self.write = h.update
+
+
+def fingerprint(value) -> dict:
+    """``{"hash": hex}``: BLAKE2b of the object's pickle (protocol 5). Out-of-band buffers (NumPy arrays, and the data
+    of pandas objects) are hashed in place, without being copied into the pickle; ``{"error": ...}`` when the object
+    cannot be pickled."""
+    h = hashlib.blake2b(digest_size=16)
+
+    def buffer(b: pickle.PickleBuffer) -> bool:
+        raw = b.raw()
+        h.update(len(raw).to_bytes(8, "little"))
+        h.update(raw)
+        return False  # out of band: not written into the stream
+
+    try:
+        pickle.Pickler(_HashWriter(h), protocol=5, buffer_callback=buffer).dump(value)
+    except Exception as error:  # noqa: BLE001
+        return {"error": f"cannot be pickled ({type(error).__name__})"}
+    return {"hash": h.hexdigest()}
+
+
+def fingerprints(namespace: dict, names: list) -> dict:
+    return {name: fingerprint(namespace[name]) if name in namespace else {"error": "missing"} for name in names}
+
+
 # ---------------------------------------------------------------- snapshots
 
 def other_threads() -> list[str]:
@@ -282,7 +314,8 @@ class Snapshot:
                 if not line:
                     conn.close()
                     continue
-                op = json.loads(line).get("op")
+                req = json.loads(line)
+                op = req.get("op")
                 if op == "hold":
                     self.holds.append(conn)
                 elif op == "info":
@@ -291,6 +324,9 @@ class Snapshot:
                 elif op == "vars":
                     rows = [describe(k, v) for k, v in list(self.worker.namespace.items()) if is_user_variable(k, v)]
                     _reply(conn, {"ok": True, "variables": rows})
+                    conn.close()
+                elif op == "fingerprint":
+                    _reply(conn, {"ok": True, "fingerprints": fingerprints(self.worker.namespace, req.get("names", []))})
                     conn.close()
                 elif op == "spawn":
                     with warnings.catch_warnings():
@@ -457,6 +493,9 @@ class Worker:
             rows = [describe(k, v) for k, v in list(self.namespace.items())
                     if is_user_variable(k, v) and (not pattern or pattern in k)]
             self.send("talo_vars_reply", {"status": "ok", "variables": rows, "rss": rss_bytes()}, msg)
+        elif kind == "talo_fingerprint_request":
+            self.send("talo_fingerprint_reply", {"status": "ok", "fingerprints": fingerprints(
+                self.namespace, msg["content"].get("names", []))}, msg)
         elif kind == "talo_show_request":
             name, rows = msg["content"]["name"], int(msg["content"].get("rows", 10))
             try:

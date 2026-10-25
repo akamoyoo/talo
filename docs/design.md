@@ -106,7 +106,7 @@ $ talo diff loaded
 Two variables are compared first by their summaries (type, shape or length, dtype, columns, value preview). When the
 summaries are equal, both sides compute a content fingerprint: a BLAKE2b hash of the object's pickle (protocol 5,
 with large buffers such as NumPy and pandas data hashed in place, without copying). Equal fingerprints mean equal
-pickled bytes. Hashing reads every byte (about 1 GB/s on each side, in parallel), so by default only variables up to
+pickled bytes. Hashing reads every byte (about 0.6 GB/s per side, both sides in parallel), so by default only variables up to
 256 MB are compared by content; `--content` compares all of them, `--max-bytes SIZE` changes the limit, and variables
 that were not compared are listed. Objects that cannot be pickled are reported as not comparable. Diffing a live
 worker needs it to be idle, as for `vars`.

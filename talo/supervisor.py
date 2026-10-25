@@ -36,6 +36,7 @@ from talo.paths import home, socket_for, socket_path
 
 log = logging.getLogger("talo")
 WORKER = Path(__file__).with_name("worker.py")
+DIFF_MAX_BYTES = 256 << 20  # variables larger than this are compared by summary only, unless the request says otherwise
 
 
 def private_dirty(pid: int | None) -> int | None:
@@ -472,11 +473,13 @@ class Supervisor:
         return self.jobs[str(job_id)]
 
     def _snapshot(self, ref: str, default_session: str | None) -> Snapshot:
-        """``[session:]name`` -> the snapshot. Without a session, look in ``default_session``, or (when it is None)
-        in every session, requiring the name to be unique."""
+        """``[session:]name`` -> the snapshot. Without a session, look in ``default_session`` first, then in every
+        session, requiring the name to be unique (so a branch can name the snapshot it came from)."""
         session, _, name = ref.rpartition(":")
-        if session or default_session:
-            return self._session(session or default_session).find(name)
+        if session:
+            return self._session(session).find(name)
+        if default_session in self.sessions and (snap := self.sessions[default_session].find(name, missing_ok=True)):
+            return snap
         found = [snap for s in self.sessions.values() if (snap := s.find(name, missing_ok=True))]
         if len(found) == 1:
             return found[0]
@@ -563,11 +566,11 @@ class Supervisor:
         job = self._job(req["id"])
         return {"id": job.id, "result": self._session(job.session).interrupt(job)}
 
-    async def _ask_idle(self, session: Session, msg_type: str, content: dict) -> dict:
+    async def _ask_idle(self, session: Session, msg_type: str, content: dict, timeout: float | None = 60) -> dict:
         if session.state == "busy":
             raise RuntimeError(f"session {session.name} is busy with job {session.current.id}; variables can be "
                                f"inspected once it finishes (`talo wait {session.current.id}`)")
-        reply = await session.request(msg_type, content, timeout=60)
+        reply = await session.request(msg_type, content, timeout=timeout)
         return reply["content"]
 
     async def op_vars(self, req):
@@ -612,6 +615,79 @@ class Supervisor:
         snap = session.find(req["name"])
         session.drop(snap)
         return {"dropped": snap.ref}
+
+    async def op_tree(self, req):
+        nodes = []
+        for session in self.sessions.values():
+            nodes += [{"kind": "snapshot", **s.to_dict()} for s in session.snapshots.values()]
+            nodes.append({"kind": "worker", "session": session.name, "state": session.state, "pid": session.worker_pid,
+                          "parent": session.base, "jobs_since_base": list(session.jobs_since_base)})
+        return {"nodes": nodes}
+
+    # ---------------------------------------------------------------- diff
+
+    def _state(self, ref: str, session: str) -> tuple[str, Session | Snapshot]:
+        """``@`` / ``SESSION:@`` -> a live worker; ``[SESSION:]NAME`` -> a snapshot."""
+        owner, _, name = ref.rpartition(":")
+        if name == "@":
+            return f"{owner or session}:@", self._session(owner or session)
+        snap = self._snapshot(ref, session)
+        return snap.ref, snap
+
+    async def _ask_state(self, state: Session | Snapshot, op: str, **params) -> dict:
+        """Ask a live worker (kernel message) or a snapshot (its socket) for ``vars`` or ``fingerprint``."""
+        if isinstance(state, Session):
+            return await self._ask_idle(state, f"talo_{op}_request", params, timeout=None)
+        if private_dirty(state.pid) is None:
+            raise RuntimeError(f"snapshot {state.ref} (pid {state.pid}) is gone")
+        reader, writer = await asyncio.open_unix_connection(state.socket, limit=wire.MAX_LINE)
+        try:
+            writer.write(json.dumps({"op": op, **params}).encode() + b"\n")
+            await writer.drain()
+            reply = json.loads(await reader.readline())
+        finally:
+            writer.close()
+        if not reply.get("ok"):
+            raise RuntimeError(f"snapshot {state.ref}: {reply.get('error')}")
+        return reply
+
+    async def op_diff(self, req):
+        session = req.get("session") or "default"
+        (ref_a, a), (ref_b, b) = self._state(req["a"], session), self._state(req.get("b") or "@", session)
+        limit = req.get("max_bytes", DIFF_MAX_BYTES)
+        va, vb = await asyncio.gather(self._ask_state(a, "vars"), self._ask_state(b, "vars"))
+        va = {v["name"]: v for v in va["variables"]}
+        vb = {v["name"]: v for v in vb["variables"]}
+        changed, same, not_compared = [], [], []
+        for name in sorted(va.keys() & vb.keys()):
+            x, y = va[name], vb[name]
+            fields = [k for k in sorted(x.keys() | y.keys()) if k not in ("name", "nbytes", "nbytes_partial")
+                      and x.get(k) != y.get(k)]
+            if fields:
+                changed.append({"name": name, "a": x, "b": y, "fields": fields})
+            elif limit is not None and max(x.get("nbytes") or 0, y.get("nbytes") or 0) > limit:
+                not_compared.append({"name": name, "reason": "size", "nbytes": max(x.get("nbytes") or 0,
+                                                                                  y.get("nbytes") or 0)})
+            else:
+                same.append(name)
+        if same:
+            fa, fb = await asyncio.gather(self._ask_state(a, "fingerprint", names=same),
+                                          self._ask_state(b, "fingerprint", names=same))
+            fa, fb, unchanged = fa["fingerprints"], fb["fingerprints"], 0
+            for name in same:
+                x, y = fa.get(name, {}), fb.get(name, {})
+                if "hash" not in x or "hash" not in y:
+                    not_compared.append({"name": name, "reason": x.get("error") or y.get("error") or "missing"})
+                elif x["hash"] != y["hash"]:
+                    changed.append({"name": name, "a": va[name], "b": vb[name], "fields": ["content"]})
+                else:
+                    unchanged += 1
+        else:
+            unchanged = 0
+        return {"a": ref_a, "b": ref_b, "added": [vb[n] for n in sorted(vb.keys() - va.keys())],
+                "removed": [va[n] for n in sorted(va.keys() - vb.keys())],
+                "changed": sorted(changed, key=lambda c: c["name"]), "unchanged": unchanged,
+                "not_compared": not_compared, "max_bytes": limit}
 
     async def op_shutdown(self, req):
         self.stopping.set()
