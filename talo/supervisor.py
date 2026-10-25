@@ -62,6 +62,7 @@ def private_dirty(pid: int | None) -> int | None:
 MEMORY_FIELDS = {"Rss:": "rss", "Pss:": "pss", "Private_Clean:": "private_clean", "Private_Dirty:": "private_dirty"}
 MEMORY_LIMIT_INTERVAL = 0.5  # seconds between samples of a session with --memory-limit
 AUTOSAVE_CHECK = float(os.environ.get("TALO_AUTOSAVE_CHECK", "15"))  # seconds between autosave checks
+SNAPSHOT_PREP = ("collect", "trim")  # default preparation before a fork; "freeze" is opt-in
 POLICY_INTERVAL = float(os.environ.get("TALO_POLICY_INTERVAL", 30))  # --snapshot-policy demote: seconds between checks
 POLICY_IDLE_S = float(os.environ.get("TALO_POLICY_IDLE", 600))  # snapshots used more recently are not demoted
 POLICY_HIGH, POLICY_LOW = 0.9, 0.8           # demote above 90% of the budget, until below 80%
@@ -328,6 +329,7 @@ class Snapshot:
     demoting: str | None = None  # the demotion job holding this snapshot's transition, if any
     blocked: str | None = None   # why it cannot be demoted (a variable that cannot be saved): a snapshot never changes
     last_used: float = field(default_factory=time.time)  # checked out, branched from, diffed
+    prepare: dict | None = None                 # what the worker did before forking it (collect, trim, freeze)
     retry_at: float = 0.0                       # the policy retries a transient failure after this
     failures: int = 0
 
@@ -343,7 +345,7 @@ class Snapshot:
                 "pid": self.pid, "created": self.created, "message": self.message, "owner": self.owner,
                 "pins": sorted(self.pins), "auto": self.auto,
                 "execution_count": self.execution_count, "jobs": self.jobs, "threads": self.threads,
-                "storage": "disk" if self.cold else "memory",
+                "storage": "disk" if self.cold else "memory", "prepare": self.prepare,
                 "private_bytes": None if self.cold else private_dirty(self.pid),
                 "alive": bool(self.cold) or private_dirty(self.pid) is not None,
                 **({"disk": {k: self.cold[k] for k in ("bytes", "stored", "variables")}} if self.cold else {}),
@@ -505,6 +507,7 @@ class Session:
         self.reclaim_lock = asyncio.Lock()
         self.demote_lock = asyncio.Lock()    # one demotion at a time per session, manual or automatic
         self.closing = False                 # set first thing by stop(): late starts give up
+        self.snapshot_prep = SNAPSHOT_PREP   # done in the worker before every fork (see prepare_fork)
         self.policy_stuck = False            # only protected or blocked snapshots are left (reported once)
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
@@ -1217,12 +1220,14 @@ class Session:
             raise MemoryError(f"session {self.name} uses {self.memory_in_use() >> 20} MB, over its memory limit of "
                               f"{self.memory_limit >> 20} MB; `talo resources` shows what to drop")
         path = str(socket_for(self.dir / "snapshots" / f"{sid}.sock"))
-        reply = await self.request("talo_snapshot_request", {"id": sid, "socket": path, "strict": strict}, timeout=120)
+        reply = await self.request("talo_snapshot_request", {"id": sid, "socket": path, "strict": strict,
+                                                              "prepare": list(self.snapshot_prep)}, timeout=120)
         content = reply["content"]
         if content.get("status") != "ok":
             raise RuntimeError(f"{content.get('ename')}: {content.get('evalue')}")
         snap = Snapshot(sid, name or sid, self.name, path, content["pid"], self.base, list(self.jobs_since_base),
                         content.get("execution_count", 0), content.get("threads", []), message, owner)
+        snap.prepare = content.get("prepare")
         snap.hold = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         snap.hold.connect(path)
         snap.hold.sendall(b'{"op": "hold"}\n')
@@ -1347,6 +1352,7 @@ class Session:
                 "limits": self.limits, "effective_limits": self.effective_limits, "scope": self.scope,
                 "limits_inherited_from": self.limits_inherited_from, "last_checkpoint": self.last_checkpoint,
                 "autosave": self.autosave_config, "snapshot_policy": self.snapshot_policy,
+                "snapshot_prep": list(self.snapshot_prep),
                 "max_output": self.max_output}
 
 
@@ -1503,6 +1509,8 @@ class Supervisor:
             scope_command(limits, "check")  # refuse limits this machine cannot enforce, before starting anything
         session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"), req.get("memory_limit"),
                           limits or inherited.get("limits"), req.get("max_output"))
+        if source:
+            session.snapshot_prep = self.sessions[source.session].snapshot_prep
         if inherited.get("scope"):
             session.scope, session.memory_events = inherited["scope"], inherited["events"]
             session.limits_inherited_from = source.session
@@ -1515,6 +1523,11 @@ class Supervisor:
         session.resolve = lambda ref: self._snapshot(ref, session.name)
         session.store_ops = self._store_op
         session.reclaim = lambda target=None: self._reclaim(session, target)
+        if req.get("snapshot_prep") is not None:
+            steps = tuple(x for x in req["snapshot_prep"] if x)
+            if not set(steps) <= {"collect", "trim", "freeze"}:
+                raise ValueError(f"--snapshot-prep: collect, trim, freeze or none, not {','.join(steps)}")
+            session.snapshot_prep = steps
         if req.get("snapshot_policy"):
             self._set_policy(session, req["snapshot_policy"])
         session.on_publish = lambda job, snap: self._register_versions(session, job, snap)

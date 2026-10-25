@@ -881,6 +881,37 @@ def _patch_in_place(old, new) -> str | None:
     return None
 
 
+_LIBC = []  # [ctypes.CDLL or None], resolved once
+
+
+def prepare_fork(steps) -> dict:
+    """Before forking a snapshot (see "Keeping snapshots small" in docs/design.md): ``collect`` frees unreachable
+    cycles, ``trim`` returns free heap pages to the kernel (glibc ``malloc_trim``), so that the worker's later
+    allocations get fresh pages instead of writing into pages it shares with the snapshot; ``freeze`` moves the
+    surviving objects to the garbage collector's permanent generation, so collections stop writing their headers."""
+    import gc
+    started, done = time.monotonic(), []
+    if "collect" in steps:
+        gc.collect()
+        done.append("collect")
+    if "freeze" in steps:
+        gc.freeze()
+        done.append("freeze")
+    if "trim" in steps:
+        if not _LIBC:
+            try:
+                import ctypes
+                import ctypes.util
+                libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+                _LIBC.append(libc if hasattr(libc, "malloc_trim") else None)
+            except OSError:
+                _LIBC.append(None)
+        if _LIBC[0] is not None:
+            _LIBC[0].malloc_trim(0)
+            done.append("trim")
+    return {"steps": done, "seconds": round(time.monotonic() - started, 3), "frozen": gc.get_freeze_count()}
+
+
 def _excluded(path: str) -> bool:
     """Files of installed packages and interpreters, which ``reload --changed`` never selects."""
     real = os.path.realpath(path)
@@ -1524,6 +1555,7 @@ class Worker:
                                               "evalue": f"{len(threads)} other threads: {', '.join(threads[:10])}",
                                               "threads": threads}, msg)
             return
+        prep = prepare_fork(content.get("prepare") or ())
         path = content["socket"]
         if os.path.exists(path):
             os.unlink(path)
@@ -1539,7 +1571,7 @@ class Worker:
         if pid:
             listener.close()
             self.send("talo_snapshot_reply", {"status": "ok", "pid": pid, "threads": threads,
-                                              "execution_count": self.execution_count}, msg)
+                                              "execution_count": self.execution_count, "prepare": prep}, msg)
             return
         # the snapshot process: drop the worker's connection and wait; serve() returns only in a spawned worker
         self.rfile.close()

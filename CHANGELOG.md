@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Snapshots stay small: before every fork the worker collects garbage and returns free heap pages to the kernel
+  (`malloc_trim`); measured on a research session, a snapshot's private memory after the same work fell from 475 MB
+  to 67 MB (11 MB with the opt-in `freeze`). `new --snapshot-prep` sets it per session.
 - M10, bounded snapshots: `talo snapshot demote NAME` moves a snapshot's variables to the checkpoint store and ends
   its process (fail closed: a value that cannot be saved keeps it in memory); checking out a cold snapshot restores
   its values, `In` and execution count into a new worker in the session's scope; `--snapshot-policy demote` with

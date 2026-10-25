@@ -202,3 +202,21 @@ def test_autosnap_never_replaces_manual_snapshots_and_undo_waits_its_turn(talo):
     talo("run", "time.sleep(2)\nx = 3", "-t", "0")     # running when undo is submitted
     rc, out = run_json(talo, "undo", "-t", "60")
     assert rc == 0 and run_json(talo, "show", "x")[1]["text"] == "2"   # only the last execution was undone
+
+
+def test_preparing_the_heap_keeps_snapshots_small(talo):
+    import json
+    # a dict of medium arrays rebuilt once: glibc keeps the freed ones in its heap (its mmap threshold rose when the
+    # first ones were freed), shared with the snapshot; the next allocations write into them unless they were trimmed
+    garbage = "import numpy as np\nd = {i: np.random.rand(20000) for i in range(1000)}\nd = {i: v * 2 for i, v in d.items()}"
+    work = "e = {i: np.random.rand(20000) for i in range(1000)}"
+    out = {}
+    for name, prep in (("plain", "none"), ("prepared", "collect,trim")):
+        talo("new", name, "--snapshot-prep", prep)
+        talo("run", "-s", name, garbage)
+        talo("snap", "-s", name, "s")
+        talo("run", "-s", name, work)
+        snaps = json.loads(talo("snaps", "-s", name, "--json").stdout)["snapshots"]
+        out[name] = snaps[0]["private_bytes"]
+        assert (snaps[0]["prepare"] or {}).get("steps", []) == ([] if prep == "none" else ["collect", "trim"])
+    assert out["prepared"] < out["plain"] / 3, out

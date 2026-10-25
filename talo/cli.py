@@ -195,6 +195,8 @@ def cmd_new(args):
     s = call("new", name=args.name, python=args.python or (None if args.from_ else sys.executable),
              cwd=os.path.abspath(args.cwd or os.getcwd()), memory_budget=parse_size(args.memory_budget),
              snapshot_policy=args.snapshot_policy,
+             snapshot_prep=None if args.snapshot_prep is None else
+             [] if args.snapshot_prep == "none" else args.snapshot_prep.split(","),
              memory_limit=parse_size(args.memory_limit), limits=parse_limits(args.limit),
              max_output=parse_size(args.max_output),
              **({"from": args.from_} if args.from_ else {}))
@@ -584,8 +586,10 @@ def cmd_snap(args):
         return code
     def human(x):
         threads = f"; {len(x['threads'])} other threads at fork time" if x.get("threads") else ""
+        prep = x.get("prepare") or {}
+        prep = f"; {'+'.join(prep['steps'])} {prep['seconds']:.2f}s" if prep.get("steps") else ""
         print(f"snapshot {x['name']} ({x['ref']}): pid {x['pid']}, after {len(x['jobs'])} jobs since "
-              f"{x['parent'] or 'session start'}{threads}")
+              f"{x['parent'] or 'session start'}{threads}{prep}")
     emit(args, d, human)
 
 
@@ -1340,6 +1344,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "interrupted, then its worker killed (e.g. 100G)")
     p.add_argument("--memory-budget", metavar="SIZE",
                    help="refuse new snapshots when the worker plus its snapshots use more than this (e.g. 200G)")
+    p.add_argument("--snapshot-prep", metavar="STEPS",
+                   help="done before every snapshot: collect,trim (default), add freeze, or none")
     p.add_argument("--snapshot-policy", choices=("retain", "demote"),
                    help="demote: move snapshots to disk to stay under --memory-budget (values restored on checkout)")
     add("ls", cmd_ls, "list sessions", session=False)

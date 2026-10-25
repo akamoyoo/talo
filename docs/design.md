@@ -765,6 +765,35 @@ its data. Today named snapshots are kept until dropped; `--memory-budget` only r
 the last N. M10 lets a session keep many snapshots without holding them all in memory, by moving some of them to
 disk as checkpoints (M9) and bringing them back when they are checked out.
 
+### Keeping snapshots small
+
+Before every fork (named snapshots, autosnaps, and the internal forks of maps, saves and trials) the worker runs
+`gc.collect()` and, with glibc, `malloc_trim(0)`. Measured, the private memory of a snapshot does not come mainly from
+the user's data or from the garbage collector: it comes from **freed memory the allocator reuses**. Memory freed
+before the fork (temporaries, a rebuilt dict of arrays) stays in the heap, shared with the snapshot, and the worker's
+next allocations write into it page by page. Returning free pages to the kernel first gives those allocations fresh
+pages instead.
+
+| Same 1.7 GB research session, same read-only workload | snapshot private afterwards |
+|---|---|
+| nothing | 475 MB |
+| `gc.freeze()` only | 408 MB |
+| garbage collector disabled | 452 MB |
+| `malloc_trim(0)` only | 275 MB |
+| `gc.collect()` + `malloc_trim(0)` (the default) | 67 MB |
+| … + `gc.freeze()` | 11 MB |
+
+It costs 0.1 to 0.4 s per snapshot on a 2 GB session, and as a side effect the worker itself shrinks (here by
+590 MB). `new --snapshot-prep` changes it per session: `none`, or `collect,trim,freeze`. `freeze` moves the surviving
+objects to the collector's permanent generation, so collections stop writing their headers; it is opt-in because
+it changes the session's collection behaviour from then on (cycles among frozen objects are not collected), and
+repeated freezes exempt more and more objects. Branches inherit the setting; `snap` reports what was done and how
+long it took. Finalizers of unreachable objects run at the snapshot instead of later.
+
+Sharing read-only buffers between the worker and its snapshots (mapping large arrays from a shared store, as M6
+does) would remove the remaining cost of rewritten arrays; it is not implemented, since the measurements above put
+the main cost elsewhere.
+
 ### Two kinds of rollback
 
 A **hot** snapshot is a suspended process: checking it out gives the exact process state. A **cold** snapshot is a
