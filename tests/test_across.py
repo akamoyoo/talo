@@ -144,3 +144,21 @@ def test_services_versions_calls_and_pins(talo):
     assert out["call"]["status"] == "ok"
     rc, out = run_json(talo, "unexpose", "host.total")
     assert rc == 0 and run_json(talo, "services")[1]["services"] == []
+
+
+def test_handoff_and_resume(talo):
+    talo("run", "x = 41")
+    talo("note", "goal: reach 42")
+    talo("run", "talo.record(progress=0.5)")
+    rc, d = run_json(talo, "handoff", "-m", "x is almost there; add one", "--to", "agent-b")
+    h = d["handoff"]
+    assert rc == 0 and h["snapshot_available"] and h["notes"]["count"] == 1 and h["records"]["count"] == 1
+    rc, out = run_json(talo, "drop", h["snapshot_name"])
+    assert rc == 2 and "handoff" in out["error"]["message"]
+    talo("run", "x = 0")                                   # the live session moves on
+    rc, r = run_json(talo, "resume", h["id"], "--branch", "next")
+    assert rc == 0 and r["session"]["name"] == "next" and r["handoff"]["status"].startswith("branched")
+    assert run_json(talo, "run", "-s", "next", "x + 1")[1]["job"]["result"]["data"]["text/plain"] == "42"
+    rc, d = run_json(talo, "handoff", "-m", "second")
+    assert d["handoff"]["notes"]["count"] == 0             # only what happened since the previous handoff
+    assert run_json(talo, "drop", h["snapshot_name"])[0] == 0   # no longer pinned

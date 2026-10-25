@@ -107,6 +107,9 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `services` | `session` | `services`: `{name, session, latest, versions: [{version, snapshot, job, owner, created, calls_in_flight, pss}]}` |
 | `unexpose` | `service`, `version` | `removed` (refused while calls are in flight) |
 | `call` | `service` (`SESSION.NAME`), `args` (JSON object), `version`, `timeout`, `key`, `max_result` | `call`: `{id, service, version, status, result, result_error, text, error, elapsed_s, output}`; nested calls from map cases and service calls are refused |
+| `handoff` | `session`, `message`, `to`, `snap`, `key`, `expect_rev`; or `close` (a handoff id) | `handoff`: `{id, session, owner, to, message, snapshot, snapshot_name, snapshot_available, rev, status, notes, records, active_jobs, variables, recent_jobs, continue}` |
+| `handoffs` | `session` | `handoffs` |
+| `resume` | `id`, `branch` (a new session name) | `handoff`, and `session` when branched |
 | `record` | `session`, `fields`, `key` | `record` |
 | `ledger` | `session`, `owner`, `outcome`, `has` (list), `where` (list of `KEY=VALUE`), `sort` (`KEY` or `-KEY`), `last` | `records`: `{id, key, time, owner, session, session_id, producer ({kind: job / case / shell, ...}), rev, source_snapshot, source_state (kept / gone / none), code_hash, modules, fields, outcome}`, `total` |
 | `events` | `after` (cursor `EPOCH:SEQ`; default: now), `all`, `wait` (seconds), `session`, `type` (comma-separated), `limit` | `events`, `next` (cursor), `has_more`, `oldest`; `CursorExpired` for a cursor of another epoch or older than the journal |

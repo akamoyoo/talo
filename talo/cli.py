@@ -324,6 +324,60 @@ def cmd_unexpose(args):
          lambda d: print("removed " + ", ".join(d["removed"])))
 
 
+def show_handoff(h: dict) -> None:
+    print(f"handoff {h['id']} from {h['owner']}" + (f" to {h['to']}" if h.get("to") else "") +
+          f", {time.strftime('%Y-%m-%d %H:%M', time.localtime(h['time']))}, {h['status']}")
+    print(f"message: {h['message']}")
+    avail = "available" if h["snapshot_available"] else "GONE"
+    print(f"state: {h['snapshot_name']} ({h['snapshot']}, {avail}), session {h['session']} at rev {h['rev']}")
+    if h["notes"]["count"]:
+        print(f"notes since the previous handoff ({h['notes']['count']}):")
+        for n in h["notes"]["last"]:
+            print(f"  {note_line(n)[:300]}")
+    if h["records"]["count"]:
+        print(f"ledger records since: {h['records']['count']} (`talo ledger -s {h['session']}`)")
+    v = h.get("variables") or {}
+    if "largest" in v:
+        print("variables: " + " · ".join(f"{x['name']} {x['type']} {human_bytes(x.get('nbytes'))}" for x in v["largest"]))
+    for j in h.get("active_jobs") or []:
+        print(f"running at handoff: job {j['id']} {(j['code_preview'].strip().splitlines() or [''])[0][:70]}")
+    print("continue with:")
+    for c in h["continue"]:
+        print(f"  {c}")
+
+
+def cmd_handoff(args):
+    if args.close:
+        d = call("handoff", close=args.close)
+        emit(args, d, lambda x: print(f"handoff {x['handoff']['id']} closed; its snapshot is no longer pinned"))
+        return
+    if not args.message:
+        raise TaloError("BadArgument", "a handoff needs -m MESSAGE: what was done, what is open, what to do next")
+    d = call("handoff", session=session_name(args), message=args.message, to=args.to, snap=args.snap, key=args.key,
+             expect_rev=args.expect_rev)
+    emit(args, d, lambda x: show_handoff(x["handoff"]))
+
+
+def cmd_handoffs(args):
+    def human(d):
+        if not d["handoffs"]:
+            print("(no handoffs)")
+        for h in d["handoffs"]:
+            print(f"{h['id']:5s} {h['status']:24s} {h['session']:12s} {h['owner']} -> {h.get('to') or '-'}  "
+                  f"{h['message'][:80]}")
+    emit(args, call("handoffs", session=args.session), human)
+
+
+def cmd_resume(args):
+    d = call("resume", id=args.id, branch=args.branch)
+
+    def human(x):
+        show_handoff(x["handoff"])
+        if "session" in x:
+            print(f"session {x['session']['name']} started from {x['handoff']['snapshot']}")
+    emit(args, d, human)
+
+
 def cmd_map(args):
     code = read_code(args)
     cases = None
@@ -878,6 +932,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key", help="idempotency key")
     p.add_argument("--expect-rev", type=int, metavar="N", help="without --from: refuse unless the session is at revision N")
     add("maps", cmd_maps, "fan-outs and their progress")
+    p = add("handoff", cmd_handoff, "hand the session's work over: snapshot, notes, records, running jobs, message")
+    p.add_argument("-m", "--message", help="what was done, what is open, what to do next")
+    p.add_argument("--to", help="who it is for (attribution only)")
+    p.add_argument("--snap", metavar="NAME", help="hand over this snapshot instead of taking a new one")
+    p.add_argument("--close", metavar="ID", help="close a handoff (its snapshot is no longer pinned)")
+    p.add_argument("--key", help="idempotency key")
+    p.add_argument("--expect-rev", type=int, metavar="N", help="refuse unless the session is at revision N")
+    p = add("handoffs", cmd_handoffs, "handoffs and their status", session=False)
+    p.add_argument("-s", "--session")
+    p = add("resume", cmd_resume, "show a handoff; --branch NAME starts a session from its snapshot", session=False)
+    p.add_argument("id")
+    p.add_argument("--branch", metavar="NAME", help="create a session from the handoff's snapshot (closes it)")
     p = add("call", cmd_call, "call a service of a session (SESSION.NAME) with JSON arguments", session=False)
     p.add_argument("service")
     p.add_argument("args", nargs="?", help="JSON object of keyword arguments")

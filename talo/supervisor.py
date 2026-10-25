@@ -819,7 +819,9 @@ class Supervisor:
         self.ledger: dict[str, dict] = self._load_ledger()
         self.services: dict[str, dict] = {}   # "session.name" -> {"versions": {n: version}, "latest": n}
         self.calls: dict[str, dict] = {}
-        self.next_call = 1   # record id -> record (shared by all sessions)
+        self.next_call = 1
+        self.handoffs: dict[str, dict] = {}
+        self.next_handoff = 1   # record id -> record (shared by all sessions)
         self.last_rev: dict[str, int] = {}             # session name -> its revision when it was closed
         self.epoch = wire.new_id()[:12]               # changes when the supervisor restarts (keys do not survive it)
         self.state_file = home() / "state.json"
@@ -1468,6 +1470,84 @@ class Supervisor:
         view = {k: v for k, v in call.items() if k != "done"}
         view["elapsed_s"] = round((call["finished"] or time.time()) - call["started"], 3)
         return {"call": view, "epoch": self.epoch}
+
+    # ---------------------------------------------------------------- handoffs
+
+    async def op_handoff(self, req):
+        if req.get("close"):
+            h = self._handoff(req["close"])
+            self._close_handoff(h, "closed")
+            return {"handoff": self._handoff_view(h)}
+        session = self._session(req["session"])
+        key = req.get("key")
+        if key is not None and ("handoff", session.id, key) in self.keys:
+            return {"handoff": self._handoff_view(self.handoffs[self.keys[("handoff", session.id, key)][0]]),
+                    "deduplicated": True}
+        hid = f"h{self.next_handoff}"
+        self.next_handoff += 1
+        if req.get("snap"):
+            snap = self._snapshot(req["snap"], session.name)
+        else:  # queued like any snapshot, so it captures the state after the jobs before it
+            out = await self._control(session, "snap", req.get("timeout", 300), req, name=f"handoff-{hid}",
+                                      message=f"handoff {hid}: {req.get('message', '')}"[:200], strict=False)
+            if "job" in out:
+                raise RuntimeError(f"the handoff snapshot did not finish in time (job {out['job']['id']})")
+            snap = session.find(f"handoff-{hid}")
+        previous = [h for h in self.handoffs.values() if h["session_id"] == session.id]
+        since = previous[-1]["time"] if previous else 0.0
+        notes = [n for n in self._notes(session) if n["time"] > since]
+        records = [r for r in self.ledger.values() if r["session_id"] == session.id and r["time"] > since]
+        brief = await self.op_brief({"session": session.name, "notes": 0, "jobs": 8, "vars": 15})
+        h = {"id": hid, "session": session.name, "session_id": session.id, "time": time.time(),
+             "owner": req.get("owner") or "user", "to": req.get("to"), "message": req.get("message", ""),
+             "snapshot": snap.ref, "snapshot_name": snap.name, "rev": session.rev, "status": "open",
+             "notes": {"count": len(notes), "last": notes[-10:]},
+             "records": {"count": len(records), "ids": [r["id"] for r in records][-50:]},
+             "active_jobs": brief["active_jobs"], "variables": brief["variables"],
+             "recent_jobs": brief["recent_jobs"],
+             "continue": [f"talo resume {hid} --branch NAME   # a new session from {snap.ref}",
+                          f"talo attach -s {session.name}            # the live session"]}
+        snap.pins.add(f"handoff {hid}")
+        self.handoffs[hid] = h
+        if key is not None:
+            self.keys[("handoff", session.id, key)] = (hid, None)
+        with open(session.dir / "handoffs.jsonl", "a") as f:
+            f.write(json.dumps(h, ensure_ascii=False, default=str) + "\n")
+        self.emit("handoff.created", session=session.name, handoff=hid, to=h["to"], owner=h["owner"])
+        return {"handoff": self._handoff_view(h)}
+
+    def _handoff(self, hid: str) -> dict:
+        if hid not in self.handoffs:
+            raise KeyError(f"no handoff {hid!r} (`talo handoffs` lists them)")
+        return self.handoffs[hid]
+
+    def _handoff_snapshot(self, h: dict) -> Snapshot | None:
+        session, _, sid = h["snapshot"].partition(":")
+        s = self.sessions.get(session)
+        return s.snapshots.get(sid) if s else None
+
+    def _handoff_view(self, h: dict) -> dict:
+        return {**h, "snapshot_available": self._handoff_snapshot(h) is not None}
+
+    def _close_handoff(self, h: dict, status: str) -> None:
+        h["status"] = status
+        if (snap := self._handoff_snapshot(h)) is not None:
+            snap.pins.discard(f"handoff {h['id']}")
+
+    async def op_handoffs(self, req):
+        return {"handoffs": [self._handoff_view(h) for h in self.handoffs.values()
+                             if not req.get("session") or h["session"] == req["session"]]}
+
+    async def op_resume(self, req):
+        h = self._handoff(req["id"])
+        out = {"handoff": self._handoff_view(h)}
+        if req.get("branch"):
+            if self._handoff_snapshot(h) is None:
+                raise RuntimeError(f"the snapshot of handoff {h['id']} ({h['snapshot']}) is gone")
+            session = await self.op_new({"name": req["branch"], "from": h["snapshot"], "owner": req.get("owner")})
+            self._close_handoff(h, f"branched into {req['branch']}")
+            out = {"handoff": self._handoff_view(h), "session": session}
+        return out
 
     # ---------------------------------------------------------------- events
 
