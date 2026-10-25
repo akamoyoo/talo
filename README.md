@@ -23,7 +23,7 @@
 
 ---
 
-**Talo** (Finnish for *house*) is a long-lived Python process that keeps your variables in memory while you —
+**Talo** is a long-lived Python process that keeps your variables in memory while you —
 or your coding agent — send it code from the terminal, one command at a time. Think of it as a Jupyter kernel without
 the notebook UI, built for workflows where the expensive part is getting the data into memory (illustrative session):
 
