@@ -499,15 +499,16 @@ $ jupyter lab                              # open any .ipynb, pick the kernel "T
 
 - `talo kernelspec install [-s SESSION] [--name NAME]` writes a Jupyter kernelspec whose command is
   `talo kernel --session SESSION -f {connection_file}`. Jupyter starts that process as "the kernel"; it is a bridge:
-  it speaks the Jupyter messaging protocol over ZMQ to the front end (shell, iopub, stdin, control and heartbeat
-  channels, HMAC-signed as the connection file says) and Talo's control requests to the supervisor. The session
+  it speaks the Jupyter messaging protocol (5.3) over ZMQ to the front end (shell, iopub, stdin and control channels,
+  messages signed and verified as the connection file says, and the raw heartbeat echo) and Talo's control requests to the supervisor. The session
   itself, with its data, runs as always; the bridge holds nothing. It needs `pyzmq` (`pip install talo[jupyter]`);
   the worker stays standard-library only.
 - Standard `.py` and `.ipynb` files: notebooks, VS Code's `# %%` cells in `.py` files and its Interactive Window all
   work through the same kernelspec. Several front ends can attach to one session, and agents keep using the CLI.
-- Mapping: `execute_request` → a job (`run`); its output file is streamed as `stream` messages while it runs, then
-  `execute_result` / `display_data` (images inlined as base64 from their files) / `error`, with the job's execution
-  count. `complete_request`, `inspect_request` (a `show` summary), `is_complete_request`, `history_request` (the
+- Mapping: `execute_request` → a job (`run`, `silent` passed through); its output file is streamed as `stream`
+  messages while it runs, with each `display()` and figure sent as `display_data` at the place in the text where it
+  happened (the worker records the output offset of every display), then `execute_result` / `error`. Images are
+  inlined (base64 for PNG and JPEG, text for SVG). `complete_request`, `inspect_request` (a `show` summary), `is_complete_request`, `history_request` (the
   session's history), `kernel_info_request` (`implementation: "talo"`) and `comm_info_request` (no comms) are
   answered. `interrupt_request` (control channel) interrupts the running job. `input()` is not supported.
 - **Attaching from a notebook** connects to the live state, not to its code: the notebook document belongs to the
@@ -520,6 +521,10 @@ $ jupyter lab                              # open any .ipynb, pick the kernel "T
   which is the point. `shutdown_request` likewise detaches; the session keeps running.
 - **Jobs from other clients** are reported at the top of the next cell's output, one line each (owner, job, status,
   revision), as `talo attach` does.
+- The kernel is labelled `Talo: SESSION (persistent)`: "Restart and Run All" re-runs the cells against the state
+  that is still there. Execution counts follow the state: after a checkout they continue from the snapshot's count,
+  which departs from Jupyter's monotonic counter but keeps the count meaningful for rollback. Comms, widgets,
+  `clear_output` / display updates and debugging are not supported.
 
 ### Rollback inside notebooks: magics and autosnap
 
@@ -530,8 +535,9 @@ $ jupyter lab                              # open any .ipynb, pick the kernel "T
   execution, named `@N` after the execution count, keeping the last N (default 10) and dropping older ones unless
   something pins them. It is a session setting, so it works the same from the CLI, `attach` and notebooks. Costs:
   milliseconds per cell, plus the pages each later cell modifies.
-- `talo undo` (or `%undo`) checks out the state before the last execution: the autosnap of the execution before it,
-  discarding the last one. `talo checkout @15` returns to the state after execution 15.
+- Turning autosnap on takes a baseline snapshot when the current state has none. `talo undo` (or `%undo`) checks
+  out the preceding retained checkpoint: the base, if jobs ran since it (a failed execution leaves no autosnap, so
+  undo returns to the state before it), otherwise the base's parent. `talo checkout @15` returns to the state after execution 15.
 - After a checkout, the bridge prints which state the session is in (`state restored to @12; cells run after it are
   no longer in memory`); the notebook's text is unchanged, and the restored execution count shows which cells are
   no longer reflected in memory.
