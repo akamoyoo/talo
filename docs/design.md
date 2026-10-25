@@ -561,50 +561,72 @@ Agents run long, expensive and sometimes wrong computations on shared machines, 
 decide whether to trust them. M8 makes results checkable before they are adopted, failures inspectable without
 recomputing, and resource use bounded by the operating system rather than by polling.
 
-### Is this state reproducible? `talo verify`
+### Does replaying the lineage give this state? `talo verify`
 
-- `talo verify --hot [--from SNAPSHOT]` forks an ephemeral worker from a snapshot on the current lineage (default: the
-  oldest one still kept), replays the lineage's jobs after it in order, and compares the result with the live state:
-  variable by variable, by summary and content fingerprint (as `diff`, with its size limit).
-- `talo verify --cold` starts a fresh interpreter (the session's), runs the exported script of the current lineage,
-  and compares in the same way.
-- The report lists variables that match, differ (with the differing fields), are missing on either side or could not
-  be compared, the jobs replayed, and the **replay hazards**: failed jobs in the lineage whose partial effects the
-  state keeps, reloads, and jobs that read files or the network cannot be detected and are not claimed. Verification
-  never changes the session. A difference is reported, not explained: randomness without a fixed seed, time and
-  external data are common causes.
+Verification checks **replay agreement**, not reproducibility on another machine. It never changes the session's
+state, but replayed code can repeat its external effects (writing files, network requests), as any re-run would.
+
+- The target is the current state, captured as an internal snapshot through the queue (after running jobs) and pinned
+  while verifying, so concurrent work does not move it.
+- `talo verify` (hot) forks an ephemeral worker from a snapshot on the lineage (default: the oldest one still kept;
+  `--from NAME`) and replays the lineage's jobs after it, one execution at a time through the worker protocol, so
+  `_`, `Out` and expression results behave as they did. `talo verify --cold` does the same in a fresh interpreter
+  (the session's) from the session's start; if the lineage is incomplete back to the start, the result is
+  `inconclusive`.
+- Failed jobs in the lineage are replayed too (their partial effects are part of the state) and listed as hazards;
+  a lineage containing reloads is `inconclusive` (module sources may have changed since). Replays use their own
+  identities: no records, events or services of the session.
+- The comparison is variable by variable, by summary and content fingerprint, as `diff` (with its size limit and
+  its limits: equal pickles, not equal objects; aliasing between variables is not compared).
+- The result is `match`, `mismatch` (with the differing variables), `inconclusive` (what could not be compared or
+  replayed faithfully) or `replay_failed` (the job that failed while replaying), with the source, the target, the
+  jobs replayed and the hazards.
 
 ### Trial, review, adopt
 
 ```console
 $ talo run --trial clean -f clean.py      # runs in a fork of the current state; the session is not changed
-$ talo review clean                        # its output, result, and diff against the current state
+$ talo review clean                        # its output and result, and diff against the state it started from
 $ talo adopt clean                         # the session switches to the trial's state, atomically
 $ talo reject clean                        # or drop it
 ```
 
-- `run --trial NAME` takes an internal snapshot of the current state through the queue, runs the code in an ephemeral
-  worker forked from it, and, if the code succeeds, keeps that worker's final state as a snapshot `trial:NAME`
-  (pinned, counted in the session's memory). The session's own worker is free meanwhile.
-- `review NAME` shows the trial job (status, output, result, records), and `diff` between the session's current state
-  and the trial's.
-- `adopt NAME` checks out the trial's snapshot; the trial's job joins the lineage as if it had run in the session.
-  If the session's revision changed since the trial started, adopting would discard that work: it is refused unless
-  `--discard`. `reject NAME` drops the trial. A failed trial keeps nothing (with `--retain-error`, its failed state).
+- `run --trial NAME` queues a fork of the current state; when the fork is taken, the trial records the session's
+  revision, base and lineage at that moment (its **source**), then runs the code in an ephemeral worker forked from it.
+  The session's own worker is free meanwhile. A trial that succeeds keeps its final state as a snapshot `trial-NAME`
+  (pinned, counted in the session's memory); a trial that fails keeps nothing (unless `--retain-error`).
+- States: `preparing → running → ready | failed → adopted | rejected`. Trial names are unique among the session's
+  open trials; `--key` makes the submission retry-safe.
+- `review NAME` shows the trial job (output, result, records) and `diff` between its source and its result; `--current`
+  diffs against the session's current state instead.
+- `adopt NAME` is a queued operation: if the session's revision is no longer the trial's source revision, adopting
+  would discard the work done since, and it is refused unless `--discard` (an explicit `--expect-rev` is checked as
+  well). The replacement worker answers before the current one is retired. The trial's job then appears once in the
+  lineage, after its source; the revision advances once. `reject NAME` drops the trial and its snapshot unless
+  something else pins it.
+- A trial runs in a fork: `talo.expose` inside it publishes nothing, and its records carry the trial's job.
 
 ### Hard limits and deadlines
 
 - `new --limit memory=100G,cpu=8,pids=512` runs the worker in a systemd user scope (cgroup v2): `MemoryMax` (with
-  `MemorySwapMax=0`, without which the excess is swapped out instead of enforced), `CPUQuota` and `TasksMax` apply to the worker, its snapshots and every fork of them together — the kernel enforces them, there
+  `MemorySwapMax=0`, without which the excess is swapped out instead of enforced), `CPUQuota` (`cpu=8` is a budget of
+  800% CPU time, not eight pinned cores) and `TasksMax` apply to the worker, its snapshots and every fork of them together — the kernel enforces them, there
   is no sampling. Talo checks at `new` that a user systemd instance is available and that the needed controllers are
   delegated to it (often only `memory` and `pids` are; `cpu=` is then refused), and refuses otherwise (the soft
-  `--memory-limit` remains for machines without it). An out-of-memory kill inside the scope is reported as such.
+  `--memory-limit` remains for machines without it). After starting, Talo reads the limits back from the scope's
+  cgroup and reports them as `effective_limits`. An out-of-memory kill inside the scope is reported as such; note
+  that the kernel may choose a snapshot rather than the worker. Sessions branched from the session's snapshots run in
+  the same scope and share its limits.
 - `run --deadline SECONDS` bounds a job's run time independently of how long the client waits (`-t`): at the deadline
   Talo interrupts the job, then kills it after a grace period; the job ends with `termination: "deadline"`.
 - `run --max-output SIZE` (and a session default) bounds a job's output file; a job that exceeds it is interrupted with
   `termination: "output_limit"`.
-- When Talo kills a job's worker (deadline, limits), it also kills the processes the worker started (found through
-  `/proc`), so child processes do not outlive the job.
+- When Talo kills a job's worker (deadline, limits), it also kills the processes the worker started, found through
+  `/proc` (best effort: a process that detaches by double-forking can escape), except the session's snapshot
+  processes and everything below them, which are the worker's children too.
+- The deadline clock starts when the code starts executing (not while queued); a job stopped by a deadline or limit
+  stays stopped even if the code catches the interrupt, and an atomic job is restored. The output limit is checked
+  four times a second, so a fast writer can overshoot it.
 
 ### Diagnosing a job: `talo diagnose`, `--retain-error`
 
@@ -624,22 +646,28 @@ $ talo reject clean                        # or drop it
 `talo.artifact_path(name="")` returns a path in a directory of the running job (`sessions/S/artifacts/JOB/`), created
 on demand. Rolling back memory never removes files; giving each job its own directory makes its outputs visible
 (`talo artifacts JOB` lists them, with sizes) and lets a reviewer publish them deliberately
-(`talo artifacts JOB --copy-to DIR`) instead of having an experiment overwrite shared files.
+(`talo artifacts JOB --copy-to DIR`) instead of having an experiment overwrite shared files. Names must be relative and stay inside the directory;
+  listing and copying never follow symbolic links. This organizes files; it does not sandbox them.
 
 ### A human takes over: `talo queue pause`, `talo lease`
 
 - `talo queue pause [-m REASON]` stops the session from starting new jobs (running ones finish); submissions keep
   queueing and say why they wait. `talo queue resume` continues.
 - `talo lease --ttl 30m [-m REASON]` gives the caller's owner the session for a while: only its jobs start; other
-  owners' jobs wait in order and start when the lease ends (`talo lease --release`, or when it expires).
+  owners' jobs wait, keeping their order, and start when the lease ends (`talo lease --release`, or when it expires).
+  The session dispatches the oldest job that may run, so the holder's jobs are never stuck behind waiting ones;
+  releasing and resuming are never queued. Owners are attribution, not authentication: a lease coordinates
+  cooperating clients.
 - `brief`, `jobs` and `events` show a pause or a lease.
 
 ### Where the memory went: `talo memory`
 
-`talo memory` lists the session's memory by holder: the largest variables (their estimated sizes), objects retained
-by `_` and `Out`, each snapshot's private memory and pins, map cases and calls, and the worker's resident memory not
-attributed to any variable. `talo memory --prune` proposes what could be released — automatic and unpinned snapshots
-that are not the base, the `Out` cache — with the estimated bytes of each, and applies it with `--apply`. Estimates
+`talo memory` lists the session's memory in two separate views: processes (worker, snapshots, checkpoints, map
+cases and calls: resident, proportional and private memory, as measured) and objects (the largest variables and
+what `_` and `Out` retain, as estimated). The two are not subtracted from each other: object estimates are neither
+additive nor a measure of resident memory. `talo memory --prune` proposes what could be released — automatic and unpinned snapshots
+that are not the base, retained error snapshots, the `Out` cache — with the measured private memory of each
+snapshot, and applies it with `--apply` after checking again that nothing pins them. Estimates
 are labelled as such: shared pages, allocator caches and fragmentation make exact promises impossible.
 
 ## Known limitations
