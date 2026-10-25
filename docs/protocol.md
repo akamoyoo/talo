@@ -74,7 +74,7 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `op` | Parameters | Result |
 |---|---|---|
 | `ping` | – | `pid`, `home`, `sessions`, `epoch` (changes when the supervisor restarts) |
-| `new` | `name`, `python`, `cwd`, `env`, `from` (`[session:]snapshot`), `memory_budget` (bytes) | the session |
+| `new` | `name`, `python`, `cwd`, `env`, `from` (`[session:]snapshot`), `memory_budget`, `memory_limit` (bytes) | the session |
 | `ls` | – | `sessions` |
 | `kill` | `name` | `killed` |
 | `run` | `session`, `code`, `timeout` (seconds), `key` (idempotency), `expect_rev`, `atomic` | the job (with the supervisor's `epoch`), possibly still `running`; for a known `key`, the job already submitted, with `deduplicated: true` |
@@ -93,15 +93,16 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `export` | `session`, `snap` (export the path to this snapshot), `all` (every job) | `jobs`: job records in order, each with `code`, `status`, `outputs`, and markers for snapshots (`kind: "snap"`) |
 | `tree` | – | `nodes`: snapshots (`kind: "snapshot"`, as below) and live workers (`kind: "worker"`, `session`, `state`, `base`, `jobs_since_base`), each with `parent` (a snapshot ref or null) |
 | `diff` | `session` (for `@` and bare names), `a`, `b` (default `@`), `max_bytes` (content limit, null for no limit) | `added`, `removed`: variable summaries; `changed`: `{name, a, b, fields}` (`fields` lists the differing summary keys, or `["content"]`); `unchanged`: count; `not_compared`: `{name, reason}` |
+| `resources` | `session` (optional) | `machine` (`total`, `available`, swap), `sessions`: each with `processes` (worker, snapshots, checkpoint: `pid`, `memory`: `{rss, pss, private_clean, private_dirty}` or null when unknown), `pss_total`, `pss_unknown`, `memory_limit`, `over_limit`; `pss_total`, `sampled_at` |
 | `note` | `session`, `text`, `job` | `note`: `{time, owner, rev, base, job, text}` |
 | `notes` | `session`, `last` | `notes`, `total` |
 | `brief` | `session`, `notes`, `jobs`, `vars` (how many of each) | `session`, `private_bytes`, `notes`, `snapshots`, `variables` (`largest`, `total`, or `skipped` while busy), `recent_jobs`, `active_jobs` |
 | `shutdown` | – | `stopping` |
 
 A **session** is `{name, state (starting | idle | busy | dead), python, cwd, pid, rss, created, queued, current_job,
-death, base, jobs_since_base, snapshots, rev, memory_budget}`. A **snapshot** is `{id, name, session, parent, pid, created, message, execution_count,
+death, base, jobs_since_base, snapshots, rev, memory_budget, memory_limit, over_limit}`. A **snapshot** is `{id, name, session, parent, pid, created, message, execution_count,
 jobs (ids run between its parent and itself), private_bytes, threads, owner}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
-started, finished, elapsed_s, execution_count, result, error, metrics, output, outputs, owner, key, rev, atomic, progress}`; a running job also has `last_output_age_s`,
+started, finished, elapsed_s, execution_count, result, error, metrics, output, outputs, owner, key, rev, atomic, termination (`memory_limit` when Talo stopped it), progress}`; a running job also has `last_output_age_s`,
 `last_progress_age_s` and `last_activity_age_s`.
 
 The control protocol is versioned together with Talo while it is pre-alpha; it will be frozen and versioned

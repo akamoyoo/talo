@@ -54,6 +54,38 @@ def private_dirty(pid: int | None) -> int | None:
     return None
 
 
+MEMORY_FIELDS = {"Rss:": "rss", "Pss:": "pss", "Private_Clean:": "private_clean", "Private_Dirty:": "private_dirty"}
+MEMORY_LIMIT_INTERVAL = 0.5  # seconds between samples of a session with --memory-limit
+MEMORY_LIMIT_GRACE = 3.0     # seconds an interrupted job gets to stop before its worker is killed
+
+
+def memory(pid: int | None) -> dict | None:
+    """rss / pss / private_clean / private_dirty bytes of a process (``/proc/PID/smaps_rollup``); None if unknown."""
+    if not pid:
+        return None
+    out = {}
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as f:
+            for line in f:
+                key = line.split(maxsplit=1)[0] if line.strip() else ""
+                if key in MEMORY_FIELDS:
+                    out[MEMORY_FIELDS[key]] = int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return out or None
+
+
+def machine_memory() -> dict:
+    out = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, value = line.split(":", 1)
+            if key in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
+                out[key] = int(value.split()[0]) * 1024
+    return {"total": out.get("MemTotal"), "available": out.get("MemAvailable"), "swap_total": out.get("SwapTotal"),
+            "swap_free": out.get("SwapFree")}
+
+
 def resident(pid: int | None) -> int | None:
     if not pid:
         return None
@@ -94,6 +126,7 @@ class Job:
     key: str | None = None                     # idempotency key (run --key)
     expect_rev: int | None = None              # refuse to start unless the session is at this revision
     rev: int | None = None                     # the session's revision when the job started
+    termination: str | None = None             # why Talo stopped the job ("memory_limit")
     progress: dict | None = None               # the last talo.progress() of a running job
     progress_at: float | None = None           # time.monotonic() of that update
     atomic: dict | None = None                 # run --atomic: {"outcome": committed | restored | restore_failed, ...}
@@ -103,7 +136,7 @@ class Job:
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
                                             "execution_count", "result", "error", "metrics", "output", "outputs", "owner", "key",
-                                            "rev", "atomic")}
+                                            "rev", "atomic", "termination")}
         out["progress"] = self.progress
         if self.status == "running":
             out["last_progress_age_s"] = round(time.monotonic() - self.progress_at, 1) if self.progress_at else None
@@ -153,10 +186,13 @@ class StaleRevision(RuntimeError):
 
 
 class Session:
-    def __init__(self, name: str, python: str, cwd: str, env: dict | None = None, memory_budget: int | None = None):
+    def __init__(self, name: str, python: str, cwd: str, env: dict | None = None, memory_budget: int | None = None,
+                 memory_limit: int | None = None):
         self.name, self.python, self.cwd = name, python, cwd
         self.env = env or {}
         self.memory_budget = memory_budget
+        self.memory_limit = memory_limit   # soft limit on the PSS of the worker plus its snapshots (--memory-limit)
+        self.over_limit: str | None = None  # why the session is over its limit without anything to kill
         self.dir = home() / "sessions" / name
         for sub in ("jobs", "snapshots"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
@@ -195,12 +231,17 @@ class Session:
         child.close()
         reader, writer = await asyncio.open_unix_connection(sock=parent, limit=wire.MAX_LINE)
         await self._attach(reader, writer, proc=proc)
-        self.tasks.append(asyncio.create_task(self._execute_loop()))
+        self._start_tasks()
 
     async def start_from(self, snap: Snapshot) -> None:
         """Start this session with a worker forked from a snapshot (possibly another session's)."""
         await self._spawn_from(snap)
+        self._start_tasks()
+
+    def _start_tasks(self) -> None:
         self.tasks.append(asyncio.create_task(self._execute_loop()))
+        if self.memory_limit:
+            self.tasks.append(asyncio.create_task(self._watch_memory()))
 
     async def _spawn_from(self, snap: Snapshot) -> None:
         reader, writer = await asyncio.open_unix_connection(snap.socket, limit=wire.MAX_LINE)
@@ -435,9 +476,45 @@ class Session:
 
     # ---------------------------------------------------------------- snapshots
 
+    def held(self) -> list:
+        return [*self.snapshots.values(), *([self.checkpoint] if self.checkpoint else [])]
+
     def memory_in_use(self) -> int:
-        held = [*self.snapshots.values(), *([self.checkpoint] if self.checkpoint else [])]
-        return (resident(self.worker_pid) or 0) + sum(private_dirty(s.pid) or 0 for s in held)
+        """PSS of the worker plus its snapshots: shared pages are counted once across the family."""
+        pids = [self.worker_pid if self.state != "dead" else None] + [s.pid for s in self.held()]
+        return sum((memory(pid) or {}).get("pss", 0) for pid in pids if pid)
+
+    async def _watch_memory(self) -> None:
+        """Enforce --memory-limit (see "Resources on shared machines" in docs/design.md)."""
+        while True:
+            await asyncio.sleep(MEMORY_LIMIT_INTERVAL)
+            used = self.memory_in_use()
+            if used <= self.memory_limit:
+                self.over_limit = None
+                continue
+            job, generation, pid = self.current, self.generation, self.worker_pid
+            snaps = sum((memory(s.pid) or {}).get("pss", 0) for s in self.held())
+            if job is None or job.kind != "execute" or job.status != "running" or snaps > self.memory_limit:
+                self.over_limit = (f"{used >> 20} MB in use (snapshots {snaps >> 20} MB) over the limit of "
+                                   f"{self.memory_limit >> 20} MB; drop snapshots or free variables")
+                continue
+            if job.termination != "memory_limit":  # first time over: interrupt, and give it a moment to stop
+                log.warning("session %s: %d MB over the limit of %d MB; interrupting job %s", self.name, used >> 20,
+                            self.memory_limit >> 20, job.id)
+                job.termination = "memory_limit"
+                self.interrupt(job)
+                deadline = time.monotonic() + MEMORY_LIMIT_GRACE
+                while time.monotonic() < deadline and not job.done.is_set() and self.memory_in_use() > self.memory_limit:
+                    await asyncio.sleep(0.1)
+                if job.done.is_set() or self.memory_in_use() <= self.memory_limit:
+                    continue  # stopped, or freed enough; if it grows again it is killed
+            if not job.done.is_set() and self.generation == generation:
+                log.warning("session %s: job %s still over the memory limit; killing the worker", self.name, job.id)
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await job.done.wait()
 
     async def _snap(self, name: str | None = None, message: str = "", strict: bool = False,
                     owner: str = "user") -> Snapshot:
@@ -461,6 +538,9 @@ class Session:
             hint = ", ".join(f"{s.name} ({(private_dirty(s.pid) or 0) >> 20} MB)" for s in biggest) or "none"
             raise MemoryError(f"session {self.name} uses {self.memory_in_use() >> 20} MB, over its budget of "
                               f"{self.memory_budget >> 20} MB; snapshots that could be dropped: {hint}")
+        if self.memory_limit and self.memory_in_use() > self.memory_limit:
+            raise MemoryError(f"session {self.name} uses {self.memory_in_use() >> 20} MB, over its memory limit of "
+                              f"{self.memory_limit >> 20} MB; `talo resources` shows what to drop")
         path = str(socket_for(self.dir / "snapshots" / f"{sid}.sock"))
         reply = await self.request("talo_snapshot_request", {"id": sid, "socket": path, "strict": strict}, timeout=120)
         content = reply["content"]
@@ -548,7 +628,7 @@ class Session:
                 "created": self.created, "queued": self.queue.qsize(),
                 "current_job": self.current.id if self.current else None, "death": self.death, "base": self.base,
                 "jobs_since_base": list(self.jobs_since_base), "snapshots": len(self.snapshots), "rev": self.rev,
-                "memory_budget": self.memory_budget}
+                "memory_budget": self.memory_budget, "memory_limit": self.memory_limit, "over_limit": self.over_limit}
 
 
 class Supervisor:
@@ -628,7 +708,7 @@ class Supervisor:
             python, cwd = self.sessions[source.session].python, self.sessions[source.session].cwd
         else:
             python, cwd = req.get("python") or sys.executable, req.get("cwd") or os.getcwd()
-        session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"))
+        session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"), req.get("memory_limit"))
         self.sessions[name] = session
         try:
             await (session.start_from(source) if source else session.start())
@@ -864,6 +944,24 @@ class Supervisor:
             "recent_jobs": {"last": [job_line(j) for j in finished[-n_jobs:]], "total": len(finished)},
             "active_jobs": [job_line(j) for j in jobs if j.status in ("queued", "running")],
         }
+
+    async def op_resources(self, req):
+        sessions = []
+        for s in self.sessions.values():
+            if req.get("session") and s.name != req["session"]:
+                continue
+            procs = [{"kind": "worker", "pid": s.worker_pid, "memory": memory(s.worker_pid) if s.state != "dead" else None}]
+            procs += [{"kind": "snapshot", "name": x.name, "ref": x.ref, "pid": x.pid, "memory": memory(x.pid)}
+                      for x in s.snapshots.values()]
+            if s.checkpoint:
+                procs.append({"kind": "checkpoint", "pid": s.checkpoint.pid, "memory": memory(s.checkpoint.pid)})
+            known = [p["memory"]["pss"] for p in procs if p["memory"] and "pss" in p["memory"]]
+            sessions.append({"name": s.name, "state": s.state, "processes": procs,
+                             "pss_total": sum(known), "pss_unknown": len(known) < len(procs),
+                             "memory_limit": s.memory_limit, "memory_budget": s.memory_budget,
+                             "over_limit": s.over_limit})
+        return {"sampled_at": time.time(), "machine": machine_memory(), "sessions": sessions,
+                "pss_total": sum(x["pss_total"] for x in sessions)}
 
     async def op_tree(self, req):
         nodes = []

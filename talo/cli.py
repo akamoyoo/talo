@@ -137,6 +137,8 @@ def status_line(job: dict) -> str:
         return (f"[job {jid} {status}{elapsed}{live}] `talo wait {jid}` for the result, `talo tail {jid}` for output, "
                 f"`talo interrupt {jid}` to stop it")
     atomic = job.get("atomic") or {}
+    if job.get("termination") == "memory_limit":
+        status += ", stopped by the memory limit"
     if atomic.get("outcome") == "restored":
         status += ", state restored"
     elif atomic.get("outcome") in ("restore_failed", "not_started"):
@@ -173,6 +175,7 @@ def cmd_new(args):
                                        "directory; --python / --cwd cannot change them")
     s = call("new", name=args.name, python=args.python or (None if args.from_ else sys.executable),
              cwd=os.path.abspath(args.cwd or os.getcwd()), memory_budget=parse_size(args.memory_budget),
+             memory_limit=parse_size(args.memory_limit),
              **({"from": args.from_} if args.from_ else {}))
     origin = f", forked from {s['base']}" if s.get("base") else ""
     emit(args, s, lambda d: print(f"session {d['name']} started: pid {d['pid']}, {d['python']}, cwd {d['cwd']}{origin}"))
@@ -446,6 +449,25 @@ def cmd_brief(args):
     emit(args, call("brief", session=session_name(args), notes=args.notes, jobs=args.jobs), human)
 
 
+def cmd_resources(args):
+    def human(d):
+        m = d["machine"]
+        print(f"machine: {human_bytes(m['available'])} available of {human_bytes(m['total'])}; "
+              f"Talo sessions use {human_bytes(d['pss_total'])} (PSS)")
+        for s in d["sessions"]:
+            limit = f", limit {human_bytes(s['memory_limit'])}" if s["memory_limit"] else ""
+            unknown = " (some unknown)" if s["pss_unknown"] else ""
+            print(f"{s['name']:16s} {s['state']:8s} {human_bytes(s['pss_total'])}{unknown}{limit}")
+            for p in s["processes"]:
+                mem = p["memory"] or {}
+                label = p["kind"] if p["kind"] != "snapshot" else f"snapshot {p['name']}"
+                print(f"  {label:24s} pid {p['pid']}  pss {human_bytes(mem.get('pss'))}  rss {human_bytes(mem.get('rss'))}"
+                      f"  private {human_bytes((mem.get('private_dirty') or 0) + (mem.get('private_clean') or 0)) if mem else '-'}")
+            if s["over_limit"]:
+                print(f"  over the limit: {s['over_limit']}")
+    emit(args, call("resources", session=args.session), human)
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -559,6 +581,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cwd", help="working directory of the worker (default: the current directory)")
     p.add_argument("--from", dest="from_", metavar="[SESSION:]SNAPSHOT",
                    help="start from a snapshot instead of an empty interpreter (a branch)")
+    p.add_argument("--memory-limit", metavar="SIZE",
+                   help="soft limit on the session's memory (worker plus snapshots, PSS): a job that exceeds it is "
+                        "interrupted, then its worker killed (e.g. 100G)")
     p.add_argument("--memory-budget", metavar="SIZE",
                    help="refuse new snapshots when the worker plus its snapshots use more than this (e.g. 200G)")
     add("ls", cmd_ls, "list sessions", session=False)
@@ -625,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", choices=("py", "ipynb"), help="format (default: from the file name, else py)")
     p.add_argument("--snap", metavar="NAME", help="export the path to this snapshot instead")
     p.add_argument("--all", action="store_true", help="every job of the session, including rolled-back ones")
+    add("resources", cmd_resources, "memory of every session's worker and snapshots, and of the machine")
     p = add("brief", cmd_brief, "what an agent needs to resume the session's work (state, notes, variables, jobs)")
     p.add_argument("--notes", type=int, default=10, help="most recent notes shown")
     p.add_argument("--jobs", type=int, default=8, help="most recent finished jobs shown")

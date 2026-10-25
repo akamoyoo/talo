@@ -136,3 +136,28 @@ def test_output_is_condensed_and_results_bounded(talo):
     assert open(result["metadata"]["talo_text_path"]).read() == repr("x" * 50_000)
     raw = talo("tail", out["job"]["id"], "--raw", "--all").stdout
     assert raw.count("same warning") == 50
+
+
+GROW = ("import numpy as np, time\nblocks = []\nfor i in range(40):\n"
+        "    blocks.append(np.ones(5_000_000))  # 40 MB a step\n    time.sleep(0.1)")
+
+
+def test_memory_limit_interrupts_a_growing_job(talo):
+    talo("new", "lim", "--memory-limit", "300M")
+    rc, out = run_json(talo, "run", "-s", "lim", GROW, "-t", "60")
+    job = out["job"]
+    assert job["status"] == "interrupted" and job["termination"] == "memory_limit"
+    rc, out = run_json(talo, "resources", "-s", "lim")
+    assert out["sessions"][0]["memory_limit"] == 300 << 20 and out["machine"]["available"] > 0
+
+
+def test_memory_limit_kills_a_job_that_ignores_the_interrupt_and_atomic_restores(talo):
+    talo("new", "lim", "--memory-limit", "300M")
+    talo("run", "-s", "lim", "x = 1")
+    stubborn = "while True:\n    try:\n" + "\n".join("        " + line for line in GROW.splitlines()) + \
+               "\n    except KeyboardInterrupt:\n        pass"
+    rc, out = run_json(talo, "run", "-s", "lim", "--atomic", "x = 2\n" + stubborn, "-t", "60")
+    job = out["job"]
+    assert job["status"] == "lost" and job["termination"] == "memory_limit" and job["atomic"]["outcome"] == "restored"
+    rc, out = run_json(talo, "run", "-s", "lim", "x")
+    assert out["job"]["result"]["data"]["text/plain"] == "1"
