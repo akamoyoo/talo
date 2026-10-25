@@ -1,0 +1,25 @@
+[project]
+name = "talo"
+version = "0.0.1"
+description = "A resident in-memory Python session you drive from the terminal: load data once, snapshot, roll back, branch. Built for coding agents and humans."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "numpy", "pandas>=3"]
+
+[project.scripts]
+talo = "talo.cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["talo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,75 @@
+# talo protocol
+
+talo has two message channels. Both carry newline-delimited JSON over Unix sockets.
+
+| Channel | Between | Shape |
+|---|---|---|
+| Control | CLI (or any client) and supervisor, `$TALO_HOME/supervisor.sock` | one request line, one reply line |
+| Kernel | supervisor and a session's worker (socket pair) | Jupyter messages |
+
+## Kernel messages
+
+Every message has the Jupyter structure:
+
+```json
+{"header": {"msg_id": "…", "msg_type": "execute_request", "session": "default", "username": "talo",
+            "date": "2026-10-25T01:00:00+00:00", "version": "5.3"},
+ "parent_header": {},
+ "metadata": {},
+ "content": {}}
+```
+
+Replies and side messages carry the request's header as `parent_header`.
+
+### Standard messages (Jupyter 5.3)
+
+| Request | Replies and side messages | Notes |
+|---|---|---|
+| `execute_request` (`code`, `silent`, `store_history`, …) | `status` busy, `execute_input`, `execute_result` or `error`, `execute_reply`, `status` idle | metadata `talo_output`: path of the job's output file (fds 1 and 2 are redirected to it). `execute_reply` metadata: `talo_duration_s`, `talo_rss_before`, `talo_rss_after` |
+| `kernel_info_request` | `kernel_info_reply` | adds `talo_pid`, `talo_executable` |
+| `shutdown_request` | `shutdown_reply` | the worker exits |
+
+Interrupts are signals (SIGINT to the worker), as in Jupyter's `interrupt_mode: signal`. Output is delivered through
+the job's output file rather than `stream` messages; the M4 bridge turns the file into `stream` messages for Jupyter
+front ends.
+
+`execute_result.data` is a mime bundle: `text/plain` always (truncated to 100 000 characters, with
+`metadata.talo_truncated` set to the number of characters cut), plus `text/html` / `text/markdown` when the object
+provides `_repr_html_` / `_repr_markdown_`.
+
+### talo extensions
+
+| Request | Reply content |
+|---|---|
+| `talo_vars_request` (`pattern`) | `variables`: list of `{name, type, nbytes, shape | len, dtype, columns, value}`; `rss` |
+| `talo_show_request` (`name`: variable or expression, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
+
+M2 adds `talo_snapshot_request`, `talo_checkout_request` and `talo_snapshot_info_request`.
+
+## Control requests
+
+Request: `{"op": "<operation>", ...parameters}`. Reply: `{"ok": true, ...result}` or
+`{"ok": false, "error": {"type": "...", "message": "..."}}`.
+
+| `op` | Parameters | Result |
+|---|---|---|
+| `ping` | – | `pid`, `home`, `sessions` |
+| `new` | `name`, `python`, `cwd`, `env` | the session |
+| `ls` | – | `sessions` |
+| `kill` | `name` | `killed` |
+| `run` | `session`, `code`, `timeout` (seconds) | the job, possibly still `running` |
+| `job` | `id`, `wait` (seconds) | the job |
+| `jobs` | `session` (optional) | `jobs` |
+| `output` | `id`, `offset` (default: the end), `max_bytes` | `text`, `offset`, `next_offset`, `size`, `status` |
+| `interrupt` | `id` | `result`: `interrupting`, `cancelled` or the final status |
+| `vars` | `session`, `pattern` | as `talo_vars_reply` |
+| `show` | `session`, `name`, `rows` | as `talo_show_reply` |
+| `history` | `session`, `last` | `history` |
+| `shutdown` | – | `stopping` |
+
+A **session** is `{name, state (starting | idle | busy | dead), python, cwd, pid, rss, created, queued, current_job,
+death}`. A **job** is `{id, session, status (queued | running | ok | error | interrupted | lost | cancelled), submitted,
+started, finished, elapsed_s, execution_count, result, error, metrics, output}`.
+
+The control protocol is versioned together with talo while it is pre-alpha; it will be frozen and versioned
+separately at 1.0.

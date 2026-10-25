@@ -1,0 +1,322 @@
+"""talo worker: runs code inside the user's interpreter; all variables live in this process.
+
+Started by the supervisor as ``python <talo>/worker.py --fd N --session NAME``. File descriptor N is a Unix socket
+connected to the supervisor; the message format is described in ``wire.py``. The worker is single-threaded and handles
+messages one at a time: execute code, list variables, summarize a variable, shut down.
+
+While code runs, fds 1 and 2 are redirected to the job's output file (the supervisor passes its path in the
+``execute_request`` metadata), so output written directly to the file descriptors by C extensions is captured too and
+the supervisor can read it while the job is still running. Interrupts arrive as SIGINT (a KeyboardInterrupt in user
+code).
+
+Standard library only and executed by path: talo does not need to be installed in the target environment, and no
+directory is added to the user's ``sys.path``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import importlib.util
+import linecache
+import os
+import signal
+import socket
+import sys
+import time
+import traceback
+from pathlib import Path
+
+
+def _load_wire():
+    spec = importlib.util.spec_from_file_location("_talo_wire", Path(__file__).with_name("wire.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+wire = _load_wire()
+
+RESULT_LIMIT = 100_000  # characters of a result's text/plain kept; longer results are truncated and flagged
+TRACEBACK_LIMIT = 50_000
+CELL_FILENAME = "<talo-{n}>"
+
+
+def rss_bytes() -> int:
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except OSError:
+        return -1
+
+
+def truncate(text: str, limit: int) -> tuple[str, int]:
+    """(truncated text, number of characters cut): keeps the head and the tail, with a marker line in between."""
+    if len(text) <= limit:
+        return text, 0
+    head, tail = text[: limit * 3 // 4], text[-limit // 4:]
+    cut = len(text) - len(head) - len(tail)
+    return f"{head}\n… [{cut} characters cut] …\n{tail}", cut
+
+
+def mime_bundle(value) -> tuple[dict, dict]:
+    """(data, metadata): always text/plain; also text/html / text/markdown when the object provides
+    ``_repr_html_`` / ``_repr_markdown_`` (skipped if they fail)."""
+    data, meta = {}, {}
+    try:
+        text = repr(value)
+    except Exception as error:  # noqa: BLE001 - a user object's __repr__ may raise anything
+        text = f"<repr failed: {type(error).__name__}: {error}>"
+    data["text/plain"], cut = truncate(text, RESULT_LIMIT)
+    if cut:
+        meta["talo_truncated"] = cut
+    for method, mime in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown")):
+        fn = getattr(type(value), method, None)
+        if fn is None:
+            continue
+        try:
+            out = fn(value)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(out, str):
+            data[mime] = truncate(out, RESULT_LIMIT)[0]
+    return data, meta
+
+
+# ---------------------------------------------------------------- variable summaries
+
+def _nbytes(value) -> int | None:
+    """A cheap estimate of the memory an object holds (no deep traversal)."""
+    nbytes = getattr(value, "nbytes", None)  # numpy, pyarrow, torch
+    if isinstance(nbytes, int):
+        return nbytes
+    usage = getattr(value, "memory_usage", None)  # pandas DataFrame / Series
+    if callable(usage):
+        try:
+            total = usage(index=True, deep=False)
+            return int(total.sum()) if hasattr(total, "sum") else int(total)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return sys.getsizeof(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _type_name(value) -> str:
+    t = type(value)
+    module = t.__module__
+    return t.__qualname__ if module in ("builtins", "__main__") else f"{module.split('.')[0]}.{t.__qualname__}"
+
+
+def describe(name: str, value) -> dict:
+    """A one-line variable summary: name, type, shape / length, dtype, memory estimate."""
+    out = {"name": name, "type": _type_name(value), "nbytes": _nbytes(value)}
+    shape = getattr(value, "shape", None)
+    if isinstance(shape, tuple):
+        out["shape"] = list(shape)
+    elif hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+        try:
+            out["len"] = len(value)
+        except Exception:  # noqa: BLE001
+            pass
+    dtype = getattr(value, "dtype", None)
+    if dtype is not None:
+        out["dtype"] = str(dtype)
+    if hasattr(value, "dtypes") and hasattr(value, "columns"):  # DataFrame
+        try:
+            out["columns"] = [str(c) for c in list(value.columns)[:50]]
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(value, (int, float, complex, bool, str, bytes)) or value is None:
+        out["value"] = truncate(repr(value), 200)[0]
+    return out
+
+
+def is_user_variable(name: str, value) -> bool:
+    if name.startswith("_") or name in ("In", "Out", "exit", "quit", "get_ipython"):
+        return False
+    return not isinstance(value, type(sys))  # modules are not variables
+
+
+def show(value, rows: int) -> str:
+    """A text preview of one value: tables show their first rows and column types, arrays show basic statistics,
+    anything else its (truncated) repr."""
+    head = getattr(value, "head", None)
+    if callable(head) and hasattr(value, "shape"):  # pandas DataFrame / Series
+        parts = [f"{_type_name(value)} shape={tuple(value.shape)}"]
+        dtypes = getattr(value, "dtypes", None)
+        if dtypes is not None and hasattr(dtypes, "items"):
+            parts.append("dtypes: " + ", ".join(f"{k}={v}" for k, v in list(dtypes.items())[:50]))
+        elif dtypes is not None:
+            parts.append(f"dtype: {dtypes}")
+        parts.append(head(rows).to_string())
+        return "\n".join(parts)
+    if hasattr(value, "shape") and hasattr(value, "dtype"):  # numpy-like
+        parts = [f"{_type_name(value)} shape={tuple(value.shape)} dtype={value.dtype}"]
+        try:
+            import numpy as np  # only reached when the user's environment has numpy
+            flat = np.asarray(value).ravel()
+            if flat.size and flat.dtype.kind in "biuf":
+                finite = flat[np.isfinite(flat)] if flat.dtype.kind == "f" else flat
+                parts.append(f"min={finite.min() if finite.size else 'nan'} max={finite.max() if finite.size else 'nan'} "
+                             f"nan={int(flat.size - finite.size)}")
+            parts.append(repr(flat[:rows]))
+        except Exception:  # noqa: BLE001
+            parts.append(truncate(repr(value), 2000)[0])
+        return "\n".join(parts)
+    return truncate(repr(value), 5000)[0]
+
+
+# ---------------------------------------------------------------- execution
+
+class Worker:
+    def __init__(self, sock: socket.socket, session: str):
+        self.sock = sock
+        self.rfile = sock.makefile("rb")
+        self.wfile = sock.makefile("wb")
+        self.session = session
+        self.execution_count = 0
+        self.namespace = {"__name__": "__main__", "__builtins__": __builtins__, "In": [""], "Out": {}}
+
+    def send(self, msg_type: str, content: dict, parent: dict, metadata: dict | None = None) -> None:
+        wire.send(self.wfile, wire.message(msg_type, content, parent=parent, session=self.session, metadata=metadata))
+
+    def status(self, state: str, parent: dict) -> None:
+        self.send("status", {"execution_state": state}, parent)
+
+    def run_code(self, code: str, n: int):
+        """Run a cell; when its last statement is an expression, return that value (as IPython does)."""
+        filename = CELL_FILENAME.format(n=n)
+        # register the source so tracebacks can show the failing line (as IPython does)
+        linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
+        tree = ast.parse(code, filename=filename, mode="exec")
+        last = None
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            last = ast.Expression(tree.body.pop().value)
+        if tree.body:
+            exec(compile(tree, filename, "exec"), self.namespace)
+        if last is not None:
+            return True, eval(compile(last, filename, "eval"), self.namespace)
+        return False, None
+
+    def execute(self, msg: dict) -> None:
+        content, meta = msg["content"], msg["metadata"]
+        code = content.get("code", "")
+        silent = bool(content.get("silent", False))
+        if not silent:
+            self.execution_count += 1
+        n = self.execution_count
+        self.status("busy", msg)
+        self.send("execute_input", {"code": code, "execution_count": n}, msg)
+        out_path = meta.get("talo_output")
+        saved = None
+        if out_path:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            saved = (os.dup(1), os.dup(2))
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            os.close(fd)
+        rss_before, started = rss_bytes(), time.time()
+        reply = {"status": "ok", "execution_count": n, "user_expressions": {}, "payload": []}
+        result = None
+        try:
+            has_value, value = self.run_code(code, n)
+            if has_value and value is not None:
+                result = value
+                if not silent:
+                    self.namespace["_"] = value
+                    self.namespace["Out"][n] = value
+            if not silent:
+                self.namespace["In"].append(code)
+        except BaseException as error:  # noqa: BLE001 - report KeyboardInterrupt / SystemExit instead of exiting
+            frames = traceback.TracebackException.from_exception(error)
+            frames.stack = traceback.StackSummary.from_list(
+                [f for f in frames.stack if not f.filename.endswith("talo/worker.py")])  # drop the worker's own frames
+            text, _ = truncate("".join(frames.format()), TRACEBACK_LIMIT)
+            reply = {"status": "error", "execution_count": n, "ename": type(error).__name__,
+                     "evalue": str(error), "traceback": text.splitlines()}
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            if saved:
+                os.dup2(saved[0], 1)
+                os.dup2(saved[1], 2)
+                os.close(saved[0])
+                os.close(saved[1])
+        if reply["status"] == "error":
+            self.send("error", {k: reply[k] for k in ("ename", "evalue", "traceback")}, msg)
+        elif result is not None:
+            data, data_meta = mime_bundle(result)
+            self.send("execute_result", {"execution_count": n, "data": data, "metadata": data_meta}, msg)
+        metrics = {"talo_duration_s": round(time.time() - started, 6), "talo_rss_before": rss_before,
+                   "talo_rss_after": rss_bytes()}
+        self.send("execute_reply", reply, msg, metadata=metrics)
+        self.status("idle", msg)
+
+    def handle(self, msg: dict) -> bool:
+        """Handle one message; return False to exit."""
+        kind = wire.msg_type(msg)
+        if kind == "execute_request":
+            self.execute(msg)
+        elif kind == "kernel_info_request":
+            self.send("kernel_info_reply", {
+                "status": "ok", "protocol_version": wire.PROTOCOL_VERSION, "implementation": "talo",
+                "implementation_version": wire.VERSION, "banner": f"talo worker (Python {sys.version.split()[0]})",
+                "language_info": {"name": "python", "version": sys.version.split()[0], "mimetype": "text/x-python",
+                                  "file_extension": ".py"},
+                "talo_pid": os.getpid(), "talo_executable": sys.executable}, msg)
+        elif kind == "talo_vars_request":
+            pattern = msg["content"].get("pattern")
+            rows = [describe(k, v) for k, v in list(self.namespace.items())
+                    if is_user_variable(k, v) and (not pattern or pattern in k)]
+            self.send("talo_vars_reply", {"status": "ok", "variables": rows, "rss": rss_bytes()}, msg)
+        elif kind == "talo_show_request":
+            name, rows = msg["content"]["name"], int(msg["content"].get("rows", 10))
+            try:
+                value = eval(compile(name, "<talo-show>", "eval"), self.namespace)  # expressions such as df.x, d["k"]
+                self.send("talo_show_reply", {"status": "ok", "summary": describe(name, value),
+                                              "text": show(value, rows)}, msg)
+            except Exception as error:  # noqa: BLE001
+                self.send("talo_show_reply", {"status": "error", "ename": type(error).__name__,
+                                              "evalue": str(error)}, msg)
+        elif kind == "shutdown_request":
+            self.send("shutdown_reply", {"status": "ok", "restart": False}, msg)
+            return False
+        else:
+            self.send("error", {"ename": "UnknownMessage", "evalue": kind, "traceback": []}, msg)
+        return True
+
+    def serve(self) -> None:
+        while True:
+            try:
+                msg = wire.recv(self.rfile)
+            except KeyboardInterrupt:  # interrupt while idle: ignore
+                continue
+            if msg is None:
+                return
+            try:
+                if not self.handle(msg):
+                    return
+            except KeyboardInterrupt:  # interrupt landed between messages
+                continue
+
+
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fd", type=int, required=True)
+    ap.add_argument("--session", default="")
+    args = ap.parse_args(argv)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    sock = socket.socket(fileno=args.fd)
+    sys.argv = [""]  # user code sees the same sys.argv as in an interactive interpreter
+    Worker(sock, args.session).serve()
+
+
+if __name__ == "__main__":
+    # When run by path, sys.path[0] is talo's own directory: replace it with "" (the current directory), as in an
+    # interactive interpreter, so talo's files never shadow the user's modules.
+    sys.path[0] = ""
+    main()
