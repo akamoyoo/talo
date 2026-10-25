@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `import talo` inside a session (in a cell or in a module it imports) gives the session's `talo` helper, also in
+  interpreters without the talo package.
+- `map --cases` also accepts JSON Lines, and reports malformed cases as a usage error.
+
 ## 0.1.0a1 — first release
 
 Everything of the [roadmap](docs/roadmap.md), M0 to M9.

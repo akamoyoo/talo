@@ -124,6 +124,15 @@ def test_progress_and_activity_of_a_running_job(talo):
     assert "talo" not in {v["name"] for v in out["variables"]}
 
 
+def test_import_talo_gives_the_helper(talo, tmp_path):
+    (tmp_path / "helper_user.py").write_text("import talo\n\ndef step(i):\n    talo.progress(i, 2)\n    return talo\n")
+    code = (f"import sys; sys.path.insert(0, {str(tmp_path)!r})\nimport helper_user\n"
+            "t = talo\nimport talo\nfrom talo import record\n"
+            "talo is t and helper_user.step(1) is t and record.__self__ is t")
+    rc, out = run_json(talo, "run", code)
+    assert rc == 0 and out["job"]["result"]["data"]["text/plain"] == "True"
+
+
 def test_output_is_condensed_and_results_bounded(talo):
     code = ("import sys\nfor i in range(100):\n    sys.stdout.write(f'\\rprogress {i}%')\nprint()\n"
             "for _ in range(50):\n    print('same warning')\nprint('end')\n'x' * 50_000")

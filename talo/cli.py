@@ -430,12 +430,30 @@ def cmd_unshare(args):
     emit(args, d, lambda x: print("revoked: " + (", ".join(x["revoked"]) or "nothing")))
 
 
+def parse_cases(text: str) -> list:
+    """Cases of a map: a JSON list, or JSON Lines (one case per non-empty line)."""
+    try:
+        cases = json.loads(text)
+    except json.JSONDecodeError as e:
+        lines = [line for line in text.splitlines() if line.strip()]
+        try:
+            cases = [json.loads(line) for line in lines]
+        except json.JSONDecodeError:
+            raise TaloError("BadArgument", f"--cases is neither a JSON list nor JSON Lines ({e})") from None
+        if len(cases) < 2:
+            raise TaloError("BadArgument", f"--cases is not valid JSON ({e})") from None
+        return cases
+    if not isinstance(cases, list):
+        raise TaloError("BadArgument", f"--cases must be a JSON list (or JSON Lines), not a {type(cases).__name__}")
+    return cases
+
+
 def cmd_map(args):
     code = read_code(args)
     cases = None
     if args.cases:
         text = sys.stdin.read() if args.cases == "-" else (open(args.cases).read() if os.path.exists(args.cases) else args.cases)
-        cases = json.loads(text)
+        cases = parse_cases(text)
     d = call("map", session=session_name(args), code=code, cases=cases, range=args.range, **{"from": args.from_},
              parallel=args.parallel, timeout=args.timeout, memory_limit=parse_size(args.memory_limit),
              case_memory_limit=parse_size(args.case_memory_limit), max_result=args.max_result, key=args.key,
@@ -1366,7 +1384,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("map", cmd_map, "run code once per case, each in a fork of a snapshot, in parallel")
     p.add_argument("code", nargs="?", help="code to run for each case (the variable `case` holds it)")
     p.add_argument("-f", "--file", help="read the code from this file")
-    p.add_argument("--cases", help="JSON list of cases: inline, a file, or - for stdin")
+    p.add_argument("--cases", help="cases as a JSON list or JSON Lines: inline, a file, or - for stdin")
     p.add_argument("--range", type=int, metavar="N", help="cases 0 .. N-1")
     p.add_argument("--from", dest="from_", metavar="SNAPSHOT", help="snapshot to fork (default: the current state)")
     p.add_argument("-j", "--parallel", type=int, default=4, help="cases running at once (default 4)")

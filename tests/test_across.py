@@ -248,3 +248,14 @@ def test_identities_survive_recreation(talo):
     rc, out = run_json(talo, "run", "-s", "w", "talo.record(key='once', v=1)")
     assert out["job"]["result"]["data"]["text/plain"].strip("'") == rid
     assert [r["id"] for r in run_json(talo, "ledger", "-s", "w")[1]["records"]] == [rid]
+
+
+def test_cases_as_json_lines():
+    import pytest
+    from talo.cli import parse_cases
+    from talo.client import TaloError
+    assert parse_cases('{"p": "ts"}\n\n{"p": "pooled"}\n') == [{"p": "ts"}, {"p": "pooled"}]
+    assert parse_cases("[1, 2]") == [1, 2]
+    for bad in ('{"p": 1}', '{"p": 1}\n{oops'):
+        with pytest.raises(TaloError):
+            parse_cases(bad)

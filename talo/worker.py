@@ -1218,6 +1218,9 @@ class Worker:
         self.execution_count = 0
         self.namespace = {"__name__": "__main__", "__builtins__": __builtins__, "In": [""], "Out": {},
                           "display": self.display, "talo": Helper(self)}
+        # `import talo` (in a cell or in a module the session imports) gives this helper, whether or not the
+        # interpreter has the talo package installed; the worker never imports the package itself
+        sys.modules["talo"] = self.namespace["talo"]
         self.parent: dict | None = None    # the execute_request being run, for display_data
         self.out_path: str | None = None   # its output file; images are written next to it
         self.files = 0
