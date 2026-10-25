@@ -433,6 +433,7 @@ class Session:
         self.ephemeral: dict[str, int] = {}          # running map cases and calls: "m3:7" / "c12" -> pid
         self.call_slots = asyncio.Semaphore(CALL_PARALLEL)
         self.on_handoff = None                       # set by the supervisor: run a queued handoff
+        self.on_adopt = None                         # set by the supervisor: switch to a trial's state
         self.on_finish = lambda job: None            # set by the supervisor: fill in the outcome of the job's records  # set by the supervisor: append to the event journal
         self.autosnap: dict | None = None  # {"keep": N} while talo autosnap is on
         self.counts: list = []             # execution counts of finished executions, latest last
@@ -612,7 +613,7 @@ class Session:
                     raise StaleRevision(f"session {self.name} is at revision {self.rev}, not {job.expect_rev}; "
                                         f"base {self.base or 'session start'}, jobs since: {', '.join(since) or 'none'} "
                                         f"(`talo brief` shows the current state)")
-                if job.kind in ("execute", "checkout", "reload"):
+                if job.kind in ("execute", "checkout", "reload", "adopt", "undo"):
                     self.rev += 1
                 job.rev = self.rev
                 self.owners[job.id] = job.owner
@@ -632,13 +633,16 @@ class Session:
                     self._finish(job, "ok", result=await self._checkout(**job.params, owner=job.owner))
                 elif job.kind == "autosnap":
                     self._finish(job, "ok", result=await self._set_autosnap(**job.params))
+                elif job.kind == "adopt":
+                    self._finish(job, "ok", result=await self.on_adopt(job))
                 elif job.kind == "undo":
                     self._finish(job, "ok", result=await self._undo(job))
                 elif job.kind == "handoff":
                     self._finish(job, "ok", result=await self.on_handoff(job))
                 elif job.kind == "fork":  # an internal snapshot of the current state, for map
                     job.handle = await self._fork(f"f{job.id}", strict=False)
-                    self._finish(job, "ok", result={"ref": job.handle.ref, "pid": job.handle.pid})
+                    self._finish(job, "ok", result={"ref": job.handle.ref, "pid": job.handle.pid, "rev": self.rev,
+                                                    "base": self.base, "jobs": list(self.jobs_since_base)})
                 elif job.kind == "reload":
                     if self.state == "dead":
                         raise SessionDead(f"session {self.name} is dead ({self.death})")
@@ -1063,7 +1067,7 @@ class Session:
             job.status, job.finished = "cancelled", time.time()
             job.done.set()
             return "cancelled"
-        if job.status == "running" and job.kind == "execute":
+        if job.status == "running" and job.kind in ("execute", "trial"):
             job.interrupt_requested = True
             if job.phase != "executing" or not job.exec_pid:  # a checkpoint or restore is in progress
                 return "interrupt deferred" if job.phase == "preparing" else "finishing"
@@ -1160,6 +1164,8 @@ class Supervisor:
         self.next_call = 1
         self.grants: dict[int, dict] = {}   # uid -> {"user", "sessions": {name: level}}
         self.shared_server = None
+        self.trials: dict[str, dict] = {}
+        self.next_trial = 1
         self.handoffs: dict[str, dict] = {}
         self.next_handoff = 1   # record id -> record (shared by all sessions)
         self.last_rev: dict[str, int] = {}             # session name -> its revision when it was closed
@@ -1249,6 +1255,7 @@ class Supervisor:
         session.on_record = lambda job, content: self._add_record(content, session, job=job)
         session.on_finish = self._job_outcome
         session.on_handoff = lambda job: self._do_handoff(session, job)
+        session.on_adopt = lambda job: self._do_adopt(session, job)
         session.resolve = lambda ref: self._snapshot(ref, session.name)
         session.on_publish = lambda job, snap: self._register_versions(session, job, snap)
         self.sessions[name] = session
@@ -1305,6 +1312,8 @@ class Supervisor:
 
     async def op_run(self, req):
         session = self._session(req["session"])
+        if req.get("trial"):
+            return await self._start_trial(session, req)
         fingerprint = {"op": "run", "code": req["code"], "expect_rev": req.get("expect_rev"),
                        "atomic": bool(req.get("atomic")), "silent": bool(req.get("silent")),
                        "store_history": req.get("store_history", True), "deadline": req.get("deadline"),
@@ -2182,8 +2191,9 @@ class Supervisor:
         for part in chain + [tail]:
             if isinstance(part, dict):
                 out.append(part)
-            else:
-                out += [records[j] for j in part if j in records]
+            else:  # an adopted trial ran in a fork, but on this lineage it is an execution like any other
+                out += [{**records[j], "kind": "execute", "trial": True} if records[j]["kind"] == "trial" else records[j]
+                        for j in part if j in records]
         return out
 
     async def op_export(self, req):
@@ -2338,6 +2348,172 @@ class Supervisor:
         if not reply.get("ok"):
             raise RuntimeError(f"snapshot {state.ref}: {reply.get('error')}")
         return reply
+
+    # ---------------------------------------------------------------- trials
+
+    def _trial(self, session: Session, name: str) -> dict:
+        for tr in self.trials.values():
+            if tr["session_id"] == session.id and name in (tr["id"], tr["name"]):
+                return tr
+        raise KeyError(f"session {session.name} has no trial {name!r} (`talo trials` lists them)")
+
+    def _trial_view(self, tr: dict) -> dict:
+        return {k: (v.ref if isinstance(v, Snapshot) else v) for k, v in tr.items() if k not in ("job", "task")} | {
+            "job": tr["job"].to_dict()}
+
+    async def _start_trial(self, session: Session, req: dict) -> dict:
+        name = req["trial"]
+        fingerprint = {"code": req["code"], "name": name}
+        key = req.get("key")
+        if key is not None and ("trial", session.id, key) in self.keys:
+            tid, known = self.keys[("trial", session.id, key)]
+            if known != fingerprint:
+                raise ValueError(f"key {key!r} was used for another trial; use a new key")
+            return {**await self._wait(self.trials[tid]["job"], req.get("timeout", 30)), "trial": tid,
+                    "deduplicated": True}
+        if any(tr["session_id"] == session.id and tr["name"] == name and tr["status"] in ("preparing", "running", "ready")
+               for tr in self.trials.values()):
+            raise ValueError(f"session {session.name} already has an open trial {name!r}")
+        tid = f"t{self.next_trial}"
+        self.next_trial += 1
+        job = Job(self._new_job_id(), session.name, req["code"], "", kind="trial", params={"trial": tid},
+                  owner=req.get("owner") or "user", session_id=session.id)
+        job.output = str(session.dir / "jobs" / f"{job.id}.out")
+        Path(job.output).touch()
+        self.jobs[job.id] = job
+        tr = {"id": tid, "name": name, "session": session.name, "session_id": session.id, "status": "preparing",
+              "owner": job.owner, "job": job, "source": None, "source_snapshot": None, "snapshot": None,
+              "created": time.time()}
+        self.trials[tid] = tr
+        if key is not None:
+            self.keys[("trial", session.id, key)] = (tid, fingerprint)
+        tr["task"] = asyncio.create_task(self._run_trial(session, tr))
+        return {**await self._wait(job, req.get("timeout", 30)), "trial": tid}
+
+    async def _run_trial(self, session: Session, tr: dict) -> None:
+        job = tr["job"]
+        fork = await self._submit(session, "fork", owner=job.owner)
+        await fork.done.wait()
+        if fork.status != "ok":
+            tr["status"] = "failed"
+            job.started = time.time()
+            session._finish(job, "error", error={"ename": "TrialNotStarted", "evalue": str((fork.error or {}).get("evalue")),
+                                                 "traceback": []})
+            return
+        source = fork.handle
+        tr["source"] = {k: fork.result[k] for k in ("rev", "base", "jobs")}
+        tr["source_snapshot"] = source
+        source.pins.add(f"trial {tr['id']}")
+        session.internal_snaps.append(source)
+        tr["status"], job.status, job.started, job.phase = "running", "running", time.time(), "executing"
+        channel = None
+        try:
+            channel = await ephemeral.Channel.from_snapshot(source.socket)
+            job.exec_pid = channel.pid
+            session.ephemeral[f"trial {tr['id']}"] = channel.pid
+            got = await channel.execute(job.code, job.output)
+            job.execution_count, job.result = got.get("execution_count"), got.get("result")
+            for m in got["messages"]:
+                if m["header"]["msg_type"] == "talo_record":
+                    self._add_record(m["content"], session, job=job)
+            if got["status"] != "ok":
+                tr["status"] = "failed"
+                session._finish(job, "interrupted" if job.interrupt_requested else "error",
+                                error={k: (got["error"] or {}).get(k) for k in ("ename", "evalue", "traceback")})
+                return
+            sid = f"t{tr['id']}"
+            path = str(socket_for(session.dir / "snapshots" / f"{sid}.sock"))
+            reply, _ = await channel.request("talo_snapshot_request", {"id": sid, "socket": path, "strict": False},
+                                             timeout=120)
+            if reply["content"].get("status") != "ok":
+                raise RuntimeError(f"{reply['content'].get('ename')}: {reply['content'].get('evalue')}")
+            snap = Snapshot(sid, f"trial-{tr['name']}", session.name, path, reply["content"]["pid"], tr["source"]["base"],
+                            [*tr["source"]["jobs"], job.id], reply["content"].get("execution_count", 0),
+                            reply["content"].get("threads", []), f"trial {tr['name']} (job {job.id})", job.owner)
+            snap.hold = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            snap.hold.connect(path)
+            snap.hold.sendall(b'{"op": "hold"}\n')
+            snap.pins.add(f"trial {tr['id']}")
+            session.snapshots[sid] = snap
+            tr["snapshot"], tr["status"] = snap, "ready"
+            session._finish(job, "ok")              # the job's history record, for the lineage after adoption
+            session._record_snapshot(snap)
+        except Exception as error:  # noqa: BLE001
+            tr["status"] = "failed"
+            if not job.done.is_set():
+                session._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error), "traceback": []})
+        finally:
+            job.exec_pid, job.phase = None, None
+            session.ephemeral.pop(f"trial {tr['id']}", None)
+            if channel is not None:
+                await channel.close()
+            if tr["status"] == "failed":
+                self._close_trial(session, tr, "failed")
+            self.emit("trial.finished", session=session.name, trial=tr["id"], name=tr["name"], status=tr["status"])
+
+    def _close_trial(self, session: Session, tr: dict, status: str, keep_snapshot: bool = False) -> None:
+        tr["status"] = status
+        source = tr.get("source_snapshot")
+        if source is not None:
+            source.pins.discard(f"trial {tr['id']}")
+            if source in session.internal_snaps:
+                session.internal_snaps.remove(source)
+            if not source.pins:
+                session._release(source)
+            tr["source_snapshot"] = None
+        snap = tr.get("snapshot")
+        if snap is not None:
+            snap.pins.discard(f"trial {tr['id']}")
+            if not keep_snapshot and not snap.pins and snap.ref != session.base and snap.id in session.snapshots:
+                session.drop(snap)
+
+    async def op_trials(self, req):
+        session = self._session(req["session"])
+        return {"trials": [self._trial_view(tr) for tr in self.trials.values() if tr["session_id"] == session.id]}
+
+    async def op_review(self, req):
+        session = self._session(req["session"])
+        tr = self._trial(session, req["name"])
+        out = {"trial": self._trial_view(tr), "current_rev": session.rev}
+        if tr["status"] == "ready":
+            if req.get("current"):
+                ask_a = lambda op, **kw: self._ask_state(session, op, **kw)  # noqa: E731
+            else:
+                ask_a = lambda op, **kw: self._ask_state(tr["source_snapshot"], op, **kw)  # noqa: E731
+            out["diff"] = await compare_states(ask_a, lambda op, **kw: self._ask_state(tr["snapshot"], op, **kw),
+                                               req.get("max_bytes", DIFF_MAX_BYTES))
+            out["diff_against"] = "current" if req.get("current") else "source"
+        return out
+
+    async def op_adopt(self, req):
+        session = self._session(req["session"])
+        tr = self._trial(session, req["name"])
+        if tr["status"] != "ready":
+            raise RuntimeError(f"trial {tr['name']} is {tr['status']}; only a ready trial can be adopted")
+        return await self._control(session, "adopt", req.get("timeout", 300), req, trial=tr["id"],
+                                   discard=bool(req.get("discard")))
+
+    async def _do_adopt(self, session: Session, job: Job) -> dict:
+        """In the queue: switch the session to a trial's state, if nothing changed since the trial started."""
+        tr = self.trials[job.params["trial"]]
+        if tr["status"] != "ready":
+            raise RuntimeError(f"trial {tr['name']} is {tr['status']}")
+        if session.rev - 1 != tr["source"]["rev"] and not job.params["discard"]:  # this job already counted one
+            raise RuntimeError(f"the session changed since trial {tr['name']} started (revision {tr['source']['rev']} "
+                               f"→ {session.rev - 1}); adopting would discard that work: use --discard, or run the "
+                               "trial again")
+        await session._replace_from(tr["snapshot"])  # the new worker answers before the old one is retired
+        self._close_trial(session, tr, "adopted", keep_snapshot=True)
+        self.emit("trial.adopted", session=session.name, trial=tr["id"], name=tr["name"])
+        return {**session.to_dict(), "adopted": tr["name"]}
+
+    async def op_reject(self, req):
+        session = self._session(req["session"])
+        tr = self._trial(session, req["name"])
+        if tr["status"] in ("preparing", "running"):
+            raise RuntimeError(f"trial {tr['name']} is still {tr['status']}; interrupt job {tr['job'].id} first")
+        self._close_trial(session, tr, "rejected")
+        return {"trial": self._trial_view(tr)}
 
     # ---------------------------------------------------------------- verify
 

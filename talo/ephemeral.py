@@ -146,7 +146,11 @@ class Channel:
             "execute_request", {"code": code, "silent": False, "store_history": True, "user_expressions": {},
                                 "allow_stdin": False, "stop_on_error": False}, metadata={"talo_output": output})
         error = next((m["content"] for m in others if wire.msg_type(m) == "error"), None)
-        return {"status": reply["content"]["status"], "error": error}
+        result = next((m["content"] for m in others if wire.msg_type(m) == "execute_result"), None)
+        return {"status": reply["content"]["status"], "error": error, "execution_count":
+                reply["content"].get("execution_count"),
+                "result": {"data": result["data"], "metadata": result.get("metadata", {})} if result else None,
+                "messages": others}
 
     async def close(self) -> None:
         try:

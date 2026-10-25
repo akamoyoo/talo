@@ -242,7 +242,7 @@ def cmd_run(args):
     ensure_session(name, args.python)
     job = call("run", session=name, code=code, timeout=args.timeout, key=args.key, expect_rev=args.expect_rev,
                atomic=args.atomic, deadline=args.deadline, max_output=parse_size(args.max_output),
-               retain_error=args.retain_error)
+               retain_error=args.retain_error, trial=args.trial)
     show_job(args, job)
     return exit_code(job)
 
@@ -853,6 +853,58 @@ def cmd_verify(args):
     return {"match": 0}.get(d["status"], 1)
 
 
+def cmd_trials(args):
+    def human(d):
+        if not d["trials"]:
+            print("(no trials; `talo run --trial NAME CODE` starts one)")
+        for tr in d["trials"]:
+            src = tr["source"] or {}
+            print(f"{tr['name']:16s} {tr['id']:5s} {tr['status']:10s} job {tr['job']['id']}  from rev {src.get('rev', '-')}"
+                  + (f"  -> {tr['snapshot']}" if tr.get("snapshot") else ""))
+    emit(args, call("trials", session=session_name(args)), human)
+
+
+def cmd_review(args):
+    d = call("review", session=session_name(args), name=args.name, current=args.current)
+
+    def human(x):
+        tr, job = x["trial"], x["trial"]["job"]
+        print(f"trial {tr['name']} ({tr['id']}): {tr['status']}, job {job['id']} {job['status']}, "
+              f"started from rev {(tr['source'] or {}).get('rev')} (the session is at rev {x['current_rev']})")
+        out = call("output", id=job["id"], max_bytes=64 << 10)
+        text, cut = tail_lines(condense(out["text"]), 20)
+        if text.strip():
+            print(("... " if cut else "") + text.rstrip())
+        if job.get("result") and "data" in job["result"]:
+            print(f"result: {job['result']['data'].get('text/plain', '')[:2000]}")
+        if job.get("error"):
+            print(f"error: {job['error'].get('ename')}: {job['error'].get('evalue')}")
+        c = x.get("diff")
+        if c:
+            print(f"changes against the {x['diff_against']} state:")
+            for v in c["added"]:
+                print(f"  + {v['name']}")
+            for v in c["removed"]:
+                print(f"  - {v['name']}")
+            for ch in c["changed"]:
+                print(f"  ~ {ch['name']} ({', '.join(ch['fields'])})")
+            print(f"  ({c['unchanged']} unchanged)")
+    emit(args, d, human)
+
+
+def cmd_adopt(args):
+    d = call("adopt", session=session_name(args), name=args.name, discard=args.discard, expect_rev=args.expect_rev,
+             key=args.key, timeout=args.timeout)
+    if (code := pending(args, d)) is not None:
+        return code
+    emit(args, d, lambda x: print(f"session {x['name']} adopted trial {x['adopted']} (now at {x['base']})"))
+
+
+def cmd_reject(args):
+    emit(args, call("reject", session=session_name(args), name=args.name),
+         lambda d: print(f"rejected trial {d['trial']['name']}"))
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -1015,6 +1067,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deadline", type=float, metavar="SECONDS",
                    help="stop the job after this long (independent of -t, which only bounds the wait)")
     p.add_argument("--max-output", metavar="SIZE", help="stop the job if its output grows past this (e.g. 100M)")
+    p.add_argument("--trial", metavar="NAME",
+                   help="run in a fork of the current state and keep the result aside for review (talo adopt NAME)")
     p.add_argument("--retain-error", action="store_true",
                    help="if the code fails, keep the failed state (with the exception as _talo_error) as a snapshot")
     p.add_argument("--atomic", action="store_true",
@@ -1155,6 +1209,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--type", help="only these event types (comma-separated), e.g. job.finished,map.finished")
     p.add_argument("--limit", type=int, default=100)
     add("resources", cmd_resources, "memory of every session's worker and snapshots, and of the machine")
+    add("trials", cmd_trials, "trials of the session and their status")
+    p = add("review", cmd_review, "a trial's output and result, and what it changed")
+    p.add_argument("name")
+    p.add_argument("--current", action="store_true", help="diff against the current state instead of the trial's source")
+    p = add("adopt", cmd_adopt, "switch the session to a ready trial's state")
+    p.add_argument("name")
+    p.add_argument("--discard", action="store_true", help="adopt even if the session changed since the trial started")
+    p.add_argument("--expect-rev", type=int, metavar="N")
+    p.add_argument("--key", help="idempotency key")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
+    p = add("reject", cmd_reject, "drop a trial")
+    p.add_argument("name")
     p = add("verify", cmd_verify, "replay the lineage of the current state and check it gives the same variables")
     p.add_argument("--cold", action="store_true", help="replay from the start in a fresh interpreter")
     p.add_argument("--from", dest="from_", metavar="SNAPSHOT", help="hot: replay from this snapshot on the lineage")
