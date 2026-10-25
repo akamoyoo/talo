@@ -459,9 +459,14 @@ consumer always knows when it may have missed something.
 
   | Level | Allows |
   |---|---|
-  | `read` | `vars`, `show`, `brief`, `tree`, `diff`, `snaps`, `jobs`, `history`, `ledger`, `events`, `notes` |
+  | `read` | metadata Talo already holds: `ls`, `tree`, `snaps`, `jobs`, `job`, `output`, `history`, `brief` and `vars` (the last summary taken, never a live inspection), `notes`, `ledger`, `events`, `services`, `maps`, `handoffs`, `resume` (without `--branch`), `resources` |
   | `call` | `read`, plus calling the functions the owner exposed (`talo call`, JSON arguments only) |
-  | `run` | everything, including running arbitrary code (equivalent to the owner's account; stated when granted) |
+  | `run` | also running code and everything that inspects or changes live state (`run`, `show`, `diff`, completion, `snap`, `checkout`, `map`, `reload`, `expose`, ...): equivalent to the owner's account, stated when granted |
+
+  Live inspection is not offered at `read` because it calls methods of the owner's objects (properties,
+  `__repr__`, `keys()`, pickling), which may have side effects. Creating, killing and sharing sessions are never
+  offered on the shared socket. A grant belongs to one incarnation of a session: if the session is killed and
+  recreated under the same name, the grant no longer applies.
 
   `talo share -s SESSION --user NAME --level LEVEL` opens a shared socket (`/tmp/talo-shared-UID/…`, in a directory
   others can traverse). Anyone may connect to it, but every connection is identified by its uid (`SO_PEERCRED`) and

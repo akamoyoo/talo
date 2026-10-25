@@ -272,12 +272,17 @@ def visible_only(reply: dict, sessions: set) -> dict:
 
 # What each sharing level allows (see "Sharing a session" in docs/design.md). Operations that name a session are
 # checked against the grant; operations on ids are checked against the session that owns the job, map or call.
-SHARE_READ = {"ping", "ls", "vars", "show", "brief", "tree", "diff", "snaps", "jobs", "job", "output", "history",
-              "ledger", "events", "notes", "services", "maps", "resources", "handoffs", "complete"}
+# Listings: always narrowed to the granted sessions, whatever the request names.
+SHARE_LISTINGS = {"ping", "ls", "tree", "services", "handoffs", "maps", "ledger", "events", "jobs", "resources"}
+# Read: metadata the supervisor already has. No live inspection: completion, show, diff and fresh variable
+# summaries call methods of the owner's objects (properties, __repr__, keys, pickling), so they need `run`.
+SHARE_READ = {"brief", "vars", "snaps", "history", "notes", "job", "output", "resume"}
 SHARE_CALL = SHARE_READ | {"call"}
-SHARE_RUN_EXCLUDED = {"shutdown", "share", "unshare", "shares", "kill", "new"}
+SHARE_RUN = SHARE_CALL | {"run", "interrupt", "snap", "checkout", "drop", "reload", "map", "note", "record", "handoff",
+                          "export", "expose", "unexpose", "show", "diff", "complete"}
 SHARE_LEVELS = ("read", "call", "run")
-SHARE_STATE_PARAMS = {"diff": ("a", "b"), "map": ("from",), "checkout": ("name",), "handoff": ("snap",)}
+SHARE_STATE_PARAMS = {"diff": ("a", "b"), "map": ("from",), "checkout": ("name",), "handoff": ("snap",),
+                      "export": ("snap",)}
 
 
 class Session:
@@ -1003,7 +1008,8 @@ class Supervisor:
 
     async def op_jobs(self, req):
         name, last = req.get("session"), req.get("last")
-        jobs = [j for j in self.jobs.values() if not name or j.session == name]
+        jobs = [j for j in self.jobs.values() if (not name or j.session == name)
+                and ("_visible" not in req or j.session in req["_visible"])]
         return {"jobs": [{**j.to_dict(), "code_preview": j.code[:200]} for j in (jobs[-int(last):] if last else jobs)],
                 "total": len(jobs)}
 
@@ -1057,7 +1063,15 @@ class Supervisor:
         return {**reply, "rev": rev}
 
     async def op_vars(self, req):
-        return await self._vars(self._session(req["session"]), req.get("pattern"))
+        session = self._session(req["session"])
+        if req.get("_cached"):  # a shared reader: the last summary, never a live inspection
+            seen = session.vars_seen
+            if not seen:
+                raise RuntimeError(f"no variable summary of session {session.name} has been taken yet")
+            rows = [v for v in seen["variables"] if not req.get("pattern") or req["pattern"] in v["name"]]
+            return {"status": "ok", "variables": rows, "rev": seen["rev"], "stale": seen["rev"] != session.rev,
+                    "observed_at": seen["time"]}
+        return await self._vars(session, req.get("pattern"))
 
     async def op_show(self, req):
         session = self._session(req["session"])
@@ -1358,6 +1372,8 @@ class Supervisor:
 
     async def op_ledger(self, req):
         recs = list(self.ledger.values())
+        if "_visible" in req:
+            recs = [r for r in recs if r["session"] in req["_visible"] and self.sessions[r["session"]].id == r["session_id"]]
         if req.get("session"):
             recs = [r for r in recs if r["session"] == req["session"]]
         if req.get("owner"):
@@ -1465,7 +1481,8 @@ class Supervisor:
         session = self.sessions[svc["session"]]
         out_dir = session.dir / "calls"
         out_dir.mkdir(exist_ok=True)
-        call = {"id": call_id, "kind": "call", "service": svc["name"], "version": n, "args": args, "status": "running",
+        call = {"id": call_id, "kind": "call", "service": svc["name"], "session": svc["session"], "version": n,
+                "args": args, "status": "running",
                 "owner": req.get("owner") or "user", "started": time.time(), "finished": None, "result": None,
                 "result_error": None, "error": None, "pid": None, "output": str(out_dir / f"{call_id}.out"),
                 "done": asyncio.Event()}
@@ -1614,6 +1631,8 @@ class Supervisor:
         kinds = set(kinds.split(",")) if isinstance(kinds, str) else set(kinds or [])
         deadline = time.monotonic() + float(req.get("wait") or 0)
         while True:
+            if self.events and after < self.events[0]["seq"] - 1:  # overtaken while we waited
+                raise CursorExpired(f"events after {self.epoch}:{after} were dropped from the journal while waiting")
             matched, scanned = [], after
             for e in self.events:
                 if e["seq"] <= after:
@@ -1621,7 +1640,8 @@ class Supervisor:
                 if len(matched) >= limit:
                     break
                 scanned = e["seq"]
-                if (not session or e.get("session") == session) and (not kinds or e["type"] in kinds):
+                if (not session or e.get("session") == session) and (not kinds or e["type"] in kinds) \
+                        and ("_visible" not in req or e.get("session") in req["_visible"]):
                     matched.append(e)
             after = scanned
             left = deadline - time.monotonic()
@@ -1719,7 +1739,7 @@ class Supervisor:
             return d
 
         seen = session.vars_seen
-        if session.state == "idle":
+        if session.state == "idle" and not req.get("_cached"):
             await self._vars(session)
             seen = session.vars_seen
         if seen:
@@ -1892,48 +1912,49 @@ class Supervisor:
         return uid
 
     def _authorize(self, writer: asyncio.StreamWriter, req: dict) -> dict:
-        """Check a request on the shared socket against the peer's grants; returns the request, possibly narrowed to
-        the sessions the peer may see. Every request is recorded in the event journal."""
+        """Check a request on the shared socket against the peer's grants, by the resource it actually acts on;
+        returns the request with internal fields set (``_visible``, ``_cached``). Every request is recorded."""
         uid = self._peer_uid(writer)
         grant = self.grants.get(uid)
         op = req.get("op")
+        req = {k: v for k, v in req.items() if not k.startswith("_")}  # internal fields are ours alone
         if grant is None:
             raise Forbidden(f"uid {uid} has no access to these sessions")
-        req = {**req, "owner": f"{grant['user']}@shared"}
-        sessions = grant["sessions"]
+        user = grant["user"]
+        req["owner"] = f"{user}@shared"
+        # a grant belongs to one incarnation of a session: a session recreated under the same name is not shared
+        levels = {name: g["level"] for name, g in grant["sessions"].items()
+                  if name in self.sessions and self.sessions[name].id == g["id"]}
+        req["_visible"] = sorted(levels)
+        req["_cached"] = True
 
-        def level_of(name: str | None) -> str | None:
-            return sessions.get(name) if name else None
+        def deny(why: str, session=None):
+            self.emit("share.denied", user=user, op=op, session=session)
+            raise Forbidden(f"{user} may not {op}: {why}")
 
-        def allowed(level: str | None) -> bool:
-            if level is None:
-                return False
-            if level == "run":
-                return op not in SHARE_RUN_EXCLUDED
-            return op in (SHARE_CALL if level == "call" else SHARE_READ)
-
+        if op in SHARE_LISTINGS:
+            self.emit("share.request", user=user, op=op)
+            return req
         target = req.get("session")
         if op in ("job", "output", "interrupt"):
             ident = str(req.get("id"))
-            target = (self.calls[ident]["service"].split(".")[0] if ident in self.calls else
+            target = (self.calls[ident]["session"] if ident in self.calls else
                       self.maps[ident].session if ident in self.maps else
                       self.jobs[ident].session if ident in self.jobs else None)
-        elif op == "call":
-            target = str(req.get("service", "")).split(".")[0]
-        elif op in ("diff",):
-            target = req.get("session")
-        if target is None and op in SHARE_READ and op not in ("job", "output"):
-            # listings without a session: only granted sessions are shown
-            if op in ("ls", "tree", "services", "handoffs", "maps", "ledger", "events", "jobs", "resources", "ping"):
-                req["_visible"] = sorted(sessions)
-                self.emit("share.request", user=grant["user"], op=op)
-                return req
-        if not allowed(level_of(target)):
-            self.emit("share.denied", user=grant["user"], op=op, session=target)
-            raise Forbidden(f"{grant['user']} may not {op} " + (f"in session {target}" if target else "here") +
-                            f" (level {level_of(target) or 'none'})")
-        # parameters that name states (snapshots, live workers) must stay inside the granted sessions too
-        for param in SHARE_STATE_PARAMS.get(op, ()):
+        elif op in ("call", "unexpose"):
+            svc = self.services.get(str(req.get("service")))
+            target = svc["session"] if svc else None
+        elif op == "resume" or (op == "handoff" and req.get("close")):
+            h = self.handoffs.get(str(req.get("id") or req.get("close")))
+            target = h["session"] if h else None
+            if op == "resume" and req.get("branch"):
+                deny("creating a session (resume --branch) is not shared; resume without --branch shows the handoff",
+                     target)
+        level = levels.get(target)
+        allowed = {"read": SHARE_READ, "call": SHARE_CALL, "run": SHARE_RUN}.get(level, set())
+        if op not in allowed:
+            deny(f"session {target} is not shared" if level is None else f"needs a higher level than {level}", target)
+        for param in SHARE_STATE_PARAMS.get(op, ()):  # states named by the request stay inside shared sessions
             ref = req.get(param)
             if not ref:
                 continue
@@ -1945,10 +1966,11 @@ class Supervisor:
                     ref_session = self._snapshot(str(ref), target).session
                 except KeyError:
                     ref_session = owner_session or target
-            if ref_session not in sessions:
-                self.emit("share.denied", user=grant["user"], op=op, session=ref_session)
-                raise Forbidden(f"{grant['user']} may not use {ref} (session {ref_session} is not shared)")
-        self.emit("share.request", user=grant["user"], op=op, session=target)
+            if ref_session not in levels:
+                deny(f"{ref} belongs to session {ref_session}, which is not shared", ref_session)
+        if level == "run":
+            req.pop("_cached")  # run is the owner's level: live inspection is allowed
+        self.emit("share.request", user=user, op=op, session=target)
         return req
 
     async def op_share(self, req):
@@ -1959,7 +1981,7 @@ class Supervisor:
         self._session(name)
         uid = pwd.getpwnam(user).pw_uid
         grant = self.grants.setdefault(uid, {"user": user, "sessions": {}})
-        grant["sessions"][name] = level
+        grant["sessions"][name] = {"level": level, "id": self._session(name).id}
         await self._start_shared()
         self.emit("share.granted", user=user, session=name, level=level)
         warning = ("run lets them execute any code as you, with all of your account's access" if level == "run"
@@ -1980,8 +2002,9 @@ class Supervisor:
         return {"revoked": removed}
 
     async def op_shares(self, req):
-        return {"shares": [{"user": g["user"], "uid": uid, "session": s, "level": lvl}
-                           for uid, g in self.grants.items() for s, lvl in g["sessions"].items()],
+        return {"shares": [{"user": g["user"], "uid": uid, "session": s, "level": x["level"],
+                            "current": s in self.sessions and self.sessions[s].id == x["id"]}
+                           for uid, g in self.grants.items() for s, x in g["sessions"].items()],
                 "connect": str(shared_socket_path()) if self.shared_server else None}
 
     async def _start_shared(self) -> None:

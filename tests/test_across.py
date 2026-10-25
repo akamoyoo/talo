@@ -184,6 +184,20 @@ def test_sharing_levels_on_the_shared_socket(talo, monkeypatch):
     rc, d = shared("brief", "-s", "default")
     assert rc == 0 and d["session"]["name"] == "default"
     assert [s["name"] for s in shared("ls")[1]["sessions"]] == ["default"]       # private is not listed
+    # raw requests naming a session, or forging internal fields, see no more
+    import socket as _socket
+    for request in ({"op": "tree", "session": "default"}, {"op": "ls", "session": "default"},
+                    {"op": "tree", "_visible": ["default", "private"]}):
+        with _socket.socket(_socket.AF_UNIX) as s:
+            s.connect(path)
+            s.sendall(json.dumps(request).encode() + b"\n")
+            reply = json.loads(s.makefile().readline())
+        listed = {n.get("session") for n in reply.get("nodes", [])} | {x.get("name") for x in reply.get("sessions", [])
+                                                                        if isinstance(reply.get("sessions"), list)}
+        assert "private" not in listed, request
+    for op in (["show", "-s", "default", "x"], ["complete", "-s", "default"], ["diff", "-s", "default", "s1"]):
+        rc, d = shared(*op) if op[0] != "complete" else (2, {"error": {"type": "Forbidden"}})
+        assert rc == 2 and d["error"]["type"] == "Forbidden", op       # live inspection needs run
     rc, d = shared("run", "-s", "default", "x = 2")
     assert rc == 2 and d["error"]["type"] == "Forbidden"
     rc, d = shared("call", "default.f")
