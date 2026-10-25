@@ -427,6 +427,7 @@ class Session:
         self.autosave_config: dict | None = None   # {"every": seconds, "keep": N}
         self.autosave_rev: int | None = None       # the revision of the last automatic checkpoint
         self.autosave_at = 0.0
+        self.autosaving = False
         self.over_limit: str | None = None  # why the session is over its limit without anything to kill
         self.dir = home() / "sessions" / name
         for sub in ("jobs", "snapshots"):
@@ -1239,6 +1240,7 @@ class Supervisor:
         self.maps: dict[str, MapRun] = {}
         self.next_map = 1
         self.ledger: dict[str, dict] = self._load_ledger()
+        self.store_ops = 0  # saves and restores in progress (store gc refuses meanwhile)
         self.services: dict[str, dict] = {}   # "session.name" -> {"versions": {n: version}, "latest": n}
         self.version_counter: dict[str, int] = {}
         self.calls: dict[str, dict] = {}
@@ -2812,6 +2814,7 @@ class Supervisor:
                                                  "traceback": []})
             return
         source = fork.handle
+        self.store_ops += 1  # garbage collection waits for running saves and restores
         source.pins.add(f"save {job.id}")
         session.internal_snaps.append(source)
         job.status, job.phase = "running", "executing"
@@ -2832,7 +2835,9 @@ class Supervisor:
             if "value" not in meta:
                 raise RuntimeError(f"the save did not report its units: {meta.get('error')}")
             saved = meta["value"]
-            manifest = {"session": session.name, "name": job.params["name"], "created": time.time(),
+            manifest = {"format": 1, "id": wire.new_id(), "session": session.name, "session_id": session.id,
+                        "name": job.params["name"], "created": time.time(), "selection": job.params["names"],
+                        "complete": not saved["skipped"] and not job.params["names"],
                         "auto": job.params["auto"], "owner": job.owner, "rev": fork.result["rev"],
                         "base": fork.result["base"], "jobs_since_base": fork.result["jobs"],
                         "python": session.python, "python_version": saved["python"], "cwd": session.cwd,
@@ -2843,8 +2848,16 @@ class Supervisor:
             d = self._checkpoint_dir(session.name)
             d.mkdir(parents=True, exist_ok=True)
             tmp = d / f".{job.params['name']}.json.tmp"
-            tmp.write_text(json.dumps(manifest, indent=1))
+            with open(tmp, "w") as f:  # the manifest is published last, and durably: then the checkpoint exists
+                f.write(json.dumps(manifest, indent=1))
+                f.flush()
+                os.fsync(f.fileno())
+            if (d / f"{job.params['name']}.json").exists():
+                raise RuntimeError(f"checkpoint {session.name}/{job.params['name']} was created meanwhile")
             os.replace(tmp, d / f"{job.params['name']}.json")
+            dfd = os.open(d, os.O_RDONLY)
+            os.fsync(dfd)
+            os.close(dfd)
             session.last_checkpoint = f"{session.name}/{job.params['name']}"
             self._save_registry()
             job.result = {"checkpoint": session.last_checkpoint, **{k: manifest[k] for k in
@@ -2859,6 +2872,7 @@ class Supervisor:
             if not job.done.is_set():
                 session._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error), "traceback": []})
         finally:
+            self.store_ops -= 1
             session.ephemeral.pop(f"save {job.id}", None)
             job.exec_pid, job.phase = None, None
             if channel is not None:
@@ -2878,15 +2892,27 @@ class Supervisor:
         if target not in self.sessions:
             await self.op_new({"name": target, "python": req.get("python") or manifest["python"],
                                "cwd": manifest["cwd"], "owner": req.get("owner")})
+        if manifest.get("format", 1) != 1:
+            raise ValueError(f"checkpoint {ref} has format {manifest.get('format')}, which this Talo cannot read")
         units = manifest["units"]
         only = req.get("names") or None
+        for u in units:
+            if not re.fullmatch(r"[0-9a-f]{40}", str(u.get("hash"))):
+                raise ValueError(f"checkpoint {ref} lists a malformed unit")
         code = (f"# --- restored from checkpoint {ref}\n"
                 "import json as _talo_json\n"
                 f"talo._load({str(home() / 'store')!r}, _talo_json.loads({json.dumps(json.dumps(units))}), "
                 f"{only!r}, {manifest['modules']!r}, {manifest['versions']!r})")
-        out = await self.op_run({"session": target, "code": code, "timeout": req.get("timeout", 300),
-                                 "owner": req.get("owner"), "key": req.get("key"), "expect_rev": req.get("expect_rev")})
-        return {**out, "checkpoint": ref, "skipped": manifest["skipped"]}
+        self.store_ops += 1
+        try:  # atomic: a unit that fails to load leaves the session as it was
+            out = await self.op_run({"session": target, "code": code, "timeout": req.get("timeout", 300),
+                                     "owner": req.get("owner"), "key": req.get("key"),
+                                     "expect_rev": req.get("expect_rev"), "atomic": True})
+            if out["status"] in ("queued", "running"):
+                await self._wait(self.jobs[out["id"]], None)  # gc stays blocked until the restore is done
+        finally:
+            self.store_ops -= 1
+        return {**out, "checkpoint": ref, "skipped": manifest["skipped"], "complete": manifest.get("complete")}
 
     def _save_registry(self) -> None:
         """sessions.json: what is needed to bring sessions back after a restart (see "talo recover")."""
@@ -2905,9 +2931,23 @@ class Supervisor:
         path = home() / "sessions.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
+    def _last_full_checkpoint(self, session: str) -> str | None:
+        """The latest checkpoint of a session that saved all its variables (a selection is not a recovery point),
+        read from the manifests themselves, so a crash between a manifest and the registry loses nothing."""
+        best = None
+        for path in self._checkpoint_dir(session).glob("*.json"):
+            try:
+                m = json.loads(path.read_text())
+            except ValueError:
+                continue
+            if m.get("selection") is None and (best is None or m["created"] > best["created"]):
+                best = m
+        return f"{session}/{best['name']}" if best else None
+
     def _lost(self) -> list:
         """Sessions an earlier supervisor was running that are gone."""
-        return [{"name": n, **{k: r.get(k) for k in ("python", "cwd", "last_checkpoint")}}
+        return [{"name": n, "python": r.get("python"), "cwd": r.get("cwd"),
+                 "last_checkpoint": self._last_full_checkpoint(n)}
                 for n, r in self._load_registry().items()
                 if r.get("alive") and r.get("epoch") != self.epoch and n not in self.sessions]
 
@@ -2925,9 +2965,10 @@ class Supervisor:
             await self.op_new({"name": name, "python": r["python"], "cwd": r["cwd"], "limits": r.get("limits") or None,
                                "max_output": r.get("max_output"), "memory_limit": r.get("memory_limit"),
                                "owner": req.get("owner")})
-            item = {"session": name, "checkpoint": r.get("last_checkpoint")}
-            if r.get("last_checkpoint"):
-                job = await self.op_restore({"checkpoint": r["last_checkpoint"], "session": name,
+            last = self._last_full_checkpoint(name)
+            item = {"session": name, "checkpoint": last}
+            if last:
+                job = await self.op_restore({"checkpoint": last, "session": name,
                                              "timeout": req.get("timeout", 600), "owner": req.get("owner")})
                 item["job"] = {k: job.get(k) for k in ("id", "status", "error")}
             if r.get("autosave"):
@@ -2950,16 +2991,22 @@ class Supervisor:
             await asyncio.sleep(AUTOSAVE_CHECK)
             for s in list(self.sessions.values()):
                 cfg = s.autosave_config
-                if not cfg or s.state != "idle" or s.rev == s.autosave_rev or s.queue.qsize() or s.pending:
+                if not cfg or s.autosaving or s.state != "idle" or s.rev == s.autosave_rev or s.queue.qsize() or s.pending:
                     continue
                 if time.time() - s.autosave_at < cfg["every"]:
                     continue
-                s.autosave_rev, s.autosave_at = s.rev, time.time()
+                s.autosave_at, s.autosaving = time.time(), True  # one autosave at a time per session
                 try:
-                    await self.op_save({"session": s.name, "name": "auto-" + time.strftime("%Y%m%d-%H%M%S"),
-                                        "auto": True, "timeout": 0, "owner": "autosave"})
+                    out = await self.op_save({"session": s.name, "name": "auto-" + time.strftime("%Y%m%d-%H%M%S"),
+                                              "auto": True, "timeout": None, "owner": "autosave"})
+                    if out["status"] == "ok":
+                        s.autosave_rev = out["result"]["rev"]  # the revision the checkpoint captured
+                    else:
+                        log.warning("autosave of session %s: %s", s.name, (out.get("error") or {}).get("evalue"))
                 except Exception:  # noqa: BLE001
                     log.exception("autosave of session %s failed", s.name)
+                finally:
+                    s.autosaving = False
 
     async def op_checkpoints(self, req):
         root = home() / "checkpoints"
@@ -2982,14 +3029,16 @@ class Supervisor:
     async def op_store_gc(self, req):
         """Delete store units no checkpoint uses (and abandoned temporary ones older than an hour)."""
         import shutil
+        if self.store_ops:
+            raise RuntimeError(f"{self.store_ops} saves or restores are in progress; run gc when they are done")
         store = home() / "store"
         used = set()
         for path in (home() / "checkpoints").glob("*/*.json"):
             used |= {u["hash"] for u in json.loads(path.read_text())["units"]}
         freed, removed = 0, 0
         for unit in store.iterdir() if store.exists() else []:
-            young = time.time() - unit.stat().st_mtime < 3600  # may belong to a save that has not written its manifest
-            if unit.name in used or young:
+            age = time.time() - unit.lstat().st_mtime
+            if unit.name in used or (unit.name.startswith(".tmp-") and age < 3600):
                 continue
             size = sum(f.stat().st_size for f in unit.iterdir() if f.is_file())
             if not req.get("dry_run"):

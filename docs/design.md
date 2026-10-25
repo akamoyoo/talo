@@ -693,17 +693,26 @@ restored 14 variables into research2 (2.4 GB, 2.0s); content verified
   objects) are written next to it as raw bytes, not copied into the pickle stream. Units are stored by content
   (`$TALO_HOME/store/HASH`), so a checkpoint only writes what changed since earlier ones, and checkpoints share
   storage. A checkpoint is a manifest (`checkpoints/SESSION/NAME.json`) listing its units, their variables,
-  sizes and hashes; it is written last, so a checkpoint either exists completely or not at all.
+  sizes and hashes; it is written last, so a checkpoint either exists completely or not at all: unit files, unit directories, the
+  manifest and the directory holding it are each flushed to disk (fsync) before the next step, and an existing
+  manifest is never replaced. The manifest has a format version, an id, the session's incarnation, the revision it
+  captured, the selection, what was skipped and why, and whether it is **complete** (all variables, none
+  skipped). `store gc` refuses to run while saves or restores are in progress.
 - Variables that are the same object, or views of the same NumPy buffer, are saved in one unit, so they are still
-  the same object (or share memory) after restoring. Functions defined in a session's cells are saved by
+  the same object after restoring; a view of a C-contiguous array saved in the same unit is rebuilt as a view of it
+  (offset, shape and strides), so they share memory again. Aliasing hidden deeper (a list held by two
+  dictionaries) is kept within one unit only; identical but independent values stay independent. Functions defined in a session's cells are saved by
   their source and rebuilt in the restored session's namespace; lambdas, closures and classes defined in the session
   are reported as not saved.
 - What cannot be saved is reported with the reason (generators, open files and sockets, locks, objects whose pickling
   fails): `saved: 12, skipped: 2 (gen: cannot pickle generator; conn: socket)`. Modules are not saved; the manifest
   lists the modules the session had imported from its working directory, and `restore` imports them first.
 - `restore CHECKPOINT [VARS...] [--as SESSION | -s SESSION]` loads into a new session (created with the checkpoint's
-  interpreter and directory, or `--python`) or into an existing idle one, as a queued job that counts as a revision
-  and appears in the lineage (`# --- restored from research/panels`). Each unit's hash is checked as it is read; a
+  interpreter and directory, or `--python`) or into an existing idle one, as a queued, atomic job that counts as a revision
+  and appears in the lineage (`# --- restored from research/panels`): if any unit fails to load, the session is
+  left as it was. Restored variables replace variables of the same name. Each unit's hash is checked as it is read
+  (byte integrity only: a checkpoint is a pickle, and loading it runs code, so restore only checkpoints you trust;
+  restoring is not offered on the shared socket); a
   version mismatch of NumPy / pandas is reported. Restored buffers are ordinary writable memory.
 - `talo checkpoints [-s SESSION]` lists checkpoints with sizes and shared storage; `talo checkpoint drop NAME` removes
   a manifest, and `talo store gc` deletes units no manifest uses.
@@ -713,21 +722,24 @@ restored 14 variables into research2 (2.4 GB, 2.0s); content verified
 The supervisor keeps a registry of sessions (`sessions.json`: name, interpreter, directory, limits, autosave
 settings, last checkpoint). After a restart, `talo ls` shows the sessions that were running and are gone, with their
 last checkpoint; `talo recover SESSION` (or `--all`) recreates each with the same interpreter, directory and limits
-and restores its last checkpoint. Notes, ledger records, history and handoffs are already on disk. Snapshots are not
+and restores its last **complete** checkpoint, found from the manifests themselves. Notes, ledger records, history and handoffs are already on disk. Snapshots are not
 recovered: they were memory.
 
 ### Automatic checkpoints: `talo autosave`
 
 `talo autosave on [--every 30m] [--keep 3]` saves the session's variables periodically, when the session is idle and
 something changed since the last checkpoint (its revision moved). Because storage is by content, an autosave writes
-only the variables that changed. The oldest automatic checkpoints beyond `--keep` are dropped (manual ones never).
+only the variables whose content changed (it still has to serialize everything to find out). One autosave runs at
+a time per session, and the next is due when the session's revision moved past the one the last checkpoint
+captured. The oldest automatic checkpoints beyond `--keep` are dropped (manual ones never).
 
 ### Limits
 
 A checkpoint stores values, not processes: threads, open files, network connections, GPU memory and objects of C
 extensions that do not support pickling are not saved. Restoring gives equal values, not the same identities
-across separately saved units. Writing speed is that of the disk; the memory needed to save is small (buffers are
-written in place), while restoring needs the memory of the restored values.
+across separately saved units. Writing speed is that of the disk; buffers are written without being copied, but the fork that writes
+them shares the session's memory copy-on-write, so a session that keeps changing large arrays during a save pays
+for the pages it changes; restoring needs the memory of the restored values.
 
 ## Known limitations
 

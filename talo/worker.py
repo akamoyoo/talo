@@ -593,6 +593,14 @@ def _alias_root(obj):
     return id(base)
 
 
+def _fsync_dir(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def save_units(namespace: dict, names: list, store: str) -> dict:
     """Write the variables ``names`` into the content-addressed ``store``; returns the units and what was skipped.
     Each unit is a directory ``store/HASH`` with ``stream`` (the pickle), ``buffers`` (raw out-of-band buffers)
@@ -625,11 +633,16 @@ def save_units(namespace: dict, names: list, store: str) -> dict:
                     roots = {id(_root(namespace[n])) for n in members if type(namespace[n]).__name__ == "ndarray"}
                     _SavePickler(Tee(), protocol=5, buffer_callback=buffer, roots=roots).dump(
                         {n: namespace[n] for n in sorted(members, key=lambda n: getattr(namespace[n], "base", None) is not None)})
+                    fs.flush()
+                    os.fsync(fs.fileno())
                 fb.flush()
                 os.fsync(fb.fileno())
             digest = _unit_digest(hs, hb)
             with open(os.path.join(tmp, "index.json"), "w") as f:
-                _json.dump({"buffers": sizes, "names": members}, f)
+                _json.dump({"format": 1, "buffers": sizes, "names": members}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            _fsync_dir(tmp)
             final = os.path.join(store, digest)
             size = os.path.getsize(os.path.join(tmp, "stream")) + sum(sizes)
             if os.path.exists(final):  # the same content is stored already
@@ -638,6 +651,7 @@ def save_units(namespace: dict, names: list, store: str) -> dict:
                 units.append({"hash": digest, "names": members, "bytes": size, "new": False})
             else:
                 os.rename(tmp, final)
+                _fsync_dir(store)  # the rename itself survives a crash
                 units.append({"hash": digest, "names": members, "bytes": size, "new": True})
         except Exception as error:  # noqa: BLE001 - this unit is skipped, the others are saved
             import shutil
@@ -651,11 +665,21 @@ def load_units(namespace: dict, store: str, units: list, only: list | None = Non
     import json as _json
     _RESTORE["ns"] = namespace
     loaded, total = [], 0
+    for unit in units:  # checked before anything is unpickled: names, hashes, no link in the way
+        if not re.fullmatch(r"[0-9a-f]{40}", str(unit.get("hash"))) or not all(
+                isinstance(n, str) and n.isidentifier() for n in unit.get("names", [])):
+            raise ValueError(f"malformed checkpoint unit {str(unit)[:200]}")
+        if os.path.islink(os.path.join(store, unit["hash"])) or os.path.islink(store):
+            raise ValueError(f"unit {unit['hash']} is a symbolic link; refusing to load it")
     for unit in units:
         if only and not set(unit["names"]) & set(only):
             continue
         d = os.path.join(store, unit["hash"])
         index = _json.loads(open(os.path.join(d, "index.json")).read())
+        if index.get("format") not in (None, 1) or not all(isinstance(n, int) and n >= 0 for n in index["buffers"]):
+            raise ValueError(f"unit {unit['hash']} has an unknown format or malformed buffer sizes")
+        if os.path.getsize(os.path.join(d, "buffers")) != sum(index["buffers"]):
+            raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: its buffers are truncated")
         with open(os.path.join(d, "stream"), "rb") as f:
             stream = f.read()
         data = bytearray(sum(index["buffers"]))

@@ -84,3 +84,33 @@ def test_autosave_and_gc(talo, talo_home, monkeypatch):
     assert 1 <= len(autos) <= 2
     rc, g = run_json(talo, "store", "gc", "--dry-run")
     assert rc == 0
+
+
+def test_restore_is_atomic_and_recover_uses_complete_checkpoints(talo, talo_home):
+    talo("run", "import numpy as np\na = np.ones(10)\nb = np.zeros(10)")
+    talo("save", "--name", "full")
+    talo("save", "a", "--name", "only_a")                                   # a selection: not a recovery point
+    rc, c = run_json(talo, "checkpoints")
+    flags = {x["name"]: x for x in c["checkpoints"]}
+    assert set(flags) == {"full", "only_a"}
+    manifest = json.loads((talo_home / "checkpoints" / "default" / "full.json").read_text())
+    assert manifest["complete"] and manifest["format"] == 1 and manifest["selection"] is None
+    # corrupt the unit of b: restoring into a session that has a and b leaves it unchanged
+    talo("run", "a = 'kept'\nb = 'kept'")
+    unit_b = [u for u in manifest["units"] if "b" in u["names"]][0]["hash"]
+    (talo_home / "store" / unit_b / "buffers").write_bytes(b"\0" * 79 + b"\1")
+    rc, out = run_json(talo, "restore", "default/full", "-s", "default")
+    assert rc == 1 and out["atomic"]["outcome"] == "restored"
+    assert show(talo, "a") == "'kept'" and show(talo, "b") == "'kept'"
+    assert json.loads(talo("ls", "--json").stdout)["lost"] == []
+
+
+def test_a_malformed_manifest_is_refused(talo, talo_home):
+    talo("run", "x = 1")
+    talo("save", "--name", "m")
+    path = talo_home / "checkpoints" / "default" / "m.json"
+    m = json.loads(path.read_text())
+    m["units"][0]["hash"] = "../../etc"
+    path.write_text(json.dumps(m))
+    rc, out = run_json(talo, "restore", "default/m", "--as", "z")
+    assert rc == 2 and "malformed" in out["error"]["message"]
