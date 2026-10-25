@@ -49,6 +49,7 @@ writes each one to a file next to the job's output file (`ID-N.png`, ...) and li
 | `talo_vars_request` (`pattern`) | `variables`: list of `{name, type, nbytes, shape | len, dtype, columns, value}`; `rss` |
 | `talo_show_request` (`name`: a name, attribute or constant subscript such as `df.x` or `d["k"]`, `rows`) | `summary` (as above), `text` (preview) — or `status: error` with `ename`, `evalue` |
 | `talo_progress` (worker → supervisor, child of the running `execute_request`): `done`, `total`, `note` | – (stored as the job's `progress`) |
+| `talo_reload_request` (`modules`, `changed`, `root`, `dry_run`) | `selected`; unless `dry_run`: `modules` (`module`, `status`: reloaded / unchanged / failed / unsupported, `old_hash`, `new_hash`, `error`), `stale_bindings` (`name`, `kind`: definition / instance, `module`, `attribute`, `rebind`), `scan_scope` |
 | `talo_fingerprint_request` (`names`) | `fingerprints`: `{name: {"hash": hex} \| {"error": text}}` (BLAKE2b of the pickled object; see "Diff" in [design.md](design.md)) |
 | `talo_snapshot_request` (`id`, `socket`: path to listen on, `strict`) | `pid` of the snapshot process, `threads`: names of the other threads present at fork time — or `status: error` (`strict` and other threads exist) |
 
@@ -93,6 +94,7 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `export` | `session`, `snap` (export the path to this snapshot), `all` (every job) | `jobs`: job records in order, each with `code`, `status`, `outputs`, and markers for snapshots (`kind: "snap"`) |
 | `tree` | – | `nodes`: snapshots (`kind: "snapshot"`, as below) and live workers (`kind: "worker"`, `session`, `state`, `base`, `jobs_since_base`), each with `parent` (a snapshot ref or null) |
 | `diff` | `session` (for `@` and bare names), `a`, `b` (default `@`), `max_bytes` (content limit, null for no limit) | `added`, `removed`: variable summaries; `changed`: `{name, a, b, fields}` (`fields` lists the differing summary keys, or `["content"]`); `unchanged`: count; `not_compared`: `{name, reason}` |
+| `reload` | `session`, `modules`, `changed`, `root`, `dry_run`, `timeout`, `expect_rev`, `key` | `{"job": ...}` (a queued job whose `result` is the `talo_reload_reply`); with `dry_run`, only `selected` |
 | `resources` | `session` (optional) | `machine` (`total`, `available`, swap), `sessions`: each with `processes` (worker, snapshots, checkpoint: `pid`, `memory`: `{rss, pss, private_clean, private_dirty}` or null when unknown), `pss_total`, `pss_unknown`, `memory_limit`, `over_limit`; `pss_total`, `sampled_at` |
 | `note` | `session`, `text`, `job` | `note`: `{time, owner, rev, base, job, text}` |
 | `notes` | `session`, `last` | `notes`, `total` |

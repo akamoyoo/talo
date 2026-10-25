@@ -354,7 +354,7 @@ class Session:
                     raise StaleRevision(f"session {self.name} is at revision {self.rev}, not {job.expect_rev}; "
                                         f"base {self.base or 'session start'}, jobs since: {', '.join(since) or 'none'} "
                                         f"(`talo brief` shows the current state)")
-                if job.kind in ("execute", "checkout"):
+                if job.kind in ("execute", "checkout", "reload"):
                     self.rev += 1
                 job.rev = self.rev
                 self.owners[job.id] = job.owner
@@ -366,6 +366,15 @@ class Session:
                     self._finish(job, "ok", result=(await self._snap(**job.params, owner=job.owner)).to_dict())
                 elif job.kind == "checkout":
                     self._finish(job, "ok", result=await self._checkout(**job.params, owner=job.owner))
+                elif job.kind == "reload":
+                    if self.state == "dead":
+                        raise SessionDead(f"session {self.name} is dead ({self.death})")
+                    reply = (await self.request("talo_reload_request", job.params, timeout=600))["content"]
+                    failed = [m for m in reply.get("modules", []) if m["status"] == "failed"]
+                    if failed:
+                        job.error = {"ename": "ReloadFailed", "traceback": [],
+                                     "evalue": "; ".join(f"{m['module']}: {m['error']}" for m in failed)}
+                    self._finish(job, "error" if failed else "ok", result=reply)
             except Exception as error:  # noqa: BLE001 - a failed control job is reported, the session goes on
                 if not job.done.is_set():
                     self._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error),
@@ -804,6 +813,15 @@ class Supervisor:
         lines = path.read_text().splitlines() if path.exists() else []
         return {"history": [json.loads(x) for x in lines[-int(req.get("last", 20)):]]}
 
+    async def _submit_control(self, session: Session, kind: str, timeout: float, req: dict, **params) -> dict:
+        """As _control, but return the job itself (its result also when it failed)."""
+        fingerprint = {"op": kind, "expect_rev": req.get("expect_rev"), **params}
+        if job := self._deduplicated(session, req, fingerprint):
+            return {"job": {**await self._wait(job, timeout), "deduplicated": True}}
+        job = await self._submit(session, kind, owner=req.get("owner"), key=req.get("key"), fingerprint=fingerprint,
+                                 expect_rev=req.get("expect_rev"), **params)
+        return {"job": await self._wait(job, timeout)}
+
     async def _control(self, session: Session, kind: str, timeout: float, req: dict, **params) -> dict:
         fingerprint = {"op": kind, "expect_rev": req.get("expect_rev"),
                        **{k: (v.ref if isinstance(v, Snapshot) else v) for k, v in params.items()}}
@@ -834,6 +852,15 @@ class Supervisor:
         snap = self._snapshot(req["name"], session.name)
         return await self._control(session, "checkout", req.get("timeout", 300), req, snap=snap,
                                    discard=bool(req.get("discard")), save_as=req.get("snap"))
+
+    async def op_reload(self, req):
+        session = self._session(req["session"])
+        params = {"modules": list(req.get("modules") or []), "changed": bool(req.get("changed")),
+                  "root": req.get("root") or session.cwd}
+        if req.get("dry_run"):  # only lists modules: not queued, does not change the revision
+            return await self._ask_idle(session, "talo_reload_request", {**params, "dry_run": True})
+        job = await self._submit_control(session, "reload", req.get("timeout", 300), req, **params)
+        return job
 
     async def op_drop(self, req):
         session = self._session(req["session"])

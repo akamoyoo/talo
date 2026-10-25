@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib
 import importlib.util
 import json
 import linecache
@@ -440,6 +441,111 @@ class Snapshot:
 
 # ---------------------------------------------------------------- execution
 
+# ---------------------------------------------------------------- reload
+
+def _source_hash(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.blake2b(f.read(), digest_size=12).hexdigest()
+    except OSError:
+        return None
+
+
+def _excluded(path: str) -> bool:
+    """Files of installed packages and interpreters, which ``reload --changed`` never selects."""
+    real = os.path.realpath(path)
+    prefixes = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
+    return ("site-packages" in real.split(os.sep) or "dist-packages" in real.split(os.sep)
+            or any(part in (".venv", "venv", ".tox") for part in real.split(os.sep))
+            or any(real.startswith(p + os.sep) for p in prefixes))
+
+
+class Reloader:
+    """Remembers the source hash of each module when it is first seen (after the job that imported it), so that
+    ``reload --changed`` can tell which modules changed on disk since they were loaded."""
+
+    def __init__(self):
+        self.hashes: dict[str, str] = {}
+
+    def record(self) -> None:
+        for name, module in list(sys.modules.items()):
+            path = getattr(module, "__file__", None)
+            if name not in self.hashes and path and path.endswith(".py"):
+                if (h := _source_hash(path)) is not None:
+                    self.hashes[name] = h
+
+    def changed(self, root: str) -> list[str]:
+        root = os.path.realpath(root)
+        out = []
+        for name, module in list(sys.modules.items()):  # import order: dependencies usually come first
+            path = getattr(module, "__file__", None)
+            if not path or not path.endswith(".py") or _excluded(path):
+                continue
+            if not os.path.realpath(path).startswith(root + os.sep):
+                continue
+            if name in self.hashes and _source_hash(path) != self.hashes[name]:
+                out.append(name)
+        return out
+
+    def reload(self, namespace: dict, names: list[str]) -> dict:
+        report, previous = [], {}
+        for name in names:
+            module = sys.modules.get(name)
+            path = getattr(module, "__file__", None) if module else None
+            if module is None:
+                report.append({"module": name, "status": "failed", "error": "not imported in this session"})
+                continue
+            if not path or not path.endswith(".py"):
+                report.append({"module": name, "status": "unsupported", "error": "not a Python source module"})
+                continue
+            old_hash, new_hash = self.hashes.get(name), _source_hash(path)
+            previous[name] = dict(vars(module))
+            cached = getattr(module, "__cached__", None)
+            if cached and old_hash != new_hash:
+                # the .pyc is validated by mtime and size only: an edit within the same second that keeps the size
+                # would otherwise reload the old bytecode
+                try:
+                    os.unlink(cached)
+                except OSError:
+                    pass
+            try:
+                importlib.reload(module)
+            except Exception as error:  # noqa: BLE001 - a syntax or import-time error in the user's module
+                report.append({"module": name, "status": "failed", "old_hash": old_hash, "new_hash": new_hash,
+                               "error": f"{type(error).__name__}: {error}"})
+                continue
+            self.hashes[name] = new_hash
+            report.append({"module": name, "status": "reloaded" if old_hash != new_hash else "unchanged",
+                           "old_hash": old_hash, "new_hash": new_hash})
+        return {"modules": report, "stale_bindings": self.stale(namespace, previous),
+                "scan_scope": "direct_namespace"}
+
+    @staticmethod
+    def stale(namespace: dict, previous: dict) -> list:
+        """Names bound directly to a function or class of a module's previous version, or to an instance of such a
+        class."""
+        old_defs = {}  # id(object) -> (module, attribute)
+        for module_name, attrs in previous.items():
+            current = vars(sys.modules[module_name])
+            for attr, obj in attrs.items():
+                if (isinstance(obj, type) or callable(obj) and hasattr(obj, "__code__")) and current.get(attr) is not obj \
+                        and getattr(obj, "__module__", None) == module_name:
+                    old_defs[id(obj)] = (module_name, attr)
+        out = []
+        for name, value in list(namespace.items()):
+            if name.startswith("_"):
+                continue
+            if id(value) in old_defs:
+                module_name, attr = old_defs[id(value)]
+                out.append({"name": name, "kind": "definition", "module": module_name, "attribute": attr,
+                            "rebind": f"from {module_name} import {attr}" + (f" as {name}" if name != attr else "")})
+            elif id(type(value)) in old_defs:
+                module_name, attr = old_defs[id(type(value))]
+                out.append({"name": name, "kind": "instance", "module": module_name, "attribute": attr,
+                            "rebind": f"recreate {name}: it is an instance of the old {module_name}.{attr}"})
+        return out
+
+
 class Helper:
     """The ``talo`` object in the user's namespace."""
 
@@ -477,6 +583,8 @@ class Worker:
         self.out_path: str | None = None   # its output file; images are written next to it
         self.files = 0
         self.pyplot_patched = False
+        self.reloader = Reloader()
+        self.reloader.record()
 
     # ---------------------------------------------------------------- rich output
 
@@ -595,6 +703,7 @@ class Worker:
                 os.dup2(saved[1], 2)
                 os.close(saved[0])
                 os.close(saved[1])
+        self.reloader.record()
         if reply["status"] == "error":
             self.send("error", {k: reply[k] for k in ("ename", "evalue", "traceback")}, msg)
         elif result is not None:
@@ -662,6 +771,16 @@ class Worker:
             c = msg["content"]
             self.send("complete_reply", complete(self.namespace, c.get("code", ""),
                                                  int(c.get("cursor_pos", len(c.get("code", ""))))), msg)
+        elif kind == "talo_reload_request":
+            c = msg["content"]
+            names = list(c.get("modules") or [])
+            if c.get("changed"):
+                names += [n for n in self.reloader.changed(c.get("root") or os.getcwd()) if n not in names]
+            if c.get("dry_run"):
+                self.send("talo_reload_reply", {"status": "ok", "selected": names, "dry_run": True}, msg)
+            else:
+                self.send("talo_reload_reply", {"status": "ok", "selected": names,
+                                                **self.reloader.reload(self.namespace, names)}, msg)
         elif kind == "talo_fingerprint_request":
             self.send("talo_fingerprint_reply", {"status": "ok", "fingerprints": fingerprints(
                 self.namespace, msg["content"].get("names", []))}, msg)

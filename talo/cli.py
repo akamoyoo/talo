@@ -468,6 +468,34 @@ def cmd_resources(args):
     emit(args, call("resources", session=args.session), human)
 
 
+def cmd_reload(args):
+    if not args.modules and not args.changed:
+        raise TaloError("BadArgument", "name the modules to reload, or use --changed")
+    d = call("reload", session=session_name(args), modules=args.modules, changed=args.changed, root=args.root,
+             dry_run=args.dry_run, timeout=args.timeout, expect_rev=args.expect_rev, key=args.key)
+    if args.dry_run:
+        emit(args, d, lambda x: print("would reload: " + (", ".join(x["selected"]) or "(nothing changed)")))
+        return
+    job = d["job"]
+    if args.json:
+        print(json.dumps(d, ensure_ascii=False, default=str))
+        return exit_code(job)
+    result = job.get("result") or {}
+    if job["status"] in ("running", "queued"):
+        print(status_line(job), file=sys.stderr)
+        return exit_code(job)
+    if not result.get("selected"):
+        print("nothing to reload")
+    for m in result.get("modules", []):
+        print(f"{m['module']:30s} {m['status']}" + (f": {m['error']}" if m.get("error") else ""))
+    for s in result.get("stale_bindings", []):
+        print(f"stale: {s['name']} ({s['kind']} from the old {s['module']}.{s['attribute']}) -> {s['rebind']}")
+    if job.get("error") and not result:
+        print(f"{job['error']['ename']}: {job['error']['evalue']}")
+    print(status_line(job), file=sys.stderr)
+    return exit_code(job)
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -650,6 +678,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", choices=("py", "ipynb"), help="format (default: from the file name, else py)")
     p.add_argument("--snap", metavar="NAME", help="export the path to this snapshot instead")
     p.add_argument("--all", action="store_true", help="every job of the session, including rolled-back ones")
+    p = add("reload", cmd_reload, "reload edited project modules; report names still bound to the old code")
+    p.add_argument("modules", nargs="*", help="modules to reload, in this order")
+    p.add_argument("--changed", action="store_true",
+                   help="also every imported module under --root whose source changed since it was loaded")
+    p.add_argument("--root", help="directory for --changed (default: the session's working directory)")
+    p.add_argument("--dry-run", action="store_true", help="only list the modules that would be reloaded")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
+    p.add_argument("--expect-rev", type=int, metavar="N", help="refuse unless the session is at revision N")
+    p.add_argument("--key", help="idempotency key")
     add("resources", cmd_resources, "memory of every session's worker and snapshots, and of the machine")
     p = add("brief", cmd_brief, "what an agent needs to resume the session's work (state, notes, variables, jobs)")
     p.add_argument("--notes", type=int, default=10, help="most recent notes shown")

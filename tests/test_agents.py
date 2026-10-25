@@ -161,3 +161,29 @@ def test_memory_limit_kills_a_job_that_ignores_the_interrupt_and_atomic_restores
     assert job["status"] == "lost" and job["termination"] == "memory_limit" and job["atomic"]["outcome"] == "restored"
     rc, out = run_json(talo, "run", "-s", "lim", "x")
     assert out["job"]["result"]["data"]["text/plain"] == "1"
+
+
+def test_reload_changed_modules_and_report_stale_bindings(talo, tmp_path):
+    (tmp_path / "factors.py").write_text("def f():\n    return 1\n\nclass Model:\n    pass\n")
+    (tmp_path / ".venv").mkdir()
+    talo("new", "r", "--cwd", str(tmp_path))
+    talo("run", "-s", "r", "import factors\nfrom factors import f\nm = factors.Model()")
+    rc, d = run_json(talo, "reload", "-s", "r", "--changed", "--dry-run")
+    assert rc == 0 and d["selected"] == []
+    (tmp_path / "factors.py").write_text("def f():\n    return 2\n\nclass Model:\n    pass\n")
+    rc, d = run_json(talo, "reload", "-s", "r", "--changed", "--dry-run")
+    assert d["selected"] == ["factors"]
+    rc, d = run_json(talo, "brief", "-s", "r")
+    rev = d["session"]["rev"]
+    rc, d = run_json(talo, "reload", "-s", "r", "--changed")
+    result = d["job"]["result"]
+    assert rc == 0 and d["job"]["rev"] == rev + 1 and result["modules"][0]["status"] == "reloaded"
+    stale = {s["name"]: s for s in result["stale_bindings"]}
+    assert stale["f"]["kind"] == "definition" and stale["f"]["rebind"] == "from factors import f"
+    assert stale["m"]["kind"] == "instance"
+    rc, out = run_json(talo, "run", "-s", "r", "factors.f(), f()")
+    assert out["job"]["result"]["data"]["text/plain"] == "(2, 1)"
+    (tmp_path / "factors.py").write_text("def f(:\n")
+    rc, d = run_json(talo, "reload", "-s", "r", "factors")
+    assert rc == 1 and d["job"]["result"]["modules"][0]["status"] == "failed"
+    assert run_json(talo, "run", "-s", "r", "factors.f()")[1]["job"]["result"]["data"]["text/plain"] == "2"

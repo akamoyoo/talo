@@ -69,7 +69,7 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
 
 ## Status
 
-**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches / `tree` / `diff` (M2) and the interactive prompt, images as files and export (M3) work; tools for agents at scale (M4) are next, then work across sessions (M5: fan-out, sessions as services, an experiment ledger), shared datasets (M6) and Jupyter front ends (M7). Interfaces will change.
+**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches / `tree` / `diff` (M2) and the interactive prompt, images as files and export (M3) and the tools for agents at scale (M4) work: `brief`, notes, atomic runs, retries, revisions, progress, memory limits, `reload`; next is work across sessions (M5: fan-out, sessions as services, an experiment ledger), shared datasets (M6) and Jupyter front ends (M7). Interfaces will change.
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
@@ -146,6 +146,10 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo diff A [B]` | variables added, removed or changed between two snapshots (or a snapshot and the live worker) |
 | `talo attach` | an interactive prompt on the session: completion, history, `%snap` / `%diff` / ...; Ctrl-D detaches |
 | `talo export [-o FILE]` | the code that produced the current state as `.py` or `.ipynb` (`--snap NAME`, `--all`) |
+| `talo brief` / `note TEXT` | resume after losing context: state, notes, variables, recent and running jobs |
+| `talo run --atomic` / `--key K` / `--expect-rev N` | restore on failure; safe retries; refuse if the state changed |
+| `talo resources` | memory (PSS) of every worker and snapshot; `new --memory-limit` sets a soft limit |
+| `talo reload [MODULE] [--changed]` | reload edited modules, report names still bound to old code |
 | `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
 

@@ -11,6 +11,10 @@
 
 ### Added
 
+- M4, agents at scale: `brief`, `note` / `notes`; owners on every request (`--owner`, `$TALO_AGENT`); session
+  revisions and `--expect-rev`; idempotency keys (`--key`) for `run`, `snap`, `checkout`, `reload`; `run --atomic`
+  (internal checkpoint, restored on failure); `talo.progress()` and activity ages; condensed output and bounded
+  results (`--raw`, `--max-result`); `resources` and a soft `--memory-limit`; `reload` with a stale-binding report.
 - `attach`: an interactive prompt on a session (multi-line blocks, tab completion via `complete_request`,
   per-session input history, `%` commands, Ctrl-C interrupts, Ctrl-D detaches), sharing the job queue with other
   clients. Images (`_repr_png_` / `_repr_jpeg_` / `_repr_svg_`, `display()`, matplotlib figures) are saved as files
