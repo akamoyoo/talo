@@ -864,6 +864,15 @@ def cmd_diff(args):
     emit(args, d, human)
 
 
+def cmd_mcp(args):
+    from talo import mcp
+    name = session_name(args)
+    sessions = {s["name"] for s in call("ls")["sessions"]}
+    if name not in sessions:
+        call("new", name=name, python=args.python or sys.executable, cwd=os.getcwd())
+    return mcp.main(name)
+
+
 def cmd_kernel(args):
     from talo import kernel
     return kernel.main(args.connection_file, session_name(args), args.python)
@@ -1087,6 +1096,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("notebook", cmd_notebook, "write the session's code as a notebook that opens attached to the session")
     p.add_argument("-o", "--output", help="file to write (default SESSION.ipynb)")
     p.add_argument("--prefix", help="install the kernelspec under PREFIX/share/jupyter/kernels")
+    p = add("mcp", cmd_mcp, "serve the session's tools to an MCP client over stdio")
+    p.add_argument("--python", help="interpreter if the session has to be created")
     p = add("kernel", cmd_kernel, "run as a Jupyter kernel bridged to a session (started by Jupyter)")
     p.add_argument("-f", "--connection-file", required=True)
     p.add_argument("--python", help="interpreter if the session has to be created")

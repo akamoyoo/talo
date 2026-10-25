@@ -137,3 +137,23 @@ def test_notebook_names_the_session_kernel(talo, tmp_path):
     assert nb.metadata.kernelspec.name == "talo-default"
     assert (tmp_path / "jd" / "kernels" / "talo-default" / "kernel.json").exists()
     assert any("x = 1" in c.source for c in nb.cells if c.cell_type == "code")
+
+
+def test_a_notebook_runs_through_jupyters_kernel_manager(talo, tmp_path, monkeypatch):
+    """The path JupyterLab and VS Code take: KernelManager starts the kernelspec, then the cells are executed."""
+    nbclient = pytest.importorskip("nbclient")
+    import nbformat
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jd"))
+    talo("run", "data = list(range(10))")
+    path = tmp_path / "s.ipynb"
+    assert subprocess.run([sys.executable, "-m", "talo.cli", "notebook", "-o", str(path)], timeout=60,
+                          env={**os.environ}).returncode == 0
+    nb = nbformat.read(path, 4)
+    nb.cells.append(nbformat.v4.new_code_cell("sum(data)"))     # the data is already in memory
+    nb.cells.append(nbformat.v4.new_code_cell("%snap from_notebook"))
+    client = nbclient.NotebookClient(nb, timeout=60, kernel_name="talo-default")
+    client.execute()
+    assert nb.cells[-2].outputs[0]["data"]["text/plain"] == "45"
+    assert "snapshot from_notebook" in nb.cells[-1].outputs[0]["text"]
+    rc = subprocess.run([sys.executable, "-m", "talo.cli", "snaps", "--json"], capture_output=True, text=True)
+    assert "from_notebook" in rc.stdout                            # the session itself, seen from the CLI

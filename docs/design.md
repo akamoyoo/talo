@@ -544,10 +544,15 @@ $ jupyter lab                              # open any .ipynb, pick the kernel "T
 
 ### MCP: `talo mcp`
 
-`talo mcp [-s SESSION]` is a Model Context Protocol server over stdio (JSON-RPC, standard library only). Its tools
+`talo mcp [-s SESSION]` is a Model Context Protocol server over stdio (newline-delimited JSON-RPC, standard library
+only). It implements the lifecycle of MCP revisions 2024-11-05 to 2025-11-25 (`initialize`, `notifications/initialized`,
+`tools/list`, `tools/call`, `ping`); the 2026-07-28 revision, which drops `initialize`, is not yet supported. Requests
+are handled concurrently, so `interrupt` works while a `wait` is pending; end of input detaches and leaves the
+sessions running. Tool results put the data in `structuredContent` with a bounded JSON text copy; failed code is a
+result with `isError`, a job still running is not an error. Its tools
 are the agent-facing operations with the same arguments, results and errors as the CLI's `--json`: `run`, `wait`,
 `interrupt`, `brief`, `vars`, `show`, `snap`, `checkout`, `undo`, `diff`, `map`, `call`, `record`, `ledger`,
-`events`, `note`. Results are bounded as on the CLI. An MCP client that cannot run shell commands can thus use a
+`events`, `note`, `output`. Results are bounded as on the CLI. An MCP client that cannot run shell commands can thus use a
 session as fully as a CLI agent.
 
 ## Known limitations

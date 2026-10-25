@@ -11,6 +11,8 @@
 
 ### Added
 
+- M7: `talo kernel` (a Jupyter kernel bridged to a session; displays in order, magics, persistent across front
+  end restarts), `kernelspec install`, `notebook`, `autosnap` / `undo`, and `talo mcp` (MCP over stdio).
 - M5, across sessions: ephemeral workers and `map` (fan-out of a snapshot under memory limits); services
   (`talo.expose`, `talo call`, versions pinned to snapshots); the experiment ledger (`talo.record`, `ledger`) with
   provenance and outcomes; the event journal (`events`); `handoff` / `resume`; `share` with read / call / run levels.

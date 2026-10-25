@@ -78,7 +78,10 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
   `reload` (M4);
 - work across sessions: `map`, services, the experiment ledger, events, handoffs, sharing (M5).
 
-Next: shared datasets (M6) and Jupyter front ends (M7).
+- Jupyter front ends and MCP: a kernel bridge for JupyterLab / VS Code / nbclient, notebook magics, autosnap and
+  undo, `talo notebook`, `talo mcp` (M7).
+
+Next: trust and safety (M8: verify, trial / adopt, hard limits), then shared datasets (M6).
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
@@ -167,6 +170,7 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo share --user NAME --level read/call/run` | share a session with another user on the machine |
 | `talo notebook -s NAME` / `kernelspec install` | open a session in JupyterLab / VS Code: a notebook of its code, attached to it |
 | `talo autosnap on` / `undo` | a snapshot after every execution; undo the last one (`%undo` in notebooks) |
+| `talo mcp` | the same tools for an MCP client (stdio) |
 | `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
 
