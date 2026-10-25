@@ -9,7 +9,7 @@ license-files = ["LICENSE"]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest", "numpy", "pandas>=3"]
+dev = ["pytest", "numpy", "pandas>=3", "matplotlib", "nbformat"]
 
 [project.scripts]
 talo = "talo.cli:main"

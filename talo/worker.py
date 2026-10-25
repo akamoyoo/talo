@@ -23,6 +23,8 @@ import json
 import linecache
 import os
 import pickle
+import re
+import rlcompleter
 import select
 import signal
 import socket
@@ -65,9 +67,14 @@ def truncate(text: str, limit: int) -> tuple[str, int]:
     return f"{head}\n… [{cut} characters cut] …\n{tail}", cut
 
 
-def mime_bundle(value) -> tuple[dict, dict]:
+BINARY_REPRS = (("_repr_png_", "image/png", ".png"), ("_repr_jpeg_", "image/jpeg", ".jpg"),
+                ("_repr_svg_", "image/svg+xml", ".svg"))
+
+
+def mime_bundle(value, save=None) -> tuple[dict, dict]:
     """(data, metadata): always text/plain; also text/html / text/markdown when the object provides
-    ``_repr_html_`` / ``_repr_markdown_`` (skipped if they fail)."""
+    ``_repr_html_`` / ``_repr_markdown_`` (skipped if they fail). Images (``_repr_png_`` / ``_repr_jpeg_`` /
+    ``_repr_svg_``) are written with ``save(data, suffix) -> path`` and listed in ``metadata["talo_files"]``."""
     data, meta = {}, {}
     try:
         text = repr(value)
@@ -86,7 +93,56 @@ def mime_bundle(value) -> tuple[dict, dict]:
             continue
         if isinstance(out, str):
             data[mime] = truncate(out, RESULT_LIMIT)[0]
+    if save is not None:
+        for method, mime, suffix in BINARY_REPRS:
+            fn = getattr(type(value), method, None)
+            if fn is None:
+                continue
+            try:
+                out = fn(value)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(out, tuple):  # (data, metadata), as IPython allows
+                out = out[0]
+            if isinstance(out, str):
+                out = out.encode()
+            if isinstance(out, bytes) and out:
+                meta.setdefault("talo_files", {})[mime] = save(out, suffix)
     return data, meta
+
+
+# ---------------------------------------------------------------- completion
+
+_KEY = re.compile(r"([A-Za-z_][\w.]*)\[(['\"])([^'\"]*)$")   # d["pre  -> complete the keys of d
+_NAME = re.compile(r"[A-Za-z_][\w.]*$|$")
+
+
+def complete(namespace: dict, code: str, cursor_pos: int) -> dict:
+    """Jupyter ``complete_reply`` content: names and attributes (rlcompleter), and string keys after ``name[\"``.
+    Only plain names and attribute chains are evaluated, so completion never runs a call or an indexing."""
+    before = code[:cursor_pos]
+    if m := _KEY.search(before):
+        matches = []
+        try:
+            obj = eval(m.group(1), namespace)  # a dotted name only (the regex allows nothing else)
+            keys = obj.keys() if hasattr(obj, "keys") else []
+            matches = sorted(k for k in map(str, keys) if k.startswith(m.group(3)))[:500]
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "ok", "matches": matches, "cursor_start": cursor_pos - len(m.group(3)),
+                "cursor_end": cursor_pos, "metadata": {}}
+    token = _NAME.search(before).group(0)
+    completer, matches = rlcompleter.Completer(namespace), []
+    for i in range(1000):
+        try:
+            match = completer.complete(token, i)
+        except Exception:  # noqa: BLE001 - a property raising during attribute listing
+            break
+        if match is None:
+            break
+        matches.append(match)
+    return {"status": "ok", "matches": sorted(set(matches)), "cursor_start": cursor_pos - len(token),
+            "cursor_end": cursor_pos, "metadata": {}}
 
 
 # ---------------------------------------------------------------- variable summaries
@@ -187,7 +243,7 @@ def describe(name: str, value) -> dict:
 
 def is_user_variable(name: str, value) -> bool:
     """Names the user created: not private names, modules, or classes / functions imported from other modules."""
-    if name.startswith("_") or name in ("In", "Out", "exit", "quit", "get_ipython"):
+    if name.startswith("_") or name in ("In", "Out", "exit", "quit", "get_ipython", "display"):
         return False
     if isinstance(value, type(sys)):
         return False
@@ -361,7 +417,54 @@ class Worker:
         self.wfile = sock.makefile("wb")
         self.session = session
         self.execution_count = 0
-        self.namespace = {"__name__": "__main__", "__builtins__": __builtins__, "In": [""], "Out": {}}
+        self.namespace = {"__name__": "__main__", "__builtins__": __builtins__, "In": [""], "Out": {},
+                          "display": self.display}
+        self.parent: dict | None = None    # the execute_request being run, for display_data
+        self.out_path: str | None = None   # its output file; images are written next to it
+        self.files = 0
+        self.pyplot_patched = False
+
+    # ---------------------------------------------------------------- rich output
+
+    def save(self, data: bytes, suffix: str) -> str:
+        self.files += 1
+        path = f"{self.out_path.removesuffix('.out')}-{self.files}{suffix}"
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def display(self, *objs, **_):
+        """As IPython's ``display``: each object becomes a ``display_data`` message; its text goes to the output,
+        its images to files."""
+        for obj in objs:
+            data, meta = mime_bundle(obj, self.save if self.out_path else None)
+            if "talo_files" not in meta:
+                print(data["text/plain"])
+            if self.parent is not None:
+                self.send("display_data", {"data": data, "metadata": meta, "transient": {}}, self.parent)
+
+    def flush_figures(self, *_, **__):
+        """Save and close the open matplotlib figures (Jupyter's inline backend does the same after each cell)."""
+        plt = sys.modules.get("matplotlib.pyplot")
+        if plt is None:
+            return
+        if not self.pyplot_patched:
+            plt.show = self.flush_figures
+            self.pyplot_patched = True
+        if not self.out_path:
+            return
+        import io
+        for num in plt.get_fignums():
+            fig, buf = plt.figure(num), io.BytesIO()
+            try:
+                fig.savefig(buf, format="png", bbox_inches="tight")
+            except Exception as error:  # noqa: BLE001
+                print(f"[talo: figure {num} could not be saved: {type(error).__name__}: {error}]", file=sys.stderr)
+                continue
+            path = self.save(buf.getvalue(), ".png")
+            self.send("display_data", {"data": {"text/plain": repr(fig)}, "metadata": {"talo_files": {"image/png": path}},
+                                       "transient": {}}, self.parent)
+        plt.close("all")
 
     def send(self, msg_type: str, content: dict, parent: dict, metadata: dict | None = None) -> None:
         wire.send(self.wfile, wire.message(msg_type, content, parent=parent, session=self.session, metadata=metadata))
@@ -394,6 +497,7 @@ class Worker:
         self.status("busy", msg)
         self.send("execute_input", {"code": code, "execution_count": n}, msg)
         out_path = meta.get("talo_output")
+        self.parent, self.out_path, self.files = msg, out_path, 0
         saved = None
         if out_path:
             sys.stdout.flush()
@@ -423,6 +527,10 @@ class Worker:
             reply = {"status": "error", "execution_count": n, "ename": type(error).__name__,
                      "evalue": str(error), "traceback": text.splitlines()}
         finally:
+            try:
+                self.flush_figures()  # also after an error, as Jupyter does
+            except Exception:  # noqa: BLE001
+                pass
             sys.stdout.flush()
             sys.stderr.flush()
             if saved:
@@ -433,7 +541,7 @@ class Worker:
         if reply["status"] == "error":
             self.send("error", {k: reply[k] for k in ("ename", "evalue", "traceback")}, msg)
         elif result is not None:
-            data, data_meta = mime_bundle(result)
+            data, data_meta = mime_bundle(result, self.save if out_path else None)
             self.send("execute_result", {"execution_count": n, "data": data, "metadata": data_meta}, msg)
         metrics = {"talo_duration_s": round(time.time() - started, 6), "talo_rss_before": rss_before,
                    "talo_rss_after": rss_bytes()}
@@ -493,6 +601,10 @@ class Worker:
             rows = [describe(k, v) for k, v in list(self.namespace.items())
                     if is_user_variable(k, v) and (not pattern or pattern in k)]
             self.send("talo_vars_reply", {"status": "ok", "variables": rows, "rss": rss_bytes()}, msg)
+        elif kind == "complete_request":
+            c = msg["content"]
+            self.send("complete_reply", complete(self.namespace, c.get("code", ""),
+                                                 int(c.get("cursor_pos", len(c.get("code", ""))))), msg)
         elif kind == "talo_fingerprint_request":
             self.send("talo_fingerprint_reply", {"status": "ok", "fingerprints": fingerprints(
                 self.namespace, msg["content"].get("names", []))}, msg)

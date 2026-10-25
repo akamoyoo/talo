@@ -60,7 +60,8 @@ driven from the shell, plus what Jupyter does not have:
 | Driven from the terminal by agents, non-blocking commands, background jobs | – | ✓ |
 | Structured, truncated output with `--json` | – | ✓ |
 | **Snapshots, rollback and branches of the in-memory state** | – | ✓ |
-| Execution history with memory deltas, export to a replayable script | partial | ✓ |
+| Execution history with memory deltas, export of the code behind the current state (`.py` / `.ipynb`) | partial | ✓ |
+| A human and an agent on the same live session | – | ✓ |
 | Memory accounting and budgets per session | – | ✓ |
 
 Snapshots use copy-on-write `fork()`: taking one costs milliseconds even with tens of gigabytes in memory, and it only
@@ -68,7 +69,7 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
 
 ## Status
 
-**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches / `tree` / `diff` (M2) work; an interactive prompt for humans and export to `.py` / `.ipynb` (M3) are next. Interfaces will change.
+**Pre-alpha.** Resident execution (M1) and snapshots / rollback / branches / `tree` / `diff` (M2) and the interactive prompt, images as files and export (M3) work; Jupyter front ends and MCP (M4) are next. Interfaces will change.
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
@@ -143,6 +144,8 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo snaps` / `drop NAME` | snapshots with their private memory; free one |
 | `talo tree` | all snapshots and workers of all sessions as one tree |
 | `talo diff A [B]` | variables added, removed or changed between two snapshots (or a snapshot and the live worker) |
+| `talo attach` | an interactive prompt on the session: completion, history, `%snap` / `%diff` / ...; Ctrl-D detaches |
+| `talo export [-o FILE]` | the code that produced the current state as `.py` or `.ipynb` (`--snap NAME`, `--all`) |
 | `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
 

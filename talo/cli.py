@@ -63,6 +63,8 @@ def show_job(args, job: dict) -> None:
         print(text.rstrip("\n"))
     if job.get("error"):
         print("\n".join(job["error"].get("traceback") or [f"{job['error'].get('ename')}: {job['error'].get('evalue')}"]))
+    for o in job.get("outputs") or []:
+        print(f"[{o['mime']}: {o['path']}]")
     if job.get("result"):
         print(job["result"]["data"].get("text/plain", ""))
     sys.stdout.flush()  # output first, the status line (stderr) last
@@ -204,6 +206,7 @@ def cmd_vars(args):
             value = f" = {v['value']}" if "value" in v else ""
             size = ("≥ " if v.get("nbytes_partial") else "") + human_bytes(v.get("nbytes"))
             print(f"{v['name']:20s} {v['type']}{shape}{dtype}  {size}{value}")
+        sys.stdout.flush()
         print(f"(worker memory {human_bytes(d.get('rss'))})", file=sys.stderr)
     emit(args, call("vars", session=session_name(args), pattern=args.pattern), human)
 
@@ -259,6 +262,27 @@ def cmd_checkout(args):
 
 def cmd_drop(args):
     emit(args, call("drop", session=session_name(args), name=args.name), lambda d: print(f"dropped {d['dropped']}"))
+
+
+def cmd_attach(args):
+    from talo.attach import Attach
+    return Attach(session_name(args)).loop()
+
+
+def cmd_export(args):
+    from talo import export
+    session = session_name(args)
+    d = call("export", session=session, snap=args.snap, all=args.all)
+    to = args.to or ("ipynb" if args.output and args.output.endswith(".ipynb") else "py")
+    what = "every job" if args.all else (f"the path to snapshot {args.snap}" if args.snap else "lineage of the current state")
+    text = (export.to_ipynb if to == "ipynb" else export.to_py)(d["jobs"], export.header(session, what))
+    if not args.output:
+        sys.stdout.write(text)
+        return
+    with open(args.output, "w") as f:
+        f.write(text)
+    summary = {"path": os.path.abspath(args.output), "format": to, "jobs": len(d["jobs"])}
+    emit(args, summary, lambda x: print(f"wrote {x['path']} ({x['jobs']} records, {x['format']})"))
 
 
 def cmd_tree(args):
@@ -413,6 +437,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--snap", metavar="NAME", help="snapshot the current state under NAME before checking out")
     p = add("drop", cmd_drop, "free a snapshot")
     p.add_argument("name")
+    add("attach", cmd_attach, "an interactive prompt on the session (Ctrl-D detaches; the session keeps running)")
+    p = add("export", cmd_export, "write the code that produced the current state as a .py script or .ipynb notebook")
+    p.add_argument("-o", "--output", help="file to write (default: standard output)")
+    p.add_argument("--to", choices=("py", "ipynb"), help="format (default: from the file name, else py)")
+    p.add_argument("--snap", metavar="NAME", help="export the path to this snapshot instead")
+    p.add_argument("--all", action="store_true", help="every job of the session, including rolled-back ones")
     add("tree", cmd_tree, "all snapshots and live workers of all sessions, as a tree", session=False)
     p = add("diff", cmd_diff, "variables added, removed or changed between two states")
     p.add_argument("a", help="[SESSION:]SNAPSHOT, or @ / SESSION:@ for a live worker")

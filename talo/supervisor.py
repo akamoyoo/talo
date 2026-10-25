@@ -88,12 +88,13 @@ class Job:
     result: dict | None = None  # data of execute_result (a mime bundle); for control jobs, their result
     error: dict | None = None   # ename / evalue / traceback
     metrics: dict = field(default_factory=dict)
+    outputs: list = field(default_factory=list)  # files of rich outputs: {"mime", "path"}
     interrupt_requested: bool = False
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def to_dict(self) -> dict:
         out = {k: getattr(self, k) for k in ("id", "session", "kind", "status", "submitted", "started", "finished",
-                                            "execution_count", "result", "error", "metrics", "output")}
+                                            "execution_count", "result", "error", "metrics", "output", "outputs")}
         out["elapsed_s"] = round((self.finished or time.time()) - (self.started or time.time()), 3) if self.started else None
         return out
 
@@ -158,7 +159,7 @@ class Session:
     async def start(self) -> None:
         """Start a fresh worker process."""
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        env = {**os.environ, **self.env, "PYTHONUNBUFFERED": "1"}
+        env = {"MPLBACKEND": "Agg", **os.environ, **self.env, "PYTHONUNBUFFERED": "1"}  # figures become files
         with open(self.dir / "worker.log", "ab") as errlog:
             proc = await asyncio.create_subprocess_exec(
                 self.python, str(WORKER), "--fd", str(child.fileno()), "--session", self.name,
@@ -314,6 +315,10 @@ class Session:
                     job.execution_count = got["content"].get("execution_count")
                 elif kind == "execute_result":
                     job.result = {"data": got["content"]["data"], "metadata": got["content"].get("metadata", {})}
+                    job.outputs += [{"mime": m, "path": p} for m, p in job.result["metadata"].get("talo_files", {}).items()]
+                elif kind == "display_data":
+                    job.outputs += [{"mime": m, "path": p}
+                                    for m, p in got["content"].get("metadata", {}).get("talo_files", {}).items()]
                 elif kind == "error":
                     job.error = dict(got["content"])
                 elif kind == "execute_reply":
@@ -615,6 +620,48 @@ class Supervisor:
         snap = session.find(req["name"])
         session.drop(snap)
         return {"dropped": snap.ref}
+
+    async def op_complete(self, req):
+        return await self._ask_idle(self._session(req["session"]), "complete_request",
+                                    {"code": req["code"], "cursor_pos": req.get("cursor_pos", len(req["code"]))})
+
+    # ---------------------------------------------------------------- export
+
+    def _records(self) -> dict:
+        """Every job record of every session's history, by job id."""
+        records = {}
+        for path in (home() / "sessions").glob("*/history.jsonl"):
+            for line in path.read_text().splitlines():
+                rec = json.loads(line)
+                records[rec["id"]] = rec
+        return records
+
+    async def op_export(self, req):
+        """The job records that produced a state, oldest first (see "export" in docs/design.md)."""
+        session = self._session(req["session"])
+        records = self._records()
+        if req.get("all"):
+            path = session.dir / "history.jsonl"
+            return {"jobs": [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []}
+        snaps = {r["result"]["ref"]: r for r in records.values() if r["kind"] == "snap" and r["status"] == "ok"}
+        if req.get("snap"):
+            base, tail = self._snapshot(req["snap"], session.name).ref, []
+        else:
+            base, tail = session.base, list(session.jobs_since_base)
+        chain = []
+        while base:
+            snap = snaps.get(base)
+            if snap is None:
+                raise KeyError(f"no history record for snapshot {base}")
+            chain = [snap["result"]["jobs"], snap] + chain
+            base = snap["result"]["parent"]
+        out = []
+        for part in chain + [tail]:
+            if isinstance(part, dict):
+                out.append(part)
+            else:
+                out += [records[j] for j in part if j in records]
+        return {"jobs": out}
 
     async def op_tree(self, req):
         nodes = []
