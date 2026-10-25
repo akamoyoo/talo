@@ -221,6 +221,81 @@ $ talo export --all                          # every job, in order, including ro
 - `.ipynb` is nbformat 4.5, written with the standard library. Outputs come from the job records and output files:
   streams (truncated to their last 100 KB, with a note), results, errors and saved images (embedded).
 
+## Agents at scale (M4)
+
+Agents lose their context (compaction, a new subagent), retry shell calls that timed out, run in parallel on one
+session, and share machines with other people. M4 makes each of these safe and cheap.
+
+### Resuming: `talo brief` and `talo note`
+
+```console
+$ talo brief                       # what a fresh agent needs to continue, in under ~8 KB
+session default  idle  rev 42  base loaded (default:s1)  4 jobs since  memory 31.2 GB (private 1.1 GB)
+notes
+  [rev 12 · agent-a] goal: find intraday factors that survive a 5-minute delay
+  [rev 40 · agent-a] gap momentum dies after the first 30 minutes; next: test sector-relative version
+snapshots  loaded (default:s1) "panels 2021-2024"  ·  clean (default:s2)
+variables (largest 15 of 37)  panel DataFrame (48M, 31) 28.4 GB · ...
+recent jobs  #41 ok 3.2s  ic = evaluate(gap_mom)  ·  #42 error 0.1s  KeyError: 'sector'
+running      #43 running 12m, progress 61% (412/672 days), last output 3s ago
+```
+
+- `talo note TEXT [--job ID]` appends a note to the session (`notes.jsonl`): time, owner, revision, base and the job
+  it refers to. `talo notes` lists them; `brief` shows the most recent. Notes are kept with the session's history,
+  so they survive rollbacks, and `export` writes them as comments.
+- `brief --json` returns the same fields, each list bounded, with counts of what was left out.
+
+### Several agents and retries: owners, keys and revisions
+
+- **Owner.** Every request carries an owner: `--owner NAME`, else `$TALO_AGENT`, else `user`. Jobs, snapshots and notes
+  record it, and listings show it. `checkout` that would discard jobs of another owner names them in its refusal.
+- **Revision.** Each session has a revision number that increases whenever its state may change (an execution or a
+  checkout). `run --expect-rev N` (and `checkout --expect-rev N`) is refused, when the job starts, if the revision is
+  no longer `N`, with the current revision and what changed. An agent that planned against a state can therefore not
+  act on a state someone else has changed in the meantime.
+- **Idempotency key.** `run --key K` returns the existing job when a job with key `K` was already submitted to the
+  session (with the same code; different code under the same key is an error). A shell call that timed out after
+  submitting can simply be retried. Keys are kept for the lifetime of the supervisor.
+
+### Failing without leaving half a mutation: `run --atomic`
+
+`run --atomic CODE` takes a temporary snapshot first. If the code fails or is interrupted, the session checks out
+that snapshot, so the state is exactly as before the job; on success the snapshot is dropped. The job records
+`rolled_back: true`. The cost is one snapshot (milliseconds) and the pages the job modified. Side effects outside the
+process are not undone.
+
+### Progress and liveness
+
+User code can call `talo.progress(done, total=None, note="")` (a `talo` object is available in the namespace, as
+`display` is). The job then reports `progress` (`done`, `total`, `note`, time); every job also reports
+`last_output_s`: seconds since its output file or its progress last changed. `jobs` and `brief` show both, so an
+agent can tell a slow computation from a stuck one without reading the output.
+
+### Output that respects the context window
+
+The output shown by `run`, `wait` and `tail` (not the file itself) is condensed: for lines rewritten with carriage
+returns (progress bars) only the final state is kept, and runs of identical lines are folded into one with a count
+(`[... repeated 120 times]`). Results are cut to `--max-result` characters (default 10 000) with a note saying where
+the full text is. `--raw` shows the output unchanged.
+
+### Resources on shared machines
+
+- `talo resources` lists, per session, the worker's and each snapshot's private memory (pages only it holds), the
+  memory they share, the machine's available memory and the memory used by other users' processes. Shared pages are
+  counted once, so the numbers add up.
+- `new --memory-limit SIZE` bounds a session's private memory (worker plus snapshots). The supervisor checks it
+  twice a second; a worker over the limit is killed by Talo (not by the kernel, which may choose another process), its
+  job ends as `killed: memory limit`, and with `--on-limit rollback` the session checks out its base snapshot. The
+  limit is enforced by polling, so a very fast allocation can overshoot between two checks; a cgroup limit (for
+  example `systemd-run --user -p MemoryMax=`) remains the hard guarantee.
+
+### Editing code while data stays loaded: `talo reload`
+
+`talo reload [MODULE ...]` reloads project modules (`importlib.reload`). Without arguments it reloads every imported
+module whose file is under the session's working directory and changed since it was loaded. The report lists objects
+in the namespace still bound to the old code: instances of old classes and functions imported by name before the
+reload (`from factors import f` keeps the old `f`), with the command to rebind them.
+
 ## Known limitations
 
 - Linux only (relies on `fork`, `/proc`, Unix sockets).
