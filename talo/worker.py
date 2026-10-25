@@ -361,10 +361,31 @@ def fingerprint(value) -> dict:
         return False  # out of band: not written into the stream
 
     try:
-        pickle.Pickler(_HashWriter(h), protocol=5, buffer_callback=buffer).dump(value)
+        _CodePickler(_HashWriter(h), protocol=5, buffer_callback=buffer).dump(value)
     except Exception as error:  # noqa: BLE001
         return {"error": f"cannot be pickled ({type(error).__name__})"}
     return {"hash": h.hexdigest()}
+
+
+def _code_key(code) -> tuple:
+    """What a code object does, without where it was written: replayed cells have other names and line numbers."""
+    consts = tuple(_code_key(c) if hasattr(c, "co_code") else repr(c) for c in code.co_consts)
+    return (code.co_name, code.co_code, consts, code.co_names, code.co_varnames, code.co_freevars)
+
+
+class _CodePickler(pickle.Pickler):
+    """Functions and classes defined in the session cannot be pickled by reference (they are not importable): they
+    are fingerprinted by their code instead."""
+
+    def reducer_override(self, obj):
+        import types
+        if isinstance(obj, types.FunctionType) and obj.__module__ == "__main__":
+            return str, (repr(("function", obj.__qualname__, _code_key(obj.__code__), obj.__defaults__,
+                                obj.__kwdefaults__)),)
+        if isinstance(obj, type) and obj.__module__ == "__main__":
+            methods = sorted((k, _code_key(v.__code__)) for k, v in vars(obj).items() if hasattr(v, "__code__"))
+            return str, (repr(("class", obj.__qualname__, [b.__qualname__ for b in obj.__bases__], methods)),)
+        return NotImplemented
 
 
 def fingerprints(namespace: dict, names: list) -> dict:

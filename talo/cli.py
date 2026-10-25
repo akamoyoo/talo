@@ -866,7 +866,8 @@ def cmd_trials(args):
 
 
 def cmd_review(args):
-    d = call("review", session=session_name(args), name=args.name, current=args.current)
+    d = call("review", session=session_name(args), name=args.name, current=args.current,
+             max_bytes=None if args.content else parse_size(args.max_bytes))
 
     def human(x):
         tr, job = x["trial"], x["trial"]["job"]
@@ -890,6 +891,9 @@ def cmd_review(args):
             for ch in c["changed"]:
                 print(f"  ~ {ch['name']} ({', '.join(ch['fields'])})")
             print(f"  ({c['unchanged']} unchanged)")
+            for n in c["not_compared"]:  # never let "unchanged" hide what was not looked at
+                why = f"over {human_bytes(c['max_bytes'])}" if n["reason"] == "size" else n["reason"]
+                print(f"  ? {n['name']} not compared ({why}; --max-bytes or --content compares it)")
     emit(args, d, human)
 
 
@@ -1306,6 +1310,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("review", cmd_review, "a trial's output and result, and what it changed")
     p.add_argument("name")
     p.add_argument("--current", action="store_true", help="diff against the current state instead of the trial's source")
+    p.add_argument("--max-bytes", default="256M", help="compare content only for variables up to this size")
+    p.add_argument("--content", action="store_true", help="compare the content of all variables")
     p = add("adopt", cmd_adopt, "switch the session to a ready trial's state")
     p.add_argument("name")
     p.add_argument("--discard", action="store_true", help="adopt even if the session changed since the trial started")

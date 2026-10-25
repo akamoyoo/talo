@@ -1485,6 +1485,7 @@ class Supervisor:
         if before is not None and after is not None:
             cpu = round(100 * (after - before) / os.sysconf("SC_CLK_TCK") / (time.monotonic() - t0), 1)
         stack = stack_path.read_text(errors="replace")[size:] if stack_path.exists() else ""
+        stack = "\n".join(line for line in stack.splitlines() if str(WORKER) not in line)  # the user's frames only
         status = {}
         try:
             for line in Path(f"/proc/{pid}/status").read_text().splitlines():
@@ -1511,7 +1512,8 @@ class Supervisor:
                 cmd = Path(f"/proc/{c}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
             except OSError:
                 continue
-            children.append({"pid": c, "cmdline": cmd[:200]})
+            if cmd:  # an empty command line is a zombie, already finished
+                children.append({"pid": c, "cmdline": cmd[:200]})
         return {"job": job.id, "pid": pid, "elapsed_s": round(time.time() - (job.started or time.time()), 1),
                 "cpu_percent": cpu, "status": status, "wchan": wchan, "io": io, "children": children,
                 "stack": stack[-20_000:], "progress": job.progress,
