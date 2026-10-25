@@ -6,10 +6,7 @@
       <stop offset="1" stop-color="#F59E0B"/>
     </radialGradient>
   </defs>
-  <!-- smoke: something is running inside -->
-  <circle cx="92" cy="15" r="4" fill="#9CA3AF"/>
-  <circle cx="99" cy="6" r="2.6" fill="#9CA3AF"/>
-  <!-- chimney and house -->
+  <!-- house and chimney -->
   <rect x="84" y="22" width="13" height="24" rx="2" fill="#1F2937"/>
   <path d="M64 16 L115 57 Q119 61 114 61 L105 61 L105 106 Q105 113 98 113 L30 113 Q23 113 23 106 L23 61 L14 61 Q9 61 13 57 Z"
         fill="#1F2937"/>
