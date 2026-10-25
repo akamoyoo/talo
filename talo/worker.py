@@ -373,6 +373,17 @@ def _code_key(code) -> tuple:
     return (code.co_name, code.co_code, consts, code.co_names, code.co_varnames, code.co_freevars)
 
 
+def _function_key(fn):
+    """A function's identity for comparisons: its source when known (bytecode is not stable: CPython compiles the
+    same function differently depending on what else is in the cell), else its code."""
+    import inspect
+    import textwrap
+    try:
+        return textwrap.dedent(inspect.getsource(fn))
+    except (OSError, TypeError):
+        return _code_key(fn.__code__)
+
+
 class _CodePickler(pickle.Pickler):
     """Functions and classes defined in the session cannot be pickled by reference (they are not importable): they
     are fingerprinted by their code instead."""
@@ -380,10 +391,10 @@ class _CodePickler(pickle.Pickler):
     def reducer_override(self, obj):
         import types
         if isinstance(obj, types.FunctionType) and obj.__module__ == "__main__":
-            return str, (repr(("function", obj.__qualname__, _code_key(obj.__code__), obj.__defaults__,
+            return str, (repr(("function", obj.__qualname__, _function_key(obj), obj.__defaults__,
                                 obj.__kwdefaults__)),)
         if isinstance(obj, type) and obj.__module__ == "__main__":
-            methods = sorted((k, _code_key(v.__code__)) for k, v in vars(obj).items() if hasattr(v, "__code__"))
+            methods = sorted((k, _function_key(v)) for k, v in vars(obj).items() if hasattr(v, "__code__"))
             return str, (repr(("class", obj.__qualname__, [b.__qualname__ for b in obj.__bases__], methods)),)
         return NotImplemented
 
@@ -536,7 +547,9 @@ def _rebuild_function(name: str, source: str):
     """Unpickling a function saved by its source: run the source in the session's namespace, so its globals are
     the session's."""
     ns = _RESTORE["ns"]
-    exec(compile(source, f"<talo-restored-{name}>", "exec"), ns)
+    filename = f"<talo-restored-{name}>"
+    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)  # for tracebacks
+    exec(compile(source, filename, "exec"), ns)
     return ns[name]
 
 
