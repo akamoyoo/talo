@@ -21,6 +21,7 @@ Layout of ``TALO_HOME`` (default ``~/.talo``)::
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from talo.paths import home, socket_for, socket_path
 
 log = logging.getLogger("talo")
 WORKER = Path(__file__).with_name("worker.py")
+EVENTS_KEPT = 100_000  # events kept in the journal (older cursors are refused with CursorExpired)
 BRIEF_MAX_BYTES = 16_000  # upper bound for the serialized brief
 NOTE_PREVIEW = 500  # characters of each note shown by brief (talo notes shows them in full)
 DIFF_MAX_BYTES = 256 << 20  # variables larger than this are compared by summary only, unless the request says otherwise
@@ -74,6 +76,12 @@ def memory(pid: int | None) -> dict | None:
     except OSError:
         return None
     return out or None
+
+
+def case_seed(map_id: str, index: int) -> int:
+    """A seed per map case: forks inherit identical random generator states, so cases should seed from this."""
+    import hashlib
+    return int.from_bytes(hashlib.blake2b(f"{map_id}:{index}".encode(), digest_size=4).digest(), "little")
 
 
 def machine_memory() -> dict:
@@ -169,6 +177,7 @@ class Snapshot:
     message: str = ""
     owner: str = "user"
     created: float = field(default_factory=time.time)
+    pins: set = field(default_factory=set)  # holders that need this snapshot alive (maps, service versions, handoffs)
     hold: socket.socket | None = field(default=None, repr=False)
 
     @property
@@ -178,6 +187,7 @@ class Snapshot:
     def to_dict(self) -> dict:
         return {"id": self.id, "name": self.name, "session": self.session, "ref": self.ref, "parent": self.parent,
                 "pid": self.pid, "created": self.created, "message": self.message, "owner": self.owner,
+                "pins": sorted(self.pins),
                 "execution_count": self.execution_count, "jobs": self.jobs, "threads": self.threads,
                 "private_bytes": private_dirty(self.pid), "alive": private_dirty(self.pid) is not None}
 
@@ -197,7 +207,8 @@ class MapRun:
     json_limit: int
     owner: str
     dir: Path
-    status: str = "running"   # running -> ok (all cases ran) / interrupted / error
+    status: str = "running"   # running -> finished (every case ran) / interrupted / error
+    blocked: str | None = None  # why no further case is starting right now
     rows: dict = field(default_factory=dict)      # index -> result row
     running: dict = field(default_factory=dict)   # index -> pid
     interrupt_requested: bool = False
@@ -210,7 +221,7 @@ class MapRun:
         for r in self.rows.values():
             counts[r["status"]] = counts.get(r["status"], 0) + 1
         ordered = [self.rows[i] for i in sorted(self.rows)]
-        return {"id": self.id, "kind": "map", "session": self.session, "status": self.status, "from": self.snap.ref if self.owns_snap else f"{self.snap.name} ({self.snap.ref})",
+        return {"id": self.id, "kind": "map", "session": self.session, "status": self.status, "blocked": self.blocked, "from": self.snap.ref if self.owns_snap else f"{self.snap.name} ({self.snap.ref})",
                 "cases": len(self.cases), "finished_cases": len(self.rows), "running": sorted(self.running),
                 "counts": counts, "owner": self.owner, "started": self.started, "finished": self.finished,
                 "elapsed_s": round((self.finished or time.time()) - self.started, 3),
@@ -223,6 +234,10 @@ class SessionDead(RuntimeError):
 
 
 class StaleRevision(RuntimeError):
+    pass
+
+
+class CursorExpired(RuntimeError):
     pass
 
 
@@ -255,6 +270,7 @@ class Session:
         self.id = wire.new_id()[:12]        # unique per incarnation: a recreated session with the same name is another
         self.rev = 0                        # increases whenever the state may change (execution, checkout, reload)
         self.owners: dict[str, str] = {}    # job id -> owner, for refusals that name whose work would be lost
+        self.emit = lambda event_type, /, **fields: None  # set by the supervisor: append to the event journal
         self.checkpoint: Snapshot | None = None  # the internal checkpoint of a running --atomic job
         self.vars_seen: dict | None = None  # the last variable summary: {"rev", "time", "variables"} (for brief)
         self.tasks: list[asyncio.Task] = []
@@ -377,6 +393,7 @@ class Session:
         self.death = death
         self.state = "dead"
         log.warning("session %s: %s", self.name, self.death)
+        self.emit("session.died", session=self.name, death=death)
         for q in list(self.waiters.values()):
             await q.put(None)
 
@@ -447,8 +464,13 @@ class Session:
                     self._finish(job, "error" if failed else "ok", result=reply)
             except Exception as error:  # noqa: BLE001 - a failed control job is reported, the session goes on
                 if not job.done.is_set():
-                    self._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error),
-                                                      "traceback": []})
+                    try:
+                        self._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error),
+                                                          "traceback": []})
+                    except Exception:  # noqa: BLE001 - the queue must survive a failure to record a job
+                        log.exception("session %s: could not finish job %s", self.name, job.id)
+                        job.status = "error"
+                        job.done.set()
             finally:
                 self.current = None
                 if self.state != "dead":
@@ -563,7 +585,6 @@ class Session:
             job.error = error
         if result is not None:
             job.result = result
-        job.done.set()
         record = {k: v for k, v in job.to_dict().items() if k != "result"}
         record["code"] = job.code
         if job.kind == "execute":
@@ -572,6 +593,9 @@ class Session:
             record["result"] = job.result
         with open(self.dir / "history.jsonl", "a") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        job.done.set()  # the record is written first: whoever wakes up can read it
+        self.emit("job.finished", session=self.name, job=job.id, kind=job.kind, status=status, owner=job.owner,
+                  rev=job.rev)
 
     # ---------------------------------------------------------------- snapshots
 
@@ -642,6 +666,7 @@ class Session:
         self.next_snapshot += 1
         self.snapshots[sid] = snap
         self.base, self.jobs_since_base = snap.ref, []
+        self.emit("snapshot.created", session=self.name, snapshot=snap.ref, name=snap.name, owner=owner)
         return snap
 
     async def _fork(self, sid: str, strict: bool, *, name: str | None = None, message: str = "",
@@ -700,6 +725,7 @@ class Session:
     def drop(self, snap: Snapshot) -> None:
         self._release(snap)
         self.snapshots.pop(snap.id, None)
+        self.emit("snapshot.dropped", session=self.name, snapshot=snap.ref, name=snap.name)
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -756,6 +782,9 @@ class Supervisor:
         self.sessions: dict[str, Session] = {}
         self.jobs: dict[str, Job] = {}
         self.keys: dict[tuple[str, str], tuple] = {}  # (session id, idempotency key) -> (job id, request fingerprint)
+        self.events: collections.deque = collections.deque(maxlen=EVENTS_KEPT)
+        self.event_seq = 0
+        self.event_added = asyncio.Event()
         self.maps: dict[str, MapRun] = {}
         self.next_map = 1
         self.last_rev: dict[str, int] = {}             # session name -> its revision when it was closed
@@ -835,9 +864,12 @@ class Supervisor:
             python, cwd = req.get("python") or sys.executable, req.get("cwd") or os.getcwd()
         session = Session(name, python, cwd, req.get("env"), req.get("memory_budget"), req.get("memory_limit"))
         session.rev = self.last_rev.get(name, 0)  # revisions never repeat for a name, so a stale --expect-rev fails
+        session.emit = self.emit
         self.sessions[name] = session
         try:
             await (session.start_from(source) if source else session.start())
+            self.emit("session.created", session=name, id=session.id, owner=req.get("owner") or "user",
+                      **({"from": source.ref} if source else {}))
         except Exception:
             self.sessions.pop(name, None)
             await session.stop()
@@ -853,6 +885,7 @@ class Supervisor:
         await session.stop()
         self.last_rev[session.name] = session.rev
         del self.sessions[req["name"]]
+        self.emit("session.killed", session=session.name, id=session.id)
         return {"killed": req["name"]}
 
     def _deduplicated(self, session: Session, req: dict, fingerprint: dict) -> Job | None:
@@ -1004,9 +1037,9 @@ class Supervisor:
     async def op_drop(self, req):
         session = self._session(req["session"])
         snap = session.find(req["name"])
-        users = [m.id for m in self.maps.values() if m.snap is snap and m.status == "running"]
-        if users:
-            raise RuntimeError(f"snapshot {snap.name} is used by running map {', '.join(users)}; interrupt it first")
+        if snap.pins:
+            raise RuntimeError(f"snapshot {snap.name} is pinned by {', '.join(sorted(snap.pins))}; "
+                               "it can be dropped once they end")
         session.drop(snap)
         return {"dropped": snap.ref}
 
@@ -1029,7 +1062,7 @@ class Supervisor:
         if req.get("from"):
             snap, owns = self._snapshot(req["from"], session.name), False
         else:  # the current state: an internal snapshot taken in the queue, after running jobs
-            job = await self._submit(session, "fork", owner=req.get("owner"))
+            job = await self._submit(session, "fork", owner=req.get("owner"), expect_rev=req.get("expect_rev"))
             await job.done.wait()
             if job.status != "ok":
                 raise RuntimeError(f"could not snapshot the current state: {(job.error or {}).get('evalue')}")
@@ -1040,6 +1073,7 @@ class Supervisor:
                    req.get("memory_limit") or session.memory_limit, req.get("case_memory_limit"),
                    int(req.get("max_result") or 65536), req.get("owner") or "user", session.dir / "maps" / map_id)
         m.dir.mkdir(parents=True, exist_ok=True)
+        snap.pins.add(f"map {map_id}")
         self.maps[map_id] = m
         if key is not None:
             self.keys[(session.id, "map:" + key)] = (map_id, {"code": req["code"], "cases": cases, "from": req.get("from")})
@@ -1079,8 +1113,11 @@ class Supervisor:
 
         async def one(index: int, case) -> None:
             async with sem:
-                while m.memory_limit and m.running and family_pss() > m.memory_limit and not m.interrupt_requested:
-                    await asyncio.sleep(0.2)  # admission: wait until running cases free memory
+                while m.memory_limit and m.running and not m.interrupt_requested \
+                        and (used := family_pss()) > m.memory_limit:  # admission; one case may always run
+                    m.blocked = f"memory {used >> 20} MB over the limit of {m.memory_limit >> 20} MB"
+                    await asyncio.sleep(0.2)
+                m.blocked = None
                 if m.interrupt_requested:
                     row = {"index": index, "case": case, "status": "cancelled"}
                 else:
@@ -1088,10 +1125,11 @@ class Supervisor:
                 m.rows[index] = row
                 results.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
                 results.flush()
+                self.emit("case.finished", session=m.session, map=m.id, index=index, status=row["status"])
 
         try:
             await asyncio.gather(*(one(i, c) for i, c in enumerate(m.cases)))
-            m.status = "interrupted" if m.interrupt_requested else "ok"
+            m.status = "interrupted" if m.interrupt_requested else "finished"
         except Exception as error:  # noqa: BLE001
             log.exception("map %s failed", m.id)
             m.status = "error"
@@ -1099,9 +1137,11 @@ class Supervisor:
         finally:
             results.close()
             m.finished = time.time()
+            m.snap.pins.discard(f"map {m.id}")
             if m.owns_snap:
                 session._release(m.snap)
             m.done.set()
+            self.emit("map.finished", session=m.session, map=m.id, status=m.status, counts=m.summary(rows=0)["counts"])
 
     async def _run_case(self, m: MapRun, index: int, case) -> dict:
         output = str(m.dir / f"{index}.out")
@@ -1134,7 +1174,8 @@ class Supervisor:
         watcher = asyncio.create_task(watch())
         try:
             out = await ephemeral.run(m.snap.socket, m.code, output, bind={"case": case},
-                                      case={"map": m.id, "index": index}, json_limit=m.json_limit, started=started)
+                                      case={"map": m.id, "index": index, "seed": case_seed(m.id, index)},
+                                      json_limit=m.json_limit, started=started)
         except Exception as error:  # noqa: BLE001
             out = {"status": "error", "error": {"ename": type(error).__name__, "evalue": str(error), "traceback": []}}
         finally:
@@ -1150,8 +1191,59 @@ class Supervisor:
                      "traceback": (error.get("traceback") or [])[-20:]}
         return {"index": index, "case": case, "status": status, "result": out.get("result"),
                 "result_error": out.get("result_error"), "text": out.get("text"), "error": error,
-                "termination": stop["reason"], "elapsed_s": out.get("elapsed_s"), "peak_pss": peak["pss"] or None,
+                "termination": stop["reason"], "elapsed_s": out.get("elapsed_s"), "sampled_peak_pss": peak["pss"] or None,
                 "output": output, "outputs": out.get("outputs", [])}
+
+    # ---------------------------------------------------------------- events
+
+    def emit(self, event_type: str, /, **fields) -> None:
+        self.event_seq += 1
+        self.events.append({"seq": self.event_seq, "cursor": f"{self.epoch}:{self.event_seq}", "type": event_type,
+                            "time": time.time(), **fields})
+        self.event_added.set()
+        self.event_added = asyncio.Event()
+
+    def _cursor(self, text: str | None) -> int:
+        if text is None:
+            return self.event_seq  # from now on
+        epoch, _, seq = str(text).rpartition(":")
+        oldest = self.events[0]["seq"] if self.events else self.event_seq + 1
+        if epoch and epoch != self.epoch:
+            raise CursorExpired(f"cursor {text} is from another supervisor (epoch {epoch}, now {self.epoch}); events "
+                                f"may have been missed: re-read the state (`talo brief`), then use `--after` with "
+                                f"{self.epoch}:{self.event_seq}")
+        if int(seq) < oldest - 1:
+            raise CursorExpired(f"cursor {text} is older than the oldest event kept ({self.epoch}:{oldest}); events "
+                                "were missed")
+        return int(seq)
+
+    async def op_events(self, req):
+        after = 0 if req.get("all") else self._cursor(req.get("after"))
+        if req.get("all") and self.events:
+            after = self.events[0]["seq"] - 1
+        session, kinds, limit = req.get("session"), req.get("type"), int(req.get("limit") or 100)
+        kinds = set(kinds.split(",")) if isinstance(kinds, str) else set(kinds or [])
+        deadline = time.monotonic() + float(req.get("wait") or 0)
+        while True:
+            matched, scanned = [], after
+            for e in self.events:
+                if e["seq"] <= after:
+                    continue
+                if len(matched) >= limit:
+                    break
+                scanned = e["seq"]
+                if (not session or e.get("session") == session) and (not kinds or e["type"] in kinds):
+                    matched.append(e)
+            after = scanned
+            left = deadline - time.monotonic()
+            if matched or left <= 0:
+                return {"events": matched, "next": f"{self.epoch}:{after}", "has_more": after < self.event_seq,
+                        "oldest": f"{self.epoch}:{self.events[0]['seq']}" if self.events else None}
+            waiter = self.event_added
+            try:
+                await asyncio.wait_for(waiter.wait(), left)
+            except asyncio.TimeoutError:
+                pass
 
     async def op_complete(self, req):
         return await self._ask_idle(self._session(req["session"]), "complete_request",
@@ -1206,6 +1298,7 @@ class Supervisor:
                 "job": req.get("job"), "text": req["text"]}
         with open(session.dir / "notes.jsonl", "a") as f:
             f.write(json.dumps(note, ensure_ascii=False) + "\n")
+        self.emit("note.added", session=session.name, note=note["id"], owner=note["owner"])
         return {"note": note}
 
     def _notes(self, session: Session) -> list:

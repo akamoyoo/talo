@@ -79,7 +79,7 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `ls` | – | `sessions` |
 | `kill` | `name` | `killed` |
 | `run` | `session`, `code`, `timeout` (seconds), `key` (idempotency), `expect_rev`, `atomic` | the job (with the supervisor's `epoch`), possibly still `running`; for a known `key`, the job already submitted, with `deduplicated: true` |
-| `job` | `id`, `wait` (seconds) | the job |
+| `job` | `id` (a job or a map), `wait` (seconds) | the job, or `{"map": ...}` |
 | `jobs` | `session` (optional), `last` | `jobs` (the last `last`, each with `code_preview`: the first 200 characters of its code), `total` |
 | `output` | `id`, `offset` (default: the end), `max_bytes` | `text`, `offset`, `next_offset`, `size`, `status` |
 | `interrupt` | `id` | `result`: `interrupting`, `cancelled` or the final status |
@@ -99,6 +99,9 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `note` | `session`, `text`, `job` | `note`: `{time, owner, rev, base, job, text}` |
 | `notes` | `session`, `last` | `notes`, `total` |
 | `brief` | `session`, `notes`, `jobs`, `vars` (how many of each) | `session`, `private_bytes`, `notes`, `snapshots`, `variables` (`largest`, `total`, or `skipped` while busy), `recent_jobs`, `active_jobs` |
+| `map` | `session`, `code`, `cases` or `range`, `from`, `parallel`, `timeout`, `memory_limit`, `case_memory_limit`, `max_result`, `key`, `expect_rev` | `map`: `{id, status (running / finished / interrupted / error), blocked, from, cases, finished_cases, running, counts, rows (first 50), rows_total, results (path of results.jsonl)}` |
+| `maps` | `session` | `maps` (summaries without rows) |
+| `events` | `after` (cursor `EPOCH:SEQ`; default: now), `all`, `wait` (seconds), `session`, `type` (comma-separated), `limit` | `events`, `next` (cursor), `has_more`, `oldest`; `CursorExpired` for a cursor of another epoch or older than the journal |
 | `shutdown` | – | `stopping` |
 
 A **session** is `{name, state (starting | idle | busy | dead), python, cwd, pid, rss, created, queued, current_job,

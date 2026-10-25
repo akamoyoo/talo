@@ -12,12 +12,13 @@ def run_json(talo, *args):
 def test_map_forks_a_snapshot_per_case(talo):
     talo("run", "import numpy as np\ndata = np.arange(1000.0)")
     talo("snap", "loaded")
-    code = "data = data * case\n{'case': case, 'sum': float(data.sum()), 'inv': 1 / case, 'idx': talo.case['index']}"
+    code = ("data = data * case\n{'case': case, 'sum': float(data.sum()), 'inv': 1 / case, 'idx': talo.case['index'],"
+            " 'seed': talo.case['seed'] > 0}")
     rc, d = run_json(talo, "map", "--from", "loaded", "--cases", "[1, 2, 0]", code, "-j", "2")
     m = d["map"]
-    assert rc == 1 and m["status"] == "ok" and m["counts"] == {"ok": 2, "error": 1}
+    assert rc == 1 and m["status"] == "finished" and m["counts"] == {"ok": 2, "error": 1}
     rows = {r["index"]: r for r in m["rows"]}
-    assert rows[1]["result"] == {"case": 2, "sum": 999000.0, "inv": 0.5, "idx": 1}
+    assert rows[1]["result"] == {"case": 2, "sum": 999000.0, "inv": 0.5, "idx": 1, "seed": True}
     assert rows[2]["error"]["ename"] == "ZeroDivisionError"
     assert run_json(talo, "run", "float(data.sum())")[1]["job"]["result"]["data"]["text/plain"] == "499500.0"
     lines = open(m["results"]).read().splitlines()
@@ -52,7 +53,7 @@ def test_map_case_memory_limit(talo):
     grow = "blocks = []\nfor i in range(40):\n    blocks.append(np.ones(5_000_000))\n    time.sleep(0.1)\n'done'"
     rc, d = run_json(talo, "map", "--from", "base", "--range", "1", grow, "--case-memory-limit", "200M", "-t", "60")
     row = d["map"]["rows"][0]
-    assert row["status"] == "interrupted" and row["termination"] == "memory_limit" and row["peak_pss"] > 200 << 20
+    assert row["status"] == "interrupted" and row["termination"] == "memory_limit" and row["sampled_peak_pss"] > 200 << 20
 
 
 def test_a_snapshot_used_by_a_running_map_cannot_be_dropped(talo):
@@ -69,3 +70,22 @@ def test_map_key_returns_the_same_map(talo):
     rc, a = run_json(talo, "map", "--range", "2", "x + case", "--key", "k")
     rc, b = run_json(talo, "map", "--range", "2", "x + case", "--key", "k")
     assert a["map"]["id"] == b["map"]["id"] and b["map"]["deduplicated"]
+
+
+def test_events_cursor_wait_and_filters(talo):
+    talo("run", "x = 1")
+    rc, d = run_json(talo, "events", "--all", "--type", "job.finished")
+    assert rc == 0 and d["events"][-1]["type"] == "job.finished" and d["events"][-1]["status"] == "ok"
+    cursor = run_json(talo, "events")[1]["next"]
+    rc, d = run_json(talo, "events", "--after", cursor, "--wait", "0.2")
+    assert d["events"] == [] and d["next"] == cursor
+    talo("run", "import time\ntime.sleep(1)", "-t", "0")
+    t0 = time.time()
+    rc, d = run_json(talo, "events", "--after", cursor, "--wait", "20", "--type", "job.finished")
+    assert d["events"] and d["events"][0]["status"] == "ok" and time.time() - t0 < 10
+    rc, d = run_json(talo, "events", "--after", "0123:5")
+    assert rc == 2 and d["error"]["type"] == "CursorExpired"
+    talo("snap", "s")
+    talo("note", "hello")
+    kinds = [e["type"] for e in run_json(talo, "events", "--after", cursor, "--limit", "50")[1]["events"]]
+    assert "snapshot.created" in kinds and "note.added" in kinds

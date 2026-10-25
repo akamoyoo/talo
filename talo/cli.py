@@ -238,7 +238,7 @@ def cmd_wait(args):
 # ---------------------------------------------------------------- map
 
 def show_map(args, m: dict) -> int:
-    code = 3 if m["status"] == "running" else (0 if m["status"] == "ok" and set(m["counts"]) <= {"ok"} else 1)
+    code = 3 if m["status"] == "running" else (0 if m["status"] == "finished" and set(m["counts"]) <= {"ok"} else 1)
     if args.json:
         print(json.dumps({"map": m}, ensure_ascii=False, default=str))
         return code
@@ -261,6 +261,8 @@ def show_map(args, m: dict) -> int:
     sys.stdout.flush()
     print(f"({m['finished_cases']}/{m['cases']} cases: {counts or 'none yet'}{running}; results in {m['results']})",
           file=sys.stderr)
+    if m.get("blocked"):
+        print(f"(waiting to start more cases: {m['blocked']})", file=sys.stderr)
     if m["status"] == "running":
         print(f"[map {m['id']} running {m['elapsed_s']:.1f}s] `talo wait {m['id']}`, `talo interrupt {m['id']}`",
               file=sys.stderr)
@@ -275,7 +277,8 @@ def cmd_map(args):
         cases = json.loads(text)
     d = call("map", session=session_name(args), code=code, cases=cases, range=args.range, **{"from": args.from_},
              parallel=args.parallel, timeout=args.timeout, memory_limit=parse_size(args.memory_limit),
-             case_memory_limit=parse_size(args.case_memory_limit), max_result=args.max_result, key=args.key)
+             case_memory_limit=parse_size(args.case_memory_limit), max_result=args.max_result, key=args.key,
+             expect_rev=args.expect_rev)
     return show_map(args, d["map"])
 
 
@@ -561,6 +564,20 @@ def cmd_reload(args):
     return exit_code(job)
 
 
+def cmd_events(args):
+    d = call("events", after=args.after, wait=args.wait, session=args.session, type=args.type, limit=args.limit,
+             all=args.all)
+
+    def human(x):
+        for e in x["events"]:
+            fields = " ".join(f"{k}={v}" for k, v in e.items() if k not in ("seq", "cursor", "type", "time"))
+            print(f"{e['cursor']}  {time.strftime('%H:%M:%S', time.localtime(e['time']))}  {e['type']:18s} {fields}")
+        if not x["events"]:
+            print("(no events)")
+        print(f"(next: --after {x['next']}{'; more are ready' if x['has_more'] else ''})", file=sys.stderr)
+    emit(args, d, human)
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -764,7 +781,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--case-memory-limit", metavar="SIZE", help="stop a case that uses more than this")
     p.add_argument("--max-result", type=int, default=65536, help="bytes of JSON kept per result")
     p.add_argument("--key", help="idempotency key")
+    p.add_argument("--expect-rev", type=int, metavar="N", help="without --from: refuse unless the session is at revision N")
     add("maps", cmd_maps, "fan-outs and their progress")
+    p = add("events", cmd_events, "the event journal: wait for jobs, maps, snapshots, notes ... without polling",
+            session=False)
+    p.add_argument("--after", metavar="CURSOR", help="events after this cursor (default: only new events)")
+    p.add_argument("--all", action="store_true", help="from the oldest event kept")
+    p.add_argument("-w", "--wait", type=float, default=0, help="seconds to wait for the first matching event")
+    p.add_argument("-s", "--session", help="only events of this session")
+    p.add_argument("--type", help="only these event types (comma-separated), e.g. job.finished,map.finished")
+    p.add_argument("--limit", type=int, default=100)
     add("resources", cmd_resources, "memory of every session's worker and snapshots, and of the machine")
     p = add("brief", cmd_brief, "what an agent needs to resume the session's work (state, notes, variables, jobs)")
     p.add_argument("--notes", type=int, default=10, help="most recent notes shown")
