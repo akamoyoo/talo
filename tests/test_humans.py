@@ -49,6 +49,7 @@ def test_export_follows_lineage(talo, tmp_path):
     script = talo("export").stdout
     assert "x = 1" in script and "x = 2" not in script and "# --- snapshot a" in script
     assert "# y = undefined_name" in script and "z = x + 10" in script
+    assert "REPLAY HAZARD" in script and "WARNING: 1 failed job(s)" in script
     assert "x = 2" in talo("export", "--all").stdout
     assert "z = x" not in talo("export", "--snap", "a").stdout
     path = tmp_path / "out.ipynb"

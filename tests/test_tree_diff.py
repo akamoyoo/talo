@@ -53,3 +53,14 @@ def test_diff_from_a_branch_finds_the_parent_snapshot(talo):
     talo("run", "-s", "b", "x = 2")
     rc, d = run_json(talo, "diff", "-s", "b", "base")
     assert rc == 0 and d["b"] == "b:@" and [c["name"] for c in d["changed"]] == ["x"]
+
+
+def test_inspecting_a_snapshot_cannot_change_it(talo):
+    talo("run", "class Sneaky:\n    def __reduce__(self):\n        globals()['touched'] = True\n        return (Sneaky, ())\n"
+                "    @property\n    def shape(self):\n        globals()['touched'] = True\n        return (1,)\ns = Sneaky()")
+    talo("snap", "base")
+    rc, d = run_json(talo, "diff", "base", "base", "--content")
+    assert rc == 0
+    talo("checkout", "base", "--discard")
+    rc, out = run_json(talo, "run", "'touched' in globals()")
+    assert out["job"]["result"]["data"]["text/plain"] == "False"

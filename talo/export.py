@@ -38,7 +38,20 @@ def _reload_title(rec: dict) -> str:
     return ("reload " + ", ".join(parts) + "; a replay imports the source files as they are now, which may differ")
 
 
+HAZARD = ("REPLAY HAZARD: this job failed after it may have changed the state; the state in memory keeps those "
+          "changes, this script does not run it")
+
+
+def hazards(jobs: list) -> list:
+    """Failed jobs in a lineage: code that ran partly, so replaying without it may not reproduce the state."""
+    return [r["id"] for r in jobs if r["kind"] == "execute" and r["status"] != "ok"]
+
+
 def to_py(jobs: list, header: str) -> str:
+    risky = hazards(jobs)
+    if risky:
+        header += (f"\nWARNING: {len(risky)} failed job(s) ({', '.join(risky)}) may have changed the state before "
+                   "failing; replaying this script may not reproduce it (see REPLAY HAZARD below).")
     parts = [f"# {line}" if line else "#" for line in header.splitlines()]
     for rec in jobs:
         if rec["kind"] == "snap":
@@ -53,7 +66,7 @@ def to_py(jobs: list, header: str) -> str:
                 parts.append(f"\n# [{rec.get('execution_count') or rec['id']}]\n{code}")
             else:
                 commented = "\n".join(f"# {line}" if line else "#" for line in code.splitlines())
-                parts.append(f"\n# [{_failure(rec)}]\n{commented}")
+                parts.append(f"\n# [{_failure(rec)}]\n# {HAZARD}\n{commented}")
     return "\n".join(parts) + "\n"
 
 
@@ -102,7 +115,7 @@ def to_ipynb(jobs: list, header: str) -> str:
             outputs.append({"output_type": "error", "ename": error.get("ename", rec["status"]),
                             "evalue": error.get("evalue") or "", "traceback": error.get("traceback") or []})
         cells.append({"cell_type": "code", "id": _cell_id(len(cells)), "execution_count": rec.get("execution_count"),
-                      "metadata": {} if rec["status"] == "ok" else {"talo_status": rec["status"]},
+                      "metadata": {} if rec["status"] == "ok" else {"talo_status": rec["status"], "talo_hazard": HAZARD},
                       "source": rec["code"].rstrip("\n").splitlines(keepends=True), "outputs": outputs})
     notebook = {"nbformat": 4, "nbformat_minor": 5, "cells": cells,
                 "metadata": {"kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},

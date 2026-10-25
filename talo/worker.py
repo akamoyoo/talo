@@ -301,16 +301,40 @@ def show(value, rows: int) -> str:
         parts = [f"{_type_name(value)} shape={tuple(value.shape)} dtype={value.dtype}"]
         try:
             import numpy as np  # only reached when the user's environment has numpy
-            flat = np.asarray(value).ravel()
-            if flat.size and flat.dtype.kind in "biuf":
-                finite = flat[np.isfinite(flat)] if flat.dtype.kind == "f" else flat
-                parts.append(f"min={finite.min() if finite.size else 'nan'} max={finite.max() if finite.size else 'nan'} "
-                             f"nan={int(flat.size - finite.size)}")
-            parts.append(repr(flat[:rows]))
+            arr = np.asarray(value)
+            if arr.size and arr.dtype.kind in "biuf":
+                parts.append(array_stats(np, arr))
+            parts.append(repr(arr.reshape(-1)[:rows] if arr.flags.c_contiguous else arr.flat[:rows]))
         except Exception:  # noqa: BLE001
             parts.append(truncate(repr(value), 2000)[0])
         return "\n".join(parts)
     return truncate(repr(value), 5000)[0]
+
+
+def array_stats(np, arr) -> str:
+    """min / max / NaN count, computed in chunks of about a million elements, so that previewing a large array never
+    allocates a copy of it."""
+    rows = arr.reshape(1, -1) if arr.ndim == 0 else (arr if arr.ndim > 1 else arr.reshape(-1, 1))
+    step = max(1, (1 << 20) // max(1, rows[0].size))
+    lo = hi = None
+    nan = 0
+    for i in range(0, rows.shape[0], step):
+        chunk = rows[i:i + step]
+        if chunk.dtype.kind == "f":
+            bad = int(np.count_nonzero(~np.isfinite(chunk)))
+            nan += bad
+            if bad == chunk.size:
+                continue
+            if bad:  # only this chunk is copied
+                finite = np.where(np.isfinite(chunk), chunk, np.nan)
+                a, b = np.nanmin(finite), np.nanmax(finite)
+            else:
+                a, b = chunk.min(), chunk.max()
+        else:
+            a, b = chunk.min(), chunk.max()
+        lo = a if lo is None or a < lo else lo
+        hi = b if hi is None or b > hi else hi
+    return f"min={'nan' if lo is None else lo} max={'nan' if hi is None else hi} non_finite={nan} (exact)"
 
 
 class _HashWriter:
@@ -358,6 +382,13 @@ def other_threads() -> list[str]:
         except OSError:
             pass
     return names
+
+
+def _wait_child(pid: int) -> None:
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:  # in a snapshot, the SIGCHLD handler may have reaped it already
+        pass
 
 
 def _reply(conn: socket.socket, obj: dict) -> None:
@@ -409,12 +440,19 @@ class Snapshot:
                 elif op == "info":
                     _reply(conn, {"ok": True, "pid": os.getpid(), "execution_count": self.worker.execution_count})
                     conn.close()
-                elif op == "vars":
-                    rows = [describe(k, v) for k, v in list(self.worker.namespace.items()) if is_user_variable(k, v)]
-                    _reply(conn, {"ok": True, "variables": rows})
+                elif op == "vars":  # inspected in a disposable fork: user code it triggers cannot change the snapshot
+                    ns = self.worker.namespace
+                    out = self.worker.in_fork(lambda: {"status": "ok", "variables": [
+                        describe(k, v) for k, v in list(ns.items()) if is_user_variable(k, v)]})
+                    _reply(conn, {"ok": out.get("status") == "ok", **out,
+                                  **({} if out.get("status") == "ok" else {"error": out.get("evalue")})})
                     conn.close()
                 elif op == "fingerprint":
-                    _reply(conn, {"ok": True, "fingerprints": fingerprints(self.worker.namespace, req.get("names", []))})
+                    ns, names = self.worker.namespace, req.get("names", [])
+                    out = self.worker.in_fork(lambda: {"status": "ok", "fingerprints": fingerprints(ns, names)},
+                                              timeout=3600)
+                    _reply(conn, {"ok": out.get("status") == "ok", **out,
+                                  **({} if out.get("status") == "ok" else {"error": out.get("evalue")})})
                     conn.close()
                 elif op == "spawn":
                     with warnings.catch_warnings():
@@ -892,13 +930,13 @@ class Worker:
                 left = deadline - time.monotonic()
                 if left <= 0 or not select.select([f], [], [], left)[0]:
                     os.kill(pid, signal.SIGKILL)
-                    os.waitpid(pid, 0)
+                    _wait_child(pid)
                     return {"status": "error", "ename": "Timeout", "evalue": f"inspection took over {timeout:.0f}s"}
                 chunk = os.read(f.fileno(), 1 << 20)
                 if not chunk:
                     break
                 chunks.append(chunk)
-        os.waitpid(pid, 0)
+        _wait_child(pid)
         try:
             return json.loads(b"".join(chunks))
         except ValueError:

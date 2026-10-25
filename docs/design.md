@@ -12,7 +12,7 @@ accounting.
 1. **Resident.** When the CLI exits or the agent disconnects, the session's variables and running computations stay.
 2. **Hot rollback** (M2). While the machine is up, the session can switch back to any snapshot of its in-memory
    state, or branch from it.
-3. **Durable restore** (M8). After a process or machine restart, selected variables can be restored from disk.
+3. **Durable restore** (M9). After a process or machine restart, selected variables can be restored from disk.
 
 Rollback is not a sandbox: files already written, network requests already sent and changes to external databases
 are not undone.
@@ -62,7 +62,7 @@ $ talo drop loaded                 # free it
 - Each session records its **base** (the snapshot its worker descends from, or none) and the jobs run since; snapshots
   record their parent snapshot, so the tree and "what happened since" are always known.
 - Snapshots survive the death of the worker: after an out-of-memory kill, `checkout` brings back the last snapshot.
-  They do not survive the supervisor (they exit when it goes away) or a reboot (that is M8).
+  They do not survive the supervisor (they exit when it goes away) or a reboot (that is M9).
 
 **Mechanics.** On `talo_snapshot_request` the worker, at an idle point, forks. The child is the snapshot: it closes the
 worker's connection, listens on its own Unix socket (`sessions/NAME/snapshots/ID.sock`) and serves a few requests:
@@ -216,6 +216,8 @@ $ talo export --all                          # every job, in order, including ro
 - By default the export follows the **lineage** of the session's current state: the jobs between each snapshot on the
   chain of bases, across sessions for a branch, then the jobs since the base. Code that was rolled back is left out,
   so running the script from an empty interpreter reproduces the state (side effects outside the process aside).
+- A failed job may have changed the state before failing; the export marks it as a **replay hazard** and says so
+  in its header, because the script leaves out code whose effects the state still has (`run --atomic` avoids this).
 - Failed and interrupted jobs are kept as comments (`# [job 4 failed: NameError: ...]`) in `.py`, and as cells with
   their error in `.ipynb`; snapshots appear as comments (`# --- snapshot loaded (default:s1)`) or Markdown cells.
 - `.ipynb` is nbformat 4.5, written with the standard library. Outputs come from the job records and output files:
@@ -491,4 +493,4 @@ a session from it or the handoff is closed with `talo handoff --close ID`.
 - Linux only (relies on `fork`, `/proc`, Unix sockets).
 - Snapshots inherit the limits of `fork()` described above.
 - A worker that runs out of memory is killed by the kernel; the supervisor reports it, and its variables are lost
-  unless a snapshot or (M8) a durable checkpoint exists.
+  unless a snapshot or (M9) a durable checkpoint exists.

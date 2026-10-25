@@ -13,7 +13,18 @@ it from the terminal by a coding agent.
 | **M5** Across sessions | `map`: fan one snapshot out into N forked trials under a memory budget, collecting bounded results; `expose` / `call`: a session as a local service other agents call (stateful calls queued, read-only calls in disposable forks); an experiment ledger (`record`, `compare`) linked to jobs, snapshots and code versions; an event journal (`events --after CURSOR --wait`); `handoff` / `resume`; sharing a session with other clients and other users (`share --level read / call / run`) | six agents test hypotheses from one prepared state with one copy of the data; a replacement agent continues an investigation from a handoff || done |
 | **M6** Shared datasets | `publish` immutable named versions of tables (Arrow IPC in sealed memory), `talo.get` in any session, explicit refresh, version retention and memory accounting | three agents use one 100 GB dataset version with one copy in memory; benchmarked against fork-only sharing and reloading | |
 | **M7** Jupyter compatibility | ZMQ bridge and a kernelspec (`talo kernel --session NAME`) so JupyterLab, VS Code (notebooks and `# %%` cells in `.py` files) and `jupyter console` attach to a running session, with standard `.py` / `.ipynb` files; MCP adapter over the same job and error contract; rollback inside notebooks: `%snap` / `%checkout` / `%tree` / `%diff` cell magics handled by the bridge (the front end stays connected while the worker behind it is replaced), `%autosnap` (a snapshot after every cell, the last N kept) with `%undo` and `%checkout @N`, and a notice when the notebook's text no longer matches the state; later, an optional VS Code extension for what Jupyter lacks (snapshot tree, checkout, variables with memory, jobs, brief), built on `--json` | open a Talo session that an agent is using in JupyterLab and in VS Code | |
-| **M8** Durability | save and restore selected variables and session metadata (notes, receipts) across restarts | recover data after a restart | |
+| **M8** Trust and safety | `verify` (hot: replay from a snapshot and diff the result; cold: run the export in a fresh interpreter); `run --trial` / `review` / `adopt` (a result kept aside until accepted, then switched in atomically); hard limits through a cgroup v2 scope (memory, CPU, processes, output size) and `--deadline` separate from the client's wait; interrupting the whole process tree; `diagnose JOB --stack` (thread stacks without killing it) and `--retain-error` (keep the failed state in a fork to debug); `talo.artifact_path()` (per-job output directories, published after review); `queue pause` / `lease` for a human to take over; `memory explain` / `prune --dry-run` | an agent's 20-minute transformation is reviewed and adopted without recomputation; a stuck job is diagnosed without being killed; `verify` reports whether the current state is reproducible | |
+| **M9** Durability | save and restore selected variables and session metadata (notes, receipts) across restarts | recover data after a restart | |
+
+### Where Talo stands
+
+Keeping a Python session resident and driving it from a CLI is no longer unique (for example agentnb drives a
+resident IPython from the command line with background jobs; ipykernel 7 subshells allow inspection while a job
+runs, sharing one namespace). Talo's difference is **cheap, inspectable, disposable branches of the in-memory state**:
+snapshots, rollback, forks per case or call, and the provenance that ties results to them. Hidden state and
+reproducibility remain the best-documented problem of notebooks (in a re-execution of about 860 000 GitHub notebooks,
+24% ran without errors and 4% reproduced their results); reactive notebooks infer dependencies but cannot see
+in-place mutation such as `list.append()`. M8's `verify` addresses this with execution, not inference.
 
 ### Agent needs behind M4 and M5
 
