@@ -149,11 +149,12 @@ class Channel:
         return await asyncio.wait_for(read(), timeout), others
 
     async def execute(self, code: str, output: str, *, silent: bool = False, store_history: bool = True,
-                      retain_error: bool = False) -> dict:
+                      retain_error: bool = False, json_limit: int | None = None) -> dict:
         reply, others = await self.request(
             "execute_request", {"code": code, "silent": silent, "store_history": store_history and not silent,
                                 "user_expressions": {}, "allow_stdin": False, "stop_on_error": False},
-            metadata={"talo_output": output, "talo_retain_error": retain_error})
+            metadata={"talo_output": output, "talo_retain_error": retain_error,
+                      **({"talo_json_result": json_limit} if json_limit else {})})
         error = next((m["content"] for m in others if wire.msg_type(m) == "error"), None)
         result = next((m["content"] for m in others if wire.msg_type(m) == "execute_result"), None)
         return {"status": reply["content"]["status"], "error": error, "execution_count":

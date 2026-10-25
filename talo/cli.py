@@ -210,6 +210,9 @@ def cmd_ls(args):
             extra += f", {s['queued']} queued" if s["queued"] else ""
             extra += f": {s['death']}" if s["state"] == "dead" else ""
             print(f"{s['name']:16s} {s['state']:8s} pid {s['pid']}  memory {human_bytes(s['rss'])}  {s['python']}{extra}")
+        for s in d.get("lost") or []:
+            last = f"last checkpoint {s['last_checkpoint']}" if s.get("last_checkpoint") else "no checkpoint"
+            print(f"{s['name']:16s} lost     (the supervisor restarted; {last}: `talo recover {s['name']}`)")
     emit(args, call("ls"), human)
 
 
@@ -1002,6 +1005,87 @@ def cmd_memory(args):
     emit(args, d, human)
 
 
+def cmd_save(args):
+    d = call("save", session=session_name(args), name=args.name, names=args.names or None, key=args.key,
+             expect_rev=args.expect_rev, timeout=args.timeout)
+    if args.json:
+        print(json.dumps({"job": d}, ensure_ascii=False, default=str))
+        return exit_code(d)
+    if d["status"] == "ok":
+        r = d["result"]
+        skipped = f"; skipped: " + ", ".join(f"{s['name']} ({s['reason']})" for s in r["skipped"]) if r["skipped"] else ""
+        print(f"checkpoint {r['checkpoint']}: {r['variables']} variables, {human_bytes(r['bytes'])} "
+              f"({human_bytes(r['new_bytes'])} new), rev {r['rev']}{skipped}")
+    else:
+        show_job(args, d)
+    return exit_code(d)
+
+
+def cmd_restore(args):
+    d = call("restore", checkpoint=args.checkpoint, session=args.session, names=args.names or None,
+             python=args.python, key=args.key, timeout=args.timeout, **{"as": args.as_})
+    if args.json:
+        print(json.dumps(d, ensure_ascii=False, default=str))
+        return exit_code(d)
+    if d["status"] == "ok":
+        print(f"restored {d['checkpoint']} into session {d['session']} [job {d['id']}]")
+        if d.get("skipped"):
+            print("not in the checkpoint (they could not be saved): " + ", ".join(s["name"] for s in d["skipped"]))
+        print(d["result"]["data"]["text/plain"][:2000])
+    else:
+        show_job(args, d)
+    return exit_code(d)
+
+
+def cmd_checkpoints(args):
+    def human(d):
+        if not d["checkpoints"]:
+            print("(no checkpoints; `talo save` writes one)")
+        for c in d["checkpoints"]:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["created"]))
+            print(f"{c['session'] + '/' + c['name']:36s} {when}  {c['variables']:>4} vars  {human_bytes(c['bytes']):>9} "
+                  f"({human_bytes(c['new_bytes'])} new)  rev {c['rev']}" + ("  auto" if c["auto"] else ""))
+    emit(args, call("checkpoints", session=args.session), human)
+
+
+def cmd_checkpoint(args):
+    if args.action == "drop":
+        emit(args, call("checkpoint_drop", checkpoint=args.name, session=args.session),
+             lambda d: print(f"dropped {d['dropped']} (`talo store gc` frees its storage)"))
+
+
+def cmd_store(args):
+    emit(args, call("store_gc", dry_run=args.dry_run),
+         lambda d: print(f"{'would remove' if d['dry_run'] else 'removed'} {d['removed']} units, "
+                         f"{human_bytes(d['freed_bytes'])}"))
+
+
+def cmd_recover(args):
+    if not args.name and not args.all:
+        lost = call("ls_lost")["lost"]
+        if not lost:
+            print("nothing to recover")
+        for s in lost:
+            print(f"{s['name']:16s} last checkpoint {s['last_checkpoint'] or '-'}   (`talo recover {s['name']}`)")
+        return
+    d = call("recover", name=args.name, all=args.all, timeout=args.timeout)
+
+    def human(x):
+        for r in x["recovered"]:
+            how = f"restored {r['checkpoint']}" if r.get("checkpoint") else "no checkpoint: started empty"
+            status = f" ({r['job']['status']})" if r.get("job") else ""
+            print(f"session {r['session']}: {how}{status}")
+    emit(args, d, human)
+
+
+def cmd_autosave(args):
+    on = {"on": True, "off": False}.get(args.state) if args.state else None
+    d = call("autosave", session=session_name(args), on=on, every=parse_duration(args.every), keep=args.keep)
+    emit(args, d, lambda x: print(f"autosave for {x['session']}: " + (
+        f"every {x['autosave']['every'] / 60:.0f} min when changed, keeping {x['autosave']['keep']}" if x["autosave"]
+        else "off")))
+
+
 def cmd_tree(args):
     def human(d):
         nodes = d["nodes"]
@@ -1335,6 +1419,37 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("memory", cmd_memory, "where the session's memory is, and what could be released")
     p.add_argument("--prune", action="store_true", help="list what could be released (shown anyway)")
     p.add_argument("--apply", action="store_true", help="release it")
+    p = add("save", cmd_save, "write the session's variables to a durable checkpoint (the session keeps working)")
+    p.add_argument("names", nargs="*", help="variables to save (default: all)")
+    p.add_argument("--name", help="checkpoint name (default: the time)")
+    p.add_argument("--key", help="idempotency key")
+    p.add_argument("--expect-rev", type=int, metavar="N")
+    p.add_argument("-t", "--timeout", type=float, default=TIMEOUT)
+    p = add("restore", cmd_restore, "load a checkpoint into a new session (--as) or an existing one (-s)",
+            session=False)
+    p.add_argument("checkpoint", help="SESSION/NAME")
+    p.add_argument("names", nargs="*", help="only these variables")
+    p.add_argument("--as", dest="as_", metavar="SESSION", help="a new session (with the checkpoint's interpreter)")
+    p.add_argument("-s", "--session", help="an existing session to load into")
+    p.add_argument("--python", help="interpreter for the new session")
+    p.add_argument("--key", help="idempotency key")
+    p.add_argument("-t", "--timeout", type=float, default=300)
+    p = add("checkpoints", cmd_checkpoints, "durable checkpoints", session=False)
+    p.add_argument("-s", "--session")
+    p = add("checkpoint", cmd_checkpoint, "manage a checkpoint")
+    p.add_argument("action", choices=("drop",))
+    p.add_argument("name", help="SESSION/NAME or NAME")
+    p = add("store", cmd_store, "the checkpoint store: gc deletes units no checkpoint uses", session=False)
+    p.add_argument("action", choices=("gc",))
+    p.add_argument("--dry-run", action="store_true")
+    p = add("recover", cmd_recover, "bring back sessions lost in a restart, from their last checkpoints", session=False)
+    p.add_argument("name", nargs="?")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("-t", "--timeout", type=float, default=600)
+    p = add("autosave", cmd_autosave, "checkpoint the session periodically when it changed")
+    p.add_argument("state", nargs="?", choices=("on", "off"))
+    p.add_argument("--every", default="30m")
+    p.add_argument("--keep", type=int, default=3)
     p = add("verify", cmd_verify, "replay the lineage of the current state and check it gives the same variables")
     p.add_argument("--cold", action="store_true", help="replay from the start in a fresh interpreter")
     p.add_argument("--from", dest="from_", metavar="SNAPSHOT", help="hot: replay from this snapshot on the lineage")

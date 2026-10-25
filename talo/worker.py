@@ -527,6 +527,160 @@ def json_result(value, limit: int) -> dict:
     return {"value": json.loads(text)}
 
 
+# ---------------------------------------------------------------- checkpoints
+
+_RESTORE = {"ns": {}}  # the session namespace functions saved by source are rebuilt in (set by load_units)
+
+
+def _rebuild_function(name: str, source: str):
+    """Unpickling a function saved by its source: run the source in the session's namespace, so its globals are
+    the session's."""
+    ns = _RESTORE["ns"]
+    exec(compile(source, f"<talo-restored-{name}>", "exec"), ns)
+    return ns[name]
+
+
+def _unit_digest(stream_hash, buffer_hash) -> str:
+    return hashlib.blake2b(stream_hash.digest() + buffer_hash.digest(), digest_size=20).hexdigest()
+
+
+def _rebuild_view(root, offset: int, shape: tuple, strides: tuple, dtype: str):
+    """Unpickling a NumPy view saved with its base: a view of the restored base, so they share memory again."""
+    import numpy as np
+    return np.ndarray(shape, dtype=np.dtype(dtype), buffer=root, offset=offset, strides=strides)
+
+
+def _root(arr):
+    while getattr(arr, "base", None) is not None and type(arr.base).__name__ == "ndarray":
+        arr = arr.base
+    return arr
+
+
+class _SavePickler(pickle.Pickler):
+    """Functions defined in the session are saved by their source (cells keep it in linecache); NumPy views of an
+    array saved in the same unit are saved as views of it."""
+
+    def __init__(self, *args, roots: set | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.roots = roots or set()
+
+    def reducer_override(self, obj):
+        import inspect
+        import types
+        if type(obj).__name__ == "ndarray" and obj.base is not None:
+            root = _root(obj)
+            if id(root) in self.roots and root.flags.c_contiguous and root is not obj:
+                offset = obj.__array_interface__["data"][0] - root.__array_interface__["data"][0]
+                return _rebuild_view, (root, offset, obj.shape, obj.strides, obj.dtype.str)
+        if isinstance(obj, types.FunctionType) and obj.__module__ == "__main__" \
+                and obj.__code__.co_filename.startswith(("<talo-", "<talo-restored-")):  # cells, not Talo's own
+            if obj.__name__ == "<lambda>" or obj.__code__.co_freevars:
+                raise pickle.PicklingError(f"{obj.__qualname__}: lambdas and closures cannot be saved by source")
+            try:
+                source = inspect.getsource(obj)
+            except (OSError, TypeError) as error:
+                raise pickle.PicklingError(f"{obj.__qualname__}: source not available") from error
+            import textwrap
+            return _rebuild_function, (obj.__name__, textwrap.dedent(source))
+        return NotImplemented
+
+
+def _alias_root(obj):
+    """Objects that must be saved together to stay the same object or share memory after restoring."""
+    base = obj
+    while getattr(base, "base", None) is not None and type(base.base).__name__ == "ndarray":
+        base = base.base
+    return id(base)
+
+
+def save_units(namespace: dict, names: list, store: str) -> dict:
+    """Write the variables ``names`` into the content-addressed ``store``; returns the units and what was skipped.
+    Each unit is a directory ``store/HASH`` with ``stream`` (the pickle), ``buffers`` (raw out-of-band buffers)
+    and ``index.json``; it is written under a temporary name and renamed when complete."""
+    import json as _json
+    groups: dict = {}
+    for name in names:
+        groups.setdefault(_alias_root(namespace[name]), []).append(name)
+    units, skipped = [], []
+    os.makedirs(store, exist_ok=True)
+    for members in groups.values():
+        tmp = os.path.join(store, f".tmp-{os.getpid()}-{wire.new_id()[:8]}")
+        os.makedirs(tmp)
+        hs, hb = hashlib.blake2b(digest_size=20), hashlib.blake2b(digest_size=20)  # stream and buffers
+        sizes = []
+        try:
+            with open(os.path.join(tmp, "buffers"), "wb") as fb:
+                def buffer(b: pickle.PickleBuffer) -> bool:
+                    raw = b.raw()
+                    sizes.append(raw.nbytes)
+                    hb.update(raw.nbytes.to_bytes(8, "little"))
+                    hb.update(raw)
+                    fb.write(raw)
+                    return False
+                with open(os.path.join(tmp, "stream"), "wb") as fs:
+                    class Tee:
+                        def write(self, data):
+                            hs.update(data)
+                            return fs.write(data)
+                    roots = {id(_root(namespace[n])) for n in members if type(namespace[n]).__name__ == "ndarray"}
+                    _SavePickler(Tee(), protocol=5, buffer_callback=buffer, roots=roots).dump(
+                        {n: namespace[n] for n in sorted(members, key=lambda n: getattr(namespace[n], "base", None) is not None)})
+                fb.flush()
+                os.fsync(fb.fileno())
+            digest = _unit_digest(hs, hb)
+            with open(os.path.join(tmp, "index.json"), "w") as f:
+                _json.dump({"buffers": sizes, "names": members}, f)
+            final = os.path.join(store, digest)
+            size = os.path.getsize(os.path.join(tmp, "stream")) + sum(sizes)
+            if os.path.exists(final):  # the same content is stored already
+                import shutil
+                shutil.rmtree(tmp)
+                units.append({"hash": digest, "names": members, "bytes": size, "new": False})
+            else:
+                os.rename(tmp, final)
+                units.append({"hash": digest, "names": members, "bytes": size, "new": True})
+        except Exception as error:  # noqa: BLE001 - this unit is skipped, the others are saved
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+            skipped += [{"name": n, "reason": f"{type(error).__name__}: {error}"[:200]} for n in members]
+    return {"units": units, "skipped": skipped}
+
+
+def load_units(namespace: dict, store: str, units: list, only: list | None = None) -> dict:
+    """Read units back into ``namespace``, checking each one's hash; buffers become ordinary writable memory."""
+    import json as _json
+    _RESTORE["ns"] = namespace
+    loaded, total = [], 0
+    for unit in units:
+        if only and not set(unit["names"]) & set(only):
+            continue
+        d = os.path.join(store, unit["hash"])
+        index = _json.loads(open(os.path.join(d, "index.json")).read())
+        with open(os.path.join(d, "stream"), "rb") as f:
+            stream = f.read()
+        data = bytearray(sum(index["buffers"]))
+        with open(os.path.join(d, "buffers"), "rb") as f:
+            f.readinto(data)
+        hs, hb = hashlib.blake2b(stream, digest_size=20), hashlib.blake2b(digest_size=20)
+        views, at = [], 0
+        mv = memoryview(data)
+        for n in index["buffers"]:
+            hb.update(n.to_bytes(8, "little"))
+            hb.update(mv[at:at + n])
+            views.append(mv[at:at + n])
+            at += n
+        if _unit_digest(hs, hb) != unit["hash"]:
+            raise ValueError(f"unit {unit['hash']} ({', '.join(unit['names'])}) is corrupt: its content does not "
+                             "match its hash")
+        values = pickle.loads(stream, buffers=views)
+        for name, value in values.items():
+            if not only or name in only:
+                namespace[name] = value
+                loaded.append(name)
+        total += unit["bytes"]
+    return {"loaded": loaded, "bytes": total}
+
+
 # ---------------------------------------------------------------- reload
 
 def _source_hash(path: str) -> str | None:
@@ -720,6 +874,39 @@ class Helper:
             raise ValueError(f"artifact name {name!r} leads outside the job's directory (through a link)")
         return str(path)
 
+    def _save(self, names: list | None, store: str) -> dict:
+        """talo save, in a fork of the session: write variables to the store (see "Checkpoints" in design.md)."""
+        ns = self._worker.namespace
+        names = names or [k for k, v in list(ns.items()) if is_user_variable(k, v) and k != "talo"]
+        missing = [n for n in names if n not in ns]
+        out = save_units(ns, [n for n in names if n in ns], store)
+        out["skipped"] += [{"name": n, "reason": "no such variable"} for n in missing]
+        cwd = os.path.realpath(os.getcwd())
+        out["modules"] = sorted(name for name, m in list(sys.modules.items())
+                                if (f := getattr(m, "__file__", None)) and not _excluded(f)
+                                and os.path.realpath(f).startswith(cwd + os.sep))
+        out["versions"] = {m: getattr(sys.modules[m], "__version__", None) for m in ("numpy", "pandas", "pyarrow")
+                           if m in sys.modules}
+        out["python"] = sys.version.split()[0]
+        return out
+
+    def _load(self, store: str, units: list, only: list | None = None, modules: list | None = None,
+              versions: dict | None = None) -> dict:
+        """talo restore: import the session's modules, then read the units back."""
+        import importlib
+        failed = []
+        for m in modules or []:
+            try:
+                importlib.import_module(m)
+            except Exception as error:  # noqa: BLE001
+                failed.append(f"{m}: {type(error).__name__}: {error}"[:200])
+        out = load_units(self._worker.namespace, store, units, only)
+        out["module_errors"] = failed
+        out["version_changes"] = {m: [v, getattr(sys.modules.get(m), "__version__", None)]
+                                  for m, v in (versions or {}).items()
+                                  if m in sys.modules and getattr(sys.modules[m], "__version__", None) != v}
+        return out
+
     def _serve_call(self, name: str, kwargs: dict):
         """Run a service function (in a fork of a service version)."""
         self.in_call = True
@@ -773,6 +960,7 @@ class Worker:
         self.out_path: str | None = None   # its output file; images are written next to it
         self.files = 0
         self.displays = 0
+        self.unstored = 0  # executions not stored in the history (silent), for their cell names
         self.pyplot_patched = False
         self.services: dict = {}  # name -> function exposed with talo.expose
         self.reloader = Reloader()
@@ -859,9 +1047,14 @@ class Worker:
     def status(self, state: str, parent: dict) -> None:
         self.send("status", {"execution_state": state}, parent)
 
-    def run_code(self, code: str, n: int):
-        """Run a cell; when its last statement is an expression, return that value (as IPython does)."""
-        filename = CELL_FILENAME.format(n=n)
+    def run_code(self, code: str, n: int, stored: bool = True):
+        """Run a cell; when its last statement is an expression, return that value (as IPython does). A cell that is
+        not stored in the history (silent) gets its own name, so it never replaces the source of cell n."""
+        if stored:
+            filename = CELL_FILENAME.format(n=n)
+        else:
+            self.unstored += 1
+            filename = f"<talo-silent-{self.unstored}>"
         # register the source so tracebacks can show the failing line (as IPython does)
         linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
         tree = ast.parse(code, filename=filename, mode="exec")
@@ -907,7 +1100,7 @@ class Worker:
         reply = {"status": "ok", "execution_count": n, "user_expressions": {}, "payload": []}
         result = None
         try:
-            has_value, value = self.run_code(code, n)
+            has_value, value = self.run_code(code, n, stored=store)
             if has_value and value is not None:
                 result = value
                 if store:

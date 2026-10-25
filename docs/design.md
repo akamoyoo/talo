@@ -695,8 +695,9 @@ restored 14 variables into research2 (2.4 GB, 2.0s); content verified
   storage. A checkpoint is a manifest (`checkpoints/SESSION/NAME.json`) listing its units, their variables,
   sizes and hashes; it is written last, so a checkpoint either exists completely or not at all.
 - Variables that are the same object, or views of the same NumPy buffer, are saved in one unit, so they are still
-  the same object (or share memory) after restoring. Functions and classes defined in the session are saved by
-  their source when it is known (cells), otherwise not.
+  the same object (or share memory) after restoring. Functions defined in a session's cells are saved by
+  their source and rebuilt in the restored session's namespace; lambdas, closures and classes defined in the session
+  are reported as not saved.
 - What cannot be saved is reported with the reason (generators, open files and sockets, locks, objects whose pickling
   fails): `saved: 12, skipped: 2 (gen: cannot pickle generator; conn: socket)`. Modules are not saved; the manifest
   lists the modules the session had imported from its working directory, and `restore` imports them first.

@@ -11,6 +11,8 @@
 
 ### Added
 
+- M9: `save` / `restore` (content-addressed checkpoints written from a fork, aliasing and NumPy views kept,
+  verified on reading), `checkpoints`, `checkpoint drop`, `store gc`, `recover` after a restart, `autosave`.
 - M8: `verify` (hot / cold replay agreement), `run --trial` with `review` / `adopt` / `reject`, `new --limit`
   (systemd scope, kernel-enforced), `run --deadline` / `--max-output`, `diagnose`, `run --retain-error`,
   `talo.artifact_path()` and `artifacts`, `queue pause|resume`, `lease`, `memory` (explain and prune).

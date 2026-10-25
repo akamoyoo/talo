@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import re
 import json
 import logging
 import os
@@ -60,6 +61,7 @@ def private_dirty(pid: int | None) -> int | None:
 
 MEMORY_FIELDS = {"Rss:": "rss", "Pss:": "pss", "Private_Clean:": "private_clean", "Private_Dirty:": "private_dirty"}
 MEMORY_LIMIT_INTERVAL = 0.5  # seconds between samples of a session with --memory-limit
+AUTOSAVE_CHECK = float(os.environ.get("TALO_AUTOSAVE_CHECK", "15"))  # seconds between autosave checks
 RETAINED_ERRORS = 5          # error-JOB snapshots kept by --retain-error (older unpinned ones are dropped)
 GUARD_GRACE = 5.0           # seconds a job past its deadline or output limit gets to stop after the interrupt
 MEMORY_LIMIT_GRACE = 3.0     # seconds an interrupted job gets to stop before its worker is killed
@@ -401,7 +403,7 @@ SHARE_READ = {"brief", "vars", "snaps", "history", "notes", "job", "output", "re
 SHARE_CALL = SHARE_READ | {"call"}
 SHARE_RUN = SHARE_CALL | {"run", "interrupt", "snap", "checkout", "drop", "reload", "map", "note", "record", "handoff",
                           "export", "expose", "unexpose", "show", "diff", "complete", "diagnose", "queue", "lease",
-                          "verify", "review", "adopt", "reject", "memory", "autosnap", "undo"}
+                          "verify", "review", "adopt", "reject", "memory", "autosnap", "undo", "save", "autosave"}
 SHARE_LEVELS = ("read", "call", "run")
 SHARE_STATE_PARAMS = {"diff": ("a", "b"), "map": ("from",), "checkout": ("name",), "handoff": ("snap",),
                       "export": ("snap",)}
@@ -421,6 +423,10 @@ class Session:
         self.memory_events: Path | None = None
         self.effective_limits: dict | None = None  # read back from the scope's cgroup
         self.limits_inherited_from: str | None = None
+        self.last_checkpoint: str | None = None
+        self.autosave_config: dict | None = None   # {"every": seconds, "keep": N}
+        self.autosave_rev: int | None = None       # the revision of the last automatic checkpoint
+        self.autosave_at = 0.0
         self.over_limit: str | None = None  # why the session is over its limit without anything to kill
         self.dir = home() / "sessions" / name
         for sub in ("jobs", "snapshots"):
@@ -1181,7 +1187,8 @@ class Session:
                 "id": self.id,
                 "memory_budget": self.memory_budget, "memory_limit": self.memory_limit, "over_limit": self.over_limit,
                 "limits": self.limits, "effective_limits": self.effective_limits, "scope": self.scope,
-                "limits_inherited_from": self.limits_inherited_from,
+                "limits_inherited_from": self.limits_inherited_from, "last_checkpoint": self.last_checkpoint,
+                "autosave": self.autosave_config,
                 "max_output": self.max_output}
 
 
@@ -1341,6 +1348,7 @@ class Supervisor:
         self.sessions[name] = session
         try:
             await (session.start_from(source) if source else session.start())
+            self._save_registry()
             self.emit("session.created", session=name, id=session.id, owner=req.get("owner") or "user",
                       **({"from": source.ref} if source else {}))
         except Exception:
@@ -1349,8 +1357,11 @@ class Supervisor:
             raise
         return session.to_dict()
 
+    async def op_ls_lost(self, req):
+        return {"lost": self._lost()}
+
     async def op_ls(self, req):
-        return {"sessions": [s.to_dict() for s in self.sessions.values()]}
+        return {"sessions": [s.to_dict() for s in self.sessions.values()], "lost": self._lost()}
 
     async def op_kill(self, req):
         session = self._session(req["name"])
@@ -1387,6 +1398,10 @@ class Supervisor:
         self.last_rev[session.name] = session.rev
         del self.sessions[req["name"]]
         self.emit("session.killed", session=session.name, id=session.id)
+        registry = self._load_registry()
+        if session.name in registry:  # closed on purpose: not something to recover
+            registry[session.name]["alive"] = False
+            (home() / "sessions.json").write_text(json.dumps(registry, indent=1))
         return {"killed": req["name"]}
 
     def _deduplicated(self, session: Session, req: dict, fingerprint: dict) -> Job | None:
@@ -2746,6 +2761,242 @@ class Supervisor:
         self._close_trial(session, tr, "rejected")
         return {"trial": self._trial_view(tr)}
 
+    # ---------------------------------------------------------------- checkpoints
+
+    def _checkpoint_dir(self, session: str) -> Path:
+        return home() / "checkpoints" / session
+
+    def _manifest(self, ref: str, default_session: str | None) -> tuple[str, dict]:
+        """``SESSION/NAME`` (or ``NAME`` of the default session) -> (ref, manifest)."""
+        session, _, name = ref.rpartition("/")
+        session = session or default_session
+        path = self._checkpoint_dir(session) / f"{name}.json"
+        if not path.exists():
+            raise KeyError(f"no checkpoint {session}/{name} (`talo checkpoints` lists them)")
+        return f"{session}/{name}", json.loads(path.read_text())
+
+    async def op_save(self, req):
+        session = self._session(req["session"])
+        name = req.get("name") or time.strftime("%Y%m%d-%H%M%S")
+        if not re.fullmatch(r"[\w.-]+", name):
+            raise ValueError(f"checkpoint name {name!r}: letters, digits, '.', '-' and '_' only")
+        fingerprint = {"op": "save", "name": name, "names": req.get("names"), "expect_rev": req.get("expect_rev")}
+        key = req.get("key")
+        if key is not None and ("save", session.id, key) in self.keys:
+            job_id, known = self.keys[("save", session.id, key)]
+            if known != fingerprint:
+                raise ValueError(f"key {key!r} was used for another save; use a new key")
+            return {**await self._wait(self.jobs[job_id], req.get("timeout", 30)), "deduplicated": True}
+        if (self._checkpoint_dir(session.name) / f"{name}.json").exists():
+            raise ValueError(f"checkpoint {session.name}/{name} exists; choose another name or drop it")
+        job = Job(self._new_job_id(), session.name, f"# save {name}", "", kind="save",
+                  params={"name": name, "names": req.get("names"), "auto": bool(req.get("auto")),
+                          "expect_rev": req.get("expect_rev")},
+                  owner=req.get("owner") or "user", session_id=session.id)
+        job.output = str(session.dir / "jobs" / f"{job.id}.out")
+        Path(job.output).touch()
+        self.jobs[job.id] = job
+        if key is not None:
+            self.keys[("save", session.id, key)] = (job.id, fingerprint)
+        asyncio.create_task(self._run_save(session, job))
+        return await self._wait(job, req.get("timeout", 30))
+
+    async def _run_save(self, session: Session, job: Job) -> None:
+        """Snapshot through the queue, write from an ephemeral fork (the session keeps working), then the
+        manifest, last: a checkpoint exists completely or not at all."""
+        fork = await self._submit(session, "fork", owner=job.owner, expect_rev=job.params.get("expect_rev"))
+        await fork.done.wait()
+        job.started = time.time()
+        if fork.status != "ok":
+            session._finish(job, "error", error={"ename": "SaveNotStarted", "evalue": str((fork.error or {}).get("evalue")),
+                                                 "traceback": []})
+            return
+        source = fork.handle
+        source.pins.add(f"save {job.id}")
+        session.internal_snaps.append(source)
+        job.status, job.phase = "running", "executing"
+        channel = None
+        try:
+            channel = await ephemeral.Channel.from_snapshot(source.socket)
+            job.exec_pid = channel.pid
+            session.ephemeral[f"save {job.id}"] = channel.pid
+            store = home() / "store"
+            code = f"talo._save({job.params['names']!r}, {str(store)!r})"  # Python literals, not JSON
+            got = await channel.execute(code, job.output, silent=True, json_limit=16 << 20)
+            if got["status"] != "ok":
+                error = got.get("error") or {}
+                session._finish(job, "error", error={"ename": error.get("ename"), "evalue": error.get("evalue"),
+                                                     "traceback": error.get("traceback") or []})
+                return
+            meta = (got.get("result") or {}).get("metadata", {}).get("talo_json") or {}
+            if "value" not in meta:
+                raise RuntimeError(f"the save did not report its units: {meta.get('error')}")
+            saved = meta["value"]
+            manifest = {"session": session.name, "name": job.params["name"], "created": time.time(),
+                        "auto": job.params["auto"], "owner": job.owner, "rev": fork.result["rev"],
+                        "base": fork.result["base"], "jobs_since_base": fork.result["jobs"],
+                        "python": session.python, "python_version": saved["python"], "cwd": session.cwd,
+                        "limits": session.limits, "units": saved["units"], "skipped": saved["skipped"],
+                        "modules": saved["modules"], "versions": saved["versions"],
+                        "bytes": sum(u["bytes"] for u in saved["units"]),
+                        "new_bytes": sum(u["bytes"] for u in saved["units"] if u["new"])}
+            d = self._checkpoint_dir(session.name)
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / f".{job.params['name']}.json.tmp"
+            tmp.write_text(json.dumps(manifest, indent=1))
+            os.replace(tmp, d / f"{job.params['name']}.json")
+            session.last_checkpoint = f"{session.name}/{job.params['name']}"
+            self._save_registry()
+            job.result = {"checkpoint": session.last_checkpoint, **{k: manifest[k] for k in
+                          ("bytes", "new_bytes", "skipped", "rev")}, "variables": sum(len(u["names"]) for u in saved["units"])}
+            session._finish(job, "ok")
+            self.emit("checkpoint.saved", session=session.name, checkpoint=session.last_checkpoint)
+            if job.params["auto"] and session.autosave_config:  # automatic checkpoints beyond --keep go
+                autos = sorted((json.loads(p.read_text()) for p in d.glob("*.json")), key=lambda m: m["created"])
+                for m in [m for m in autos if m.get("auto")][:-session.autosave_config["keep"]]:
+                    (d / f"{m['name']}.json").unlink(missing_ok=True)
+        except Exception as error:  # noqa: BLE001
+            if not job.done.is_set():
+                session._finish(job, "error", error={"ename": type(error).__name__, "evalue": str(error), "traceback": []})
+        finally:
+            session.ephemeral.pop(f"save {job.id}", None)
+            job.exec_pid, job.phase = None, None
+            if channel is not None:
+                await channel.close()
+            source.pins.discard(f"save {job.id}")
+            if source in session.internal_snaps:
+                session.internal_snaps.remove(source)
+            session._release(source)
+
+    async def op_restore(self, req):
+        """Load a checkpoint into a new session (--as) or an existing idle one, as a recorded, queued execution."""
+        default = req.get("session")
+        ref, manifest = self._manifest(req["checkpoint"], default or None)
+        target = req.get("as") or default
+        if not target:
+            raise ValueError("restore needs --as NEW_SESSION or -s SESSION")
+        if target not in self.sessions:
+            await self.op_new({"name": target, "python": req.get("python") or manifest["python"],
+                               "cwd": manifest["cwd"], "owner": req.get("owner")})
+        units = manifest["units"]
+        only = req.get("names") or None
+        code = (f"# --- restored from checkpoint {ref}\n"
+                "import json as _talo_json\n"
+                f"talo._load({str(home() / 'store')!r}, _talo_json.loads({json.dumps(json.dumps(units))}), "
+                f"{only!r}, {manifest['modules']!r}, {manifest['versions']!r})")
+        out = await self.op_run({"session": target, "code": code, "timeout": req.get("timeout", 300),
+                                 "owner": req.get("owner"), "key": req.get("key"), "expect_rev": req.get("expect_rev")})
+        return {**out, "checkpoint": ref, "skipped": manifest["skipped"]}
+
+    def _save_registry(self) -> None:
+        """sessions.json: what is needed to bring sessions back after a restart (see "talo recover")."""
+        registry = self._load_registry()
+        for s in self.sessions.values():
+            registry[s.name] = {"python": s.python, "cwd": s.cwd, "limits": s.limits, "max_output": s.max_output,
+                                "memory_limit": s.memory_limit, "autosave": s.autosave_config,
+                                "last_checkpoint": s.last_checkpoint or registry.get(s.name, {}).get("last_checkpoint"),
+                                "epoch": self.epoch, "alive": s.state != "dead"}
+        path = home() / "sessions.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(registry, indent=1))
+        os.replace(tmp, path)
+
+    def _load_registry(self) -> dict:
+        path = home() / "sessions.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def _lost(self) -> list:
+        """Sessions an earlier supervisor was running that are gone."""
+        return [{"name": n, **{k: r.get(k) for k in ("python", "cwd", "last_checkpoint")}}
+                for n, r in self._load_registry().items()
+                if r.get("alive") and r.get("epoch") != self.epoch and n not in self.sessions]
+
+    async def op_recover(self, req):
+        """Recreate sessions lost in a restart, with their settings, and restore their last checkpoints."""
+        registry = self._load_registry()
+        names = [x["name"] for x in self._lost()] if req.get("all") else [req["name"]]
+        out = []
+        for name in names:
+            r = registry.get(name)
+            if r is None:
+                raise KeyError(f"no record of session {name!r}")
+            if name in self.sessions:
+                raise ValueError(f"session {name} is running; recover brings back sessions that are gone")
+            await self.op_new({"name": name, "python": r["python"], "cwd": r["cwd"], "limits": r.get("limits") or None,
+                               "max_output": r.get("max_output"), "memory_limit": r.get("memory_limit"),
+                               "owner": req.get("owner")})
+            item = {"session": name, "checkpoint": r.get("last_checkpoint")}
+            if r.get("last_checkpoint"):
+                job = await self.op_restore({"checkpoint": r["last_checkpoint"], "session": name,
+                                             "timeout": req.get("timeout", 600), "owner": req.get("owner")})
+                item["job"] = {k: job.get(k) for k in ("id", "status", "error")}
+            if r.get("autosave"):
+                self.sessions[name].autosave_config = r["autosave"]
+            out.append(item)
+        self._save_registry()
+        return {"recovered": out}
+
+    async def op_autosave(self, req):
+        session = self._session(req["session"])
+        if req.get("on") is not None:
+            session.autosave_config = ({"every": float(req.get("every") or 1800), "keep": int(req.get("keep") or 3)}
+                                       if req["on"] else None)
+            self._save_registry()
+        return {"session": session.name, "autosave": session.autosave_config}
+
+    async def _autosave_loop(self) -> None:
+        """Save idle sessions whose state changed, every `every` seconds at most (talo autosave)."""
+        while True:
+            await asyncio.sleep(AUTOSAVE_CHECK)
+            for s in list(self.sessions.values()):
+                cfg = s.autosave_config
+                if not cfg or s.state != "idle" or s.rev == s.autosave_rev or s.queue.qsize() or s.pending:
+                    continue
+                if time.time() - s.autosave_at < cfg["every"]:
+                    continue
+                s.autosave_rev, s.autosave_at = s.rev, time.time()
+                try:
+                    await self.op_save({"session": s.name, "name": "auto-" + time.strftime("%Y%m%d-%H%M%S"),
+                                        "auto": True, "timeout": 0, "owner": "autosave"})
+                except Exception:  # noqa: BLE001
+                    log.exception("autosave of session %s failed", s.name)
+
+    async def op_checkpoints(self, req):
+        root = home() / "checkpoints"
+        out = []
+        for path in sorted(root.glob("*/*.json")) if root.exists() else []:
+            if req.get("session") and path.parent.name != req["session"]:
+                continue
+            m = json.loads(path.read_text())
+            out.append({k: m.get(k) for k in ("session", "name", "created", "auto", "rev", "bytes", "new_bytes",
+                                                 "owner")} | {"variables": sum(len(u["names"]) for u in m["units"]),
+                                                              "skipped": len(m["skipped"])})
+        return {"checkpoints": out}
+
+    async def op_checkpoint_drop(self, req):
+        ref, _ = self._manifest(req["checkpoint"], req.get("session"))
+        session, _, name = ref.partition("/")
+        (self._checkpoint_dir(session) / f"{name}.json").unlink()
+        return {"dropped": ref}
+
+    async def op_store_gc(self, req):
+        """Delete store units no checkpoint uses (and abandoned temporary ones older than an hour)."""
+        import shutil
+        store = home() / "store"
+        used = set()
+        for path in (home() / "checkpoints").glob("*/*.json"):
+            used |= {u["hash"] for u in json.loads(path.read_text())["units"]}
+        freed, removed = 0, 0
+        for unit in store.iterdir() if store.exists() else []:
+            young = time.time() - unit.stat().st_mtime < 3600  # may belong to a save that has not written its manifest
+            if unit.name in used or young:
+                continue
+            size = sum(f.stat().st_size for f in unit.iterdir() if f.is_file())
+            if not req.get("dry_run"):
+                shutil.rmtree(unit, ignore_errors=True)
+            freed, removed = freed + size, removed + 1
+        return {"removed": removed, "freed_bytes": freed, "dry_run": bool(req.get("dry_run"))}
+
     # ---------------------------------------------------------------- verify
 
     async def op_verify(self, req):
@@ -2997,6 +3248,7 @@ class Supervisor:
         if path.exists():
             path.unlink()
         server = await asyncio.start_unix_server(self.handle, path=str(path), limit=wire.MAX_LINE)
+        autosave = asyncio.create_task(self._autosave_loop())
         os.chmod(path, 0o600)
         log.info("supervisor started: pid %s, %s", os.getpid(), path)
         async with server:

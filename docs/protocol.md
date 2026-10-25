@@ -126,6 +126,11 @@ Request: `{"op": "<operation>", "owner": "...", ...parameters}` (`owner` default
 | `queue` | `session`, `action` (pause / resume), `reason` | `paused`, `queued` |
 | `lease` | `session`, `ttl` (seconds), `reason`, `release`, `force` | `lease` (`id`, `owner`, `until`, `reason`) or null |
 | `memory` | `session`, `apply` | `processes` (as `resources`), `objects` (estimated), `prune`, `applied` |
+| `save` | `session`, `name`, `names`, `key`, `expect_rev`, `timeout` | the save job; its `result`: `checkpoint`, `variables`, `bytes`, `new_bytes`, `skipped`, `rev` |
+| `restore` | `checkpoint` (`SESSION/NAME`), `as` or `session`, `names`, `python`, `key` | the restoring job, `checkpoint`, `skipped` |
+| `checkpoints` / `checkpoint_drop` / `store_gc` | `session`; `checkpoint`; `dry_run` | `checkpoints`; `dropped`; `removed`, `freed_bytes` |
+| `recover` | `name` or `all` | `recovered`: `{session, checkpoint, job}` |
+| `autosave` | `session`, `on`, `every` (seconds), `keep` | `autosave` |
 | `record` | `session`, `fields`, `key` | `record` |
 | `ledger` | `session`, `owner`, `outcome`, `has` (list), `where` (list of `KEY=VALUE`), `sort` (`KEY` or `-KEY`), `last` | `records`: `{id, key, time, owner, session, session_id, producer ({kind: job / case / shell, ...}), rev, source_snapshot, source_state (kept / gone / none), code_hash, modules, fields, outcome}`, `total` |
 | `events` | `after` (cursor `EPOCH:SEQ`; default: now), `all`, `wait` (seconds), `session`, `type` (comma-separated), `limit` | `events`, `next` (cursor), `has_more`, `oldest`; `CursorExpired` for a cursor of another epoch or older than the journal |

@@ -84,7 +84,9 @@ consumes extra memory for the pages you modify afterwards (measurements: [spikes
 - trust and safety: `verify`, trial / review / adopt, hard limits, deadlines, `diagnose`, `--retain-error`,
   artifacts, pause and lease, `memory` (M8).
 
-Next: shared datasets (M6), then durability (M9).
+- durability: `save` / `restore` (content-addressed checkpoints), `recover` after a restart, `autosave` (M9).
+
+Next: shared datasets (M6).
 Linux only. See the [roadmap](docs/roadmap.md).
 
 ## Install
@@ -178,6 +180,7 @@ Exit codes: `0` ok, `1` the code failed (error, interrupted, lost), `2` Talo its
 | `talo new --limit memory=100G,pids=512` / `run --deadline 600` | hard limits by the kernel; deadlines and output limits |
 | `talo diagnose JOB` / `run --retain-error` | stacks of a running job; keep a failed state to debug |
 | `talo queue pause` / `lease` / `memory` | a human takes over; where the memory is and what can be released |
+| `talo save` / `restore` / `recover` / `autosave on` | durable checkpoints of variables; bring sessions back after a restart |
 | `talo mcp` | the same tools for an MCP client (stdio) |
 | `talo new NAME` / `ls` / `kill NAME` | manage sessions (`--python`, `--cwd`, `--memory-budget`) |
 | `talo stop` | stop the supervisor and all sessions |
