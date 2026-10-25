@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.0a1 — first release
+
+Everything of the [roadmap](docs/roadmap.md), M0 to M10.
+
+### Also in this release
+
 - GPU sessions: a session that initialises CUDA keeps its model on the GPU across `talo run`, and its worker is never
   forked again. Detected from the `/dev/nvidia*` mappings the CUDA driver creates (any framework, no declaration);
   `snap`, `autosnap`, `--atomic`, `--trial`, `map` without `--from`, `expose`, `save` and the other forks are refused
@@ -24,10 +30,6 @@
 - `import talo` inside a session (in a cell or in a module it imports) gives the session's `talo` helper, also in
   interpreters without the talo package.
 - `map --cases` also accepts JSON Lines, and reports malformed cases as a usage error.
-
-## 0.1.0a1 — first release
-
-Everything of the [roadmap](docs/roadmap.md), M0 to M9.
 
 ### Sessions and jobs
 
