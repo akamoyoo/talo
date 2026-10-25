@@ -151,3 +151,16 @@ def test_vars_hides_imports_and_sizes_nested_objects(talo):
     by_name = {v["name"]: v for v in rows["variables"]}
     assert set(by_name) == {"Holder", "helper", "h"}  # imported Path / join are hidden, own definitions are listed
     assert by_name["h"]["nbytes"] >= 1500 * 8 and "nbytes_partial" not in by_name["h"]
+
+
+def test_a_supervisor_started_while_another_stops_stays_reachable(talo):
+    """stop returns before the old supervisor has closed its sessions; one autostarted meanwhile must not lose its
+    socket to the old one's cleanup."""
+    talo("run", "import time\nx = 1")
+    talo("stop")
+    out = talo("run", "y = 2")                       # autostarts a new supervisor at once
+    assert out.returncode == 0
+    import time
+    time.sleep(1.5)                                 # the old one has finished by now
+    out = talo("ls")
+    assert out.returncode == 0 and "default" in out.stdout

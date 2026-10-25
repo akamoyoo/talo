@@ -3462,20 +3462,36 @@ class Supervisor:
     async def serve(self) -> None:
         path = socket_path()
         if path.exists():
-            path.unlink()
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(path))
+                log.info("another supervisor is serving %s; exiting", path)  # two autostarts raced: keep the first
+                return
+            except OSError:
+                path.unlink(missing_ok=True)  # a stale socket left by a supervisor that died
+            finally:
+                probe.close()
         server = await asyncio.start_unix_server(self.handle, path=str(path), limit=wire.MAX_LINE)
+        ours = os.stat(path).st_ino
         autosave = asyncio.create_task(self._autosave_loop())
         os.chmod(path, 0o600)
         log.info("supervisor started: pid %s, %s", os.getpid(), path)
         async with server:
             await self.stopping.wait()
+        # leave the socket first, and only if it is still ours: a supervisor started while this one is closing its
+        # sessions has bound the same path, and must stay reachable
+        try:
+            if os.stat(path).st_ino == ours:
+                path.unlink()
+        except FileNotFoundError:
+            pass
         self._kill_maps()
         if self.shared_server is not None:
             self.shared_server.close()
             shared_socket_path().unlink(missing_ok=True)
         for s in list(self.sessions.values()):
             await s.stop()
-        path.unlink(missing_ok=True)
+        autosave.cancel()
         log.info("supervisor stopped")
 
 
