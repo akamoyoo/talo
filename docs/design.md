@@ -670,6 +670,64 @@ that are not the base, retained error snapshots, the `Out` cache — with the me
 snapshot, and applies it with `--apply` after checking again that nothing pins them. Estimates
 are labelled as such: shared pages, allocator caches and fragmentation make exact promises impossible.
 
+## Durability (M9)
+
+Everything in memory — sessions, snapshots, maps, services — ends with the supervisor or the machine. History, notes,
+the ledger and handoffs are files and survive. M9 adds durable **checkpoints** of variables and a way to bring
+sessions back after a restart.
+
+### Checkpoints: `talo save`, `talo restore`
+
+```console
+$ talo save -s research --name panels          # all variables (or: talo save panel labels --name panels)
+checkpoint research/panels: 14 variables, 2.4 GB (1.1 GB new, 1.3 GB unchanged since research/morning), 3.1s
+$ talo restore research/panels --as research2   # a new session with those variables
+restored 14 variables into research2 (2.4 GB, 2.0s); content verified
+```
+
+- `save` takes an internal snapshot of the current state through the queue and writes the variables from an
+  ephemeral fork of it, so the session keeps working while gigabytes are written. It accepts `--key` and
+  `--expect-rev`, and records the revision, lineage, interpreter, working directory and the versions of NumPy,
+  pandas and pyarrow when they are loaded.
+- Format: each saved unit is a pickle (protocol 5) whose large buffers (NumPy arrays, and the data of pandas
+  objects) are written next to it as raw bytes, not copied into the pickle stream. Units are stored by content
+  (`$TALO_HOME/store/HASH`), so a checkpoint only writes what changed since earlier ones, and checkpoints share
+  storage. A checkpoint is a manifest (`checkpoints/SESSION/NAME.json`) listing its units, their variables,
+  sizes and hashes; it is written last, so a checkpoint either exists completely or not at all.
+- Variables that are the same object, or views of the same NumPy buffer, are saved in one unit, so they are still
+  the same object (or share memory) after restoring. Functions and classes defined in the session are saved by
+  their source when it is known (cells), otherwise not.
+- What cannot be saved is reported with the reason (generators, open files and sockets, locks, objects whose pickling
+  fails): `saved: 12, skipped: 2 (gen: cannot pickle generator; conn: socket)`. Modules are not saved; the manifest
+  lists the modules the session had imported from its working directory, and `restore` imports them first.
+- `restore CHECKPOINT [VARS...] [--as SESSION | -s SESSION]` loads into a new session (created with the checkpoint's
+  interpreter and directory, or `--python`) or into an existing idle one, as a queued job that counts as a revision
+  and appears in the lineage (`# --- restored from research/panels`). Each unit's hash is checked as it is read; a
+  version mismatch of NumPy / pandas is reported. Restored buffers are ordinary writable memory.
+- `talo checkpoints [-s SESSION]` lists checkpoints with sizes and shared storage; `talo checkpoint drop NAME` removes
+  a manifest, and `talo store gc` deletes units no manifest uses.
+
+### After a restart: `talo recover`
+
+The supervisor keeps a registry of sessions (`sessions.json`: name, interpreter, directory, limits, autosave
+settings, last checkpoint). After a restart, `talo ls` shows the sessions that were running and are gone, with their
+last checkpoint; `talo recover SESSION` (or `--all`) recreates each with the same interpreter, directory and limits
+and restores its last checkpoint. Notes, ledger records, history and handoffs are already on disk. Snapshots are not
+recovered: they were memory.
+
+### Automatic checkpoints: `talo autosave`
+
+`talo autosave on [--every 30m] [--keep 3]` saves the session's variables periodically, when the session is idle and
+something changed since the last checkpoint (its revision moved). Because storage is by content, an autosave writes
+only the variables that changed. The oldest automatic checkpoints beyond `--keep` are dropped (manual ones never).
+
+### Limits
+
+A checkpoint stores values, not processes: threads, open files, network connections, GPU memory and objects of C
+extensions that do not support pickling are not saved. Restoring gives equal values, not the same identities
+across separately saved units. Writing speed is that of the disk; the memory needed to save is small (buffers are
+written in place), while restoring needs the memory of the restored values.
+
 ## Known limitations
 
 - Linux only (relies on `fork`, `/proc`, Unix sockets).
