@@ -421,6 +421,24 @@ def other_threads() -> list[str]:
     return names
 
 
+def cuda_mappings() -> list[str]:
+    """NVIDIA device files mapped into this process. The CUDA driver maps them when it initialises (``cuInit``),
+    whatever the framework (torch, cupy, a native extension); importing a framework or querying NVML does not. From
+    then on a fork cannot use CUDA: see "GPU sessions" in docs/design.md."""
+    try:
+        with open("/proc/self/maps") as f:
+            return sorted({line.split()[-1] for line in f if " /dev/nvidia" in line})
+    except OSError:
+        return []
+
+
+def cuda_refusal(devices: list[str]) -> dict:
+    return {"status": "error", "ename": "CudaInUse", "cuda": devices,
+            "evalue": f"this worker has initialised CUDA ({', '.join(devices)} mapped) and a fork of it cannot use the "
+                      "GPU, so its state cannot be snapshotted or forked; `talo run` keeps using what is loaded, and "
+                      "snapshots taken before CUDA still work (`talo checkout NAME --discard`, `talo map --from NAME`)"}
+
+
 def _wait_child(pid: int) -> None:
     try:
         os.waitpid(pid, 0)
@@ -1357,6 +1375,12 @@ class Worker:
         self.services: dict = {}  # name -> function exposed with talo.expose
         self.reloader = Reloader()
         self.reloader.record()
+        self._cuda: list[str] = []  # once CUDA is initialised it stays so: unloading does not unmap the devices
+
+    def cuda(self) -> list[str]:
+        if not self._cuda:
+            self._cuda = cuda_mappings()
+        return self._cuda
 
     # ---------------------------------------------------------------- rich output
 
@@ -1538,8 +1562,11 @@ class Worker:
             if meta.get("talo_json_result") is not None:
                 data_meta["talo_json"] = json_result(result, int(meta["talo_json_result"]))
             self.send("execute_result", {"execution_count": n, "data": data, "metadata": data_meta}, msg)
+        had_cuda = bool(self._cuda)
         metrics = {"talo_duration_s": round(time.time() - started, 6), "talo_rss_before": rss_before,
-                   "talo_rss_after": rss_bytes()}
+                   "talo_rss_after": rss_bytes(), "talo_cuda": self.cuda()}
+        if self._cuda and not had_cuda:
+            metrics["talo_cuda_new"] = True
         if reply["status"] == "ok" and content.get("user_expressions"):
             reply["user_expressions"] = self.user_expressions(content["user_expressions"])
         self.send("execute_reply", reply, msg, metadata=metrics)
@@ -1549,6 +1576,9 @@ class Worker:
         """Fork a snapshot of the current state (see "Snapshots" in docs/design.md). In the parent this replies with
         the snapshot's pid; in a worker later spawned from the snapshot, it returns with ``self.sock`` replaced."""
         content = msg["content"]
+        if self.cuda():
+            self.send("talo_snapshot_reply", cuda_refusal(self.cuda()), msg)
+            return
         threads = other_threads()
         if content.get("strict") and threads:
             self.send("talo_snapshot_reply", {"status": "error", "ename": "ThreadsPresent",
@@ -1556,6 +1586,9 @@ class Worker:
                                               "threads": threads}, msg)
             return
         prep = prepare_fork(content.get("prepare") or ())
+        if self.cuda():  # a finalizer run by the collection may have initialised it
+            self.send("talo_snapshot_reply", cuda_refusal(self.cuda()), msg)
+            return
         path = content["socket"]
         if os.path.exists(path):
             os.unlink(path)
@@ -1590,7 +1623,13 @@ class Worker:
 
     def in_fork(self, fn, timeout: float = SHOW_TIMEOUT) -> dict:
         """Run ``fn()`` in a disposable fork and return its result: properties, ``__getitem__`` or ``__repr__`` that
-        change state while inspecting change only the copy."""
+        change state while inspecting change only the copy. Once CUDA is initialised a fork could not read GPU
+        values: ``fn()`` then runs here, as an execution would, and the result says so (``in_process``)."""
+        if self.cuda():
+            try:
+                return {**fn(), "in_process": True}
+            except Exception as error:  # noqa: BLE001
+                return {"status": "error", "ename": type(error).__name__, "evalue": str(error), "in_process": True}
         r, w = os.pipe()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)  # see "Fork safety" in docs/design.md
@@ -1636,7 +1675,7 @@ class Worker:
                 "implementation_version": wire.VERSION, "banner": f"talo worker (Python {sys.version.split()[0]})",
                 "language_info": {"name": "python", "version": sys.version.split()[0], "mimetype": "text/x-python",
                                   "file_extension": ".py"},
-                "talo_pid": os.getpid(), "talo_executable": sys.executable}, msg)
+                "talo_pid": os.getpid(), "talo_executable": sys.executable, "talo_cuda": self.cuda()}, msg)
         elif kind == "talo_vars_request":
             pattern = msg["content"].get("pattern")
             rows = [describe(k, v) for k, v in list(self.namespace.items())

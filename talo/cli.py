@@ -122,6 +122,10 @@ def show_job(args, job: dict) -> None:
     elif job.get("result"):  # a finished snap / checkout
         print(json.dumps(job["result"], ensure_ascii=False, default=str)[:2000])
     sys.stdout.flush()  # output first, the status line (stderr) last
+    if (job.get("metrics") or {}).get("talo_cuda_new"):
+        print("[this job initialised CUDA: from now on the session's state cannot be snapshotted or forked (snap, "
+              "autosnap, --atomic, --trial, map, expose, save); `talo run` keeps what is on the GPU, and snapshots "
+              "taken before still work]", file=sys.stderr)
     print(status_line(job), file=sys.stderr)
 
 
@@ -149,6 +153,9 @@ def status_line(job: dict) -> str:
         status += ", state restored"
     elif atomic.get("outcome") in ("restore_failed", "not_started"):
         status += f", atomic {atomic['outcome']}: {atomic.get('error')}"
+    for what, outcome in (("not published", job.get("published")), ("no autosnap", job.get("autosnap"))):
+        if (outcome or {}).get("error"):
+            status += f", {what}: {outcome['error'].split(':')[0]}"
     mem = ""
     m = job.get("metrics") or {}
     if m.get("talo_rss_after") and m.get("talo_rss_before"):
@@ -212,6 +219,7 @@ def cmd_ls(args):
             extra = f", running job {s['current_job']}" if s["current_job"] else ""
             extra += f", {s['queued']} queued" if s["queued"] else ""
             extra += f": {s['death']}" if s["state"] == "dead" else ""
+            extra += ", CUDA in use (no snapshots)" if s.get("cuda") else ""
             print(f"{s['name']:16s} {s['state']:8s} pid {s['pid']}  memory {human_bytes(s['rss'])}  {s['python']}{extra}")
         for s in d.get("lost") or []:
             last = f"last checkpoint {s['last_checkpoint']}" if s.get("last_checkpoint") else "no checkpoint"
@@ -560,6 +568,8 @@ def cmd_show(args):
             print(f"{d['ename']}: {d['evalue']}")
         return 1
     emit(args, d, lambda x: print(x["text"]))
+    if d.get("in_process") and not args.json:
+        print("(evaluated in the worker itself, not in a disposable fork: CUDA is in use)", file=sys.stderr)
 
 
 def cmd_history(args):
@@ -714,6 +724,9 @@ def cmd_brief(args):
               f"(private {human_bytes(d['private_bytes'])})")
         if s.get("death"):
             print(f"dead: {s['death']}")
+        if s.get("cuda"):
+            print(f"CUDA in use ({', '.join(s['cuda'])}): the state cannot be snapshotted or forked; snapshots taken "
+                  "before it still work")
         notes = d["notes"]
         if notes["last"]:
             more = f" (last {len(notes['last'])} of {notes['total']}; `talo notes`)" if notes["total"] > len(notes["last"]) else ""

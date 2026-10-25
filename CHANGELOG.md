@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- GPU sessions: a session that initialises CUDA keeps its model on the GPU across `talo run`, and its worker is never
+  forked again. Detected from the `/dev/nvidia*` mappings the CUDA driver creates (any framework, no declaration);
+  `snap`, `autosnap`, `--atomic`, `--trial`, `map` without `--from`, `expose`, `save` and the other forks are refused
+  with `CudaInUse` instead of producing states that fail on the GPU later; `show` evaluates in the worker; `ls` and
+  `brief` show `CUDA in use`. Snapshots taken before CUDA keep working. Measurements in `spikes/README.md`.
 - `talo reload` without module names reloads the changed ones (as `--changed`).
 - MCP: `snaps`, `memory` and `snapshot_demote` tools.
 - Snapshots stay small: before every fork the worker collects garbage and returns free heap pages to the kernel

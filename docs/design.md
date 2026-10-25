@@ -129,7 +129,7 @@ the worker lists its threads (`/proc/self/task/*/comm`) and reports them with th
 refuses to fork while other threads exist. Thread pools that tolerate `fork()` (OpenBLAS registers handlers for it) are
 common, so the default is to warn, not refuse. Libraries with their own thread pools may hang or refuse to run in a forked child
 unless they rebuild the pool after `fork()`; GPU contexts, network connections and writable mappings are not restored
-by a rollback.
+by a rollback. A worker that has initialised CUDA is never forked at all (see "GPU sessions").
 
 ## Messages: built on the Jupyter messaging protocol
 
@@ -988,9 +988,48 @@ panel = talo.get("panel", copy=True)        # a private, writable copy
   much of the version is shared by mapping and how much each reader rebuilds privately (the pickle stream: object
   columns, Python objects, metadata).
 
+## GPU sessions
+
+A session that loads a model onto the GPU keeps it there: every later `talo run` uses it without loading it again
+(measured: a 4 GiB model loads in 9 s once, then each inference takes 0.02 s). What a GPU session cannot do is fork:
+the CUDA driver's state does not survive `fork()`, and a child of a process that initialised CUDA can neither create
+its own context nor read the parent's device memory, while everything on the CPU side still works in it. Without a
+guard, a snapshot taken after CUDA looks healthy until it touches the GPU. So Talo detects CUDA and from then on
+treats the session like a notebook kernel: it runs code, keeps state and reports it, but takes no snapshot of it.
+
+**Detection.** The worker reads `/proc/self/maps`: the CUDA driver maps `/dev/nvidia*` when it initialises
+(`cuInit`), whatever the framework (torch, cupy, JAX or a native extension). Importing a framework does not, nor do
+NVML queries such as `nvidia-smi` or `torch.cuda.is_available()` with `PYTORCH_NVML_BASED_CUDA_CHECK=1`; those leave
+fork usable. In the measurements this signal matched "a fork can no longer use CUDA" in every case; mapped libraries,
+open device files and `torch.cuda.is_initialized()` did not (see [spikes/README.md](../spikes/README.md)). Reading
+the maps takes under a millisecond. Once seen, it stays: freeing tensors or emptying a cache does not unmap the
+devices. No declaration is needed, and nothing is imported or initialised to check.
+
+**What is refused.** Every fork of the worker, checked by the worker itself before it forks (and again after the
+garbage collection that precedes a fork, which can run finalizers): `snap`, `checkout --snap`, `autosnap` (and the
+baseline of `autosnap on`), `run --atomic` (it fails before the code runs), `run --trial`, `map` without `--from`, `expose` and
+`talo.expose` (the job succeeds; its services are not published), `save`, `autosave`, `publish`, `verify`, `handoff`
+and `--retain-error`. The error is `CudaInUse`, naming the mapped devices. Automatic snapshots and publications report
+the refusal on the job (`no autosnap: CudaInUse`, `not published: CudaInUse`) without failing it. `show` normally
+evaluates in a disposable fork; in a GPU session it evaluates in the worker itself, as `run` would, and says so.
+
+**What keeps working.** `run` and everything around it (interrupts, deadlines, limits, output, `vars`, `attach`,
+notebooks). Snapshots taken before CUDA was initialised are ordinary snapshots: `checkout NAME --discard` replaces
+the GPU worker (its VRAM is released when it exits) with one that can initialise CUDA again, and `map --from NAME`,
+`new --from NAME` and services published before CUDA create a context in each fork. So a session can prepare its
+data on the CPU, snapshot it, and then load the model: rolling back to the snapshot means loading the model again,
+not preparing the data again. An atomic job that initialises CUDA and fails is restored to its pre-CUDA checkpoint.
+
+**Reporting.** The job that initialises CUDA says so once; `ls` and `brief` show `CUDA in use`; each job's metrics
+carry `talo_cuda`. CUDA errors (out of memory, failed kernels) are ordinary job errors; the session stays usable.
+
+**Not in scope.** Snapshots of GPU state, sharing one copy of a model's device memory between sessions or forks
+(CUDA IPC), assigning GPUs to sessions, and GPU memory in `resources` and budgets. `CUDA_VISIBLE_DEVICES` in the
+environment of `talo new` selects devices as for any process.
+
 ## Known limitations
 
 - Linux only (relies on `fork`, `/proc`, Unix sockets).
-- Snapshots inherit the limits of `fork()` described above.
+- Snapshots inherit the limits of `fork()` described above; a session that initialised CUDA takes none.
 - A worker that runs out of memory is killed by the kernel; the supervisor reports it, and its variables are lost
   unless a snapshot or (M9) a durable checkpoint exists.

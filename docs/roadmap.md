@@ -60,5 +60,6 @@ not solve for an agent.
 12. **Shared datasets (M6).** One session publishes an immutable version of a table; other sessions and agents map it
    without copying and move to a newer version explicitly. Live mutable sharing is out of scope.
 
-Out of scope until after 1.0: GPU state, cross-machine migration, CRIU integration, automatic recomputation, merging
-branches.
+Out of scope until after 1.0: snapshots of GPU state (a session that initialised CUDA keeps its model loaded but takes
+no snapshots: "GPU sessions" in the design), cross-machine migration, CRIU integration, automatic recomputation,
+merging branches.

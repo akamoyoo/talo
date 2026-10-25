@@ -397,6 +397,16 @@ class SessionDead(RuntimeError):
     pass
 
 
+class CudaInUse(RuntimeError):
+    """The worker has initialised CUDA: its state is never forked (see "GPU sessions" in docs/design.md)."""
+
+
+def snapshot_refused(content: dict) -> RuntimeError:
+    if content.get("ename") == "CudaInUse":
+        return CudaInUse(content.get("evalue"))
+    return RuntimeError(f"{content.get('ename')}: {content.get('evalue')}")
+
+
 class StaleRevision(RuntimeError):
     pass
 
@@ -465,6 +475,7 @@ class Session:
         self.autosaving = False
         self.store_tasks: set = set()        # running saves and publications (cancelled when the session is killed)
         self.over_limit: str | None = None  # why the session is over its limit without anything to kill
+        self.cuda: list = []                # device files the worker mapped when it initialised CUDA: no forks
         self.dir = home() / "sessions" / name
         for sub in ("jobs", "snapshots"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
@@ -660,6 +671,7 @@ class Session:
         self.generation += 1
         self.proc, self.children_file, self.writer = proc, children_file, writer
         self.worker_pid = info["content"].get("talo_pid")
+        self.cuda = info["content"].get("talo_cuda") or []
         if self.limits and self.memory_events is None:
             self.memory_events = memory_events_path(self.worker_pid)
         if self.limits and self.effective_limits is None:
@@ -905,6 +917,7 @@ class Session:
                     status = got["content"]["status"]
                     job.user_expressions = got["content"].get("user_expressions") or None
                     job.metrics = dict(got.get("metadata", {}))
+                    self.cuda = job.metrics.get("talo_cuda") or self.cuda
                     if status == "error" and job.interrupt_requested and (job.error or {}).get("ename") == "KeyboardInterrupt":
                         status = "interrupted"
                     limit = job.params.get("max_output") or self.max_output
@@ -1224,7 +1237,7 @@ class Session:
                                                               "prepare": list(self.snapshot_prep)}, timeout=120)
         content = reply["content"]
         if content.get("status") != "ok":
-            raise RuntimeError(f"{content.get('ename')}: {content.get('evalue')}")
+            raise snapshot_refused(content)
         snap = Snapshot(sid, name or sid, self.name, path, content["pid"], self.base, list(self.jobs_since_base),
                         content.get("execution_count", 0), content.get("threads", []), message, owner)
         snap.prepare = content.get("prepare")
@@ -1353,7 +1366,7 @@ class Session:
                 "limits_inherited_from": self.limits_inherited_from, "last_checkpoint": self.last_checkpoint,
                 "autosave": self.autosave_config, "snapshot_policy": self.snapshot_policy,
                 "snapshot_prep": list(self.snapshot_prep),
-                "max_output": self.max_output}
+                "max_output": self.max_output, "cuda": self.cuda if self.state != "dead" else []}
 
 
 async def compare_states(ask_a, ask_b, limit: int | None) -> dict:
@@ -2874,7 +2887,7 @@ class Supervisor:
             reply, _ = await channel.request("talo_snapshot_request", {"id": sid, "socket": path, "strict": False},
                                              timeout=120)
             if reply["content"].get("status") != "ok":
-                raise RuntimeError(f"{reply['content'].get('ename')}: {reply['content'].get('evalue')}")
+                raise snapshot_refused(reply["content"])
             snap = Snapshot(sid, f"trial-{tr['name']}", session.name, path, reply["content"]["pid"], tr["source"]["base"],
                             [*tr["source"]["jobs"], job.id], reply["content"].get("execution_count", 0),
                             reply["content"].get("threads", []), f"trial {tr['name']} (job {job.id})", job.owner)
