@@ -555,6 +555,90 @@ are the agent-facing operations with the same arguments, results and errors as t
 `events`, `note`, `output`. Results are bounded as on the CLI. An MCP client that cannot run shell commands can thus use a
 session as fully as a CLI agent.
 
+## Trust and safety (M8)
+
+Agents run long, expensive and sometimes wrong computations on shared machines, and hand results to people who must
+decide whether to trust them. M8 makes results checkable before they are adopted, failures inspectable without
+recomputing, and resource use bounded by the operating system rather than by polling.
+
+### Is this state reproducible? `talo verify`
+
+- `talo verify --hot [--from SNAPSHOT]` forks an ephemeral worker from a snapshot on the current lineage (default: the
+  oldest one still kept), replays the lineage's jobs after it in order, and compares the result with the live state:
+  variable by variable, by summary and content fingerprint (as `diff`, with its size limit).
+- `talo verify --cold` starts a fresh interpreter (the session's), runs the exported script of the current lineage,
+  and compares in the same way.
+- The report lists variables that match, differ (with the differing fields), are missing on either side or could not
+  be compared, the jobs replayed, and the **replay hazards**: failed jobs in the lineage whose partial effects the
+  state keeps, reloads, and jobs that read files or the network cannot be detected and are not claimed. Verification
+  never changes the session. A difference is reported, not explained: randomness without a fixed seed, time and
+  external data are common causes.
+
+### Trial, review, adopt
+
+```console
+$ talo run --trial clean -f clean.py      # runs in a fork of the current state; the session is not changed
+$ talo review clean                        # its output, result, and diff against the current state
+$ talo adopt clean                         # the session switches to the trial's state, atomically
+$ talo reject clean                        # or drop it
+```
+
+- `run --trial NAME` takes an internal snapshot of the current state through the queue, runs the code in an ephemeral
+  worker forked from it, and, if the code succeeds, keeps that worker's final state as a snapshot `trial:NAME`
+  (pinned, counted in the session's memory). The session's own worker is free meanwhile.
+- `review NAME` shows the trial job (status, output, result, records), and `diff` between the session's current state
+  and the trial's.
+- `adopt NAME` checks out the trial's snapshot; the trial's job joins the lineage as if it had run in the session.
+  If the session's revision changed since the trial started, adopting would discard that work: it is refused unless
+  `--discard`. `reject NAME` drops the trial. A failed trial keeps nothing (with `--retain-error`, its failed state).
+
+### Hard limits and deadlines
+
+- `new --limit memory=100G,cpu=8,pids=512` runs the worker in a systemd user scope (cgroup v2): `MemoryMax`, `CPUQuota`
+  and `TasksMax` apply to the worker, its snapshots and every fork of them together — the kernel enforces them, there
+  is no sampling. Talo checks at `new` that a user systemd instance is available and refuses otherwise (the soft
+  `--memory-limit` remains for machines without it). An out-of-memory kill inside the scope is reported as such.
+- `run --deadline SECONDS` bounds a job's run time independently of how long the client waits (`-t`): at the deadline
+  Talo interrupts the job, then kills it after a grace period; the job ends with `termination: "deadline"`.
+- `run --max-output SIZE` (and a session default) bounds a job's output file; a job that exceeds it is interrupted with
+  `termination: "output_limit"`.
+- When Talo kills a job's worker (deadline, limits), it also kills the processes the worker started (found through
+  `/proc`), so child processes do not outlive the job.
+
+### Diagnosing a job: `talo diagnose`, `--retain-error`
+
+- `talo diagnose JOB` reports, without stopping the job: the stack of every thread (the worker dumps them with
+  `faulthandler` on a signal), CPU use over a short interval, read and written bytes, resident memory, the process
+  state and the processes it started.
+- `run --retain-error` keeps the failed state: if the code fails, the worker keeps the exception (with its traceback
+  and the frames' local variables) as `_talo_error`, Talo takes a snapshot `error-JOB` of that state, and the live
+  worker drops the reference. `talo new debug --from error-JOB` then gives a session where the failure can be
+  examined without running the expensive computation again. With `--atomic`, the snapshot is taken before the
+  restore.
+
+### Files: `talo.artifact_path()`
+
+`talo.artifact_path(name="")` returns a path in a directory of the running job (`sessions/S/artifacts/JOB/`), created
+on demand. Rolling back memory never removes files; giving each job its own directory makes its outputs visible
+(`talo artifacts JOB` lists them, with sizes) and lets a reviewer publish them deliberately
+(`talo artifacts JOB --copy-to DIR`) instead of having an experiment overwrite shared files.
+
+### A human takes over: `talo queue pause`, `talo lease`
+
+- `talo queue pause [-m REASON]` stops the session from starting new jobs (running ones finish); submissions keep
+  queueing and say why they wait. `talo queue resume` continues.
+- `talo lease --ttl 30m [-m REASON]` gives the caller's owner the session for a while: only its jobs start; other
+  owners' jobs wait in order and start when the lease ends (`talo lease --release`, or when it expires).
+- `brief`, `jobs` and `events` show a pause or a lease.
+
+### Where the memory went: `talo memory`
+
+`talo memory` lists the session's memory by holder: the largest variables (their estimated sizes), objects retained
+by `_` and `Out`, each snapshot's private memory and pins, map cases and calls, and the worker's resident memory not
+attributed to any variable. `talo memory --prune` proposes what could be released — automatic and unpinned snapshots
+that are not the base, the `Out` cache — with the estimated bytes of each, and applies it with `--apply`. Estimates
+are labelled as such: shared pages, allocator caches and fragmentation make exact promises impossible.
+
 ## Known limitations
 
 - Linux only (relies on `fork`, `/proc`, Unix sockets).
